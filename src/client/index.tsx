@@ -98,6 +98,37 @@ function service<T>(ctx: ClientContextLike, key: string): T | undefined {
   }
 }
 
+
+/**
+ * Guide-entry glyph: a document with a folded corner and an "L" baseline.
+ *
+ * The guide draws a generic cube when a type supplies no icon, which reads as
+ * "some plugin" rather than "LaTeX". Drawn inline so the bundle pulls in no
+ * artwork package and inherits `currentColor`.
+ * @param props - sizing from the guide's renderer.
+ * @returns the glyph.
+ */
+function LatexGlyph({ size = 16, className }: { size?: number; className?: string }): ReactNode {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M4 1.75h4.6L12 5.15V14H4z" />
+      <path d="M8.6 1.75v3.4H12" />
+      <path d="M6.1 8.1v3.2h2.4" />
+    </svg>
+  )
+}
+
 /**
  * Install the client half.
  * @param ctx - client context; every sidebar service is probed rather than
@@ -177,6 +208,7 @@ export function apply(ctx: ClientContextLike): void {
               order: 40,
               title: () => 'LaTeX 预览',
               description: () => '编译结果、PDF 预览与报错回传',
+              icon: LatexGlyph,
             },
           ],
         }),
