@@ -1,7 +1,5 @@
 # LaTeX Preview — 开发文档
 
-> 产品名：**LaTeX Preview**（npm 包 `dsh-latex-preview`）。曾用名 `Visual LaTeX` / `dsh-visual-latex`，已废弃——"visual LaTeX" 在英语里会被读成"图形化 LaTeX"（WYSIWYG 编辑器），与本插件"实时预览 + 双向跳转 + 报错回传"的定位不符，且不利于搜索。**本文件不再使用的名称，请勿在代码、文档、发布信息中复活。**
-
 **文档定位**：本文档交付给一位独立开发者在 4–6 周内完成从脚手架到上架 DSH 插件商店的完整开发。技术栈围绕“DSH 原生插件 + 本地 Tectonic 编译引擎 + Web 端 PDF.js 渲染”展开。
 
 **隐私边界声明**：编译、渲染、SyncTeX 跳转、diff 计算**全部在本机完成，稿件内容不出本机**。但“错误回传 Agent”“PDF 批注发 Agent”两项功能会将**错误上下文 / 批注锚点与用户指令**发送至 DSH Agent 服务。README 与插件首次启用时必须明确告知此边界，并提供“错误脱敏”开关（只发错误消息与行号，不发源码上下文）。

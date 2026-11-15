@@ -70,7 +70,7 @@ cargo install tectonic
 
 ## 4. 命名约定（已定，不要改回去）
 
-产品名：**LaTeX Preview**。旧名（`Visual LaTeX` / `dsh-visual-latex`）已于 2026-11-16 全量废弃，理由：`visual LaTeX` 在英语里会被读成"图形化 LaTeX"（WYSIWYG 编辑器），与"实时预览 + 双向跳转 + 报错回传"的实际定位相反，且不利于被搜索到。**不要在代码、文档、README、npm 页面、发布信息里复活旧名。**
+产品名：**LaTeX Preview**。下表是全部标识符的唯一取值来源，代码、文档、README、npm 页面、发布信息一律照此。
 
 | 用途 | 值 |
 |---|---|
@@ -84,9 +84,7 @@ cargo install tectonic
 | 事件前缀 | `latex-preview:` |
 | 消息来源标记 | `{ kind: 'plugin', plugin: 'latex-preview' }` |
 
-**工作目录**：`E:\dsh-latex-preview`（旧路径 `E:\dsh-visual-latex` 已随改版切换）。发布时仓库名应为 `dsh-latex-preview`。
-
-⚠️ 全仓已无旧名残留（`visual-latex` / `visualLatex` / `Visual LaTeX` 均已清除，仅规格书文首保留一行"曾用名"注记用于追溯）。若你看到旧名，那是漏改，请一并修正。
+**工作目录**：`E:\dsh-latex-preview`。发布时仓库名应为 `dsh-latex-preview`。
 
 ---
 
