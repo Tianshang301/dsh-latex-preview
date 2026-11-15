@@ -21,7 +21,7 @@
 
 ## 2. 当前状态（如实说明）
 
-> **2026-11-16 更新**：脚手架已落地，§6 的悬案大部分已有结论。**动手前先读 `docs/spikes.md`**，那里是逐条的实测证据，本节下面的表格是交接当时的快照。
+> **2026-11-16 更新**：脚手架已落地，§6 的悬案大部分已有结论。**动手前先读 `spikes.md`**，那里是逐条的实测证据，本节下面的表格是交接当时的快照。
 
 | 项 | 状态（2026-11-15 交接时） | 现状（2026-11-16） |
 |---|---|---|
@@ -82,7 +82,7 @@ cargo install tectonic
 | 服务类名 | `LatexPreviewService` |
 | 文件名 | `latex-preview-service.ts` 等 |
 | 事件前缀 | `latex-preview:` |
-| 消息来源标记 | `{ kind: 'plugin', plugin: 'latex-preview' }` |
+| 消息来源标记 | `{ kind: 'user' }`（`dsh-llm@0.2.2` 已移除旧的 `plugin` kind，见 `spikes.md` §B8） |
 
 **工作目录**：`E:\dsh-latex-preview`。发布时仓库名应为 `dsh-latex-preview`。
 
@@ -151,11 +151,11 @@ cargo install tectonic
 1. 装 tectonic，验证 `tectonic --version` 与 `synctex --version` 都能执行
 2. `git init` + 首个 commit（把现有 3 个 md 提交进去，留个干净的起点）
 3. 建 `package.json`（`"type": "module"` + `dsh` 字段，照规格书 §4 抄）、`tsconfig.json`、`cordis.patch.yml`
-4. 建 `docs/spikes.md`，用来记录 §6 的验证结论
+4. 建 `spikes.md`，用来记录 §6 的验证结论
 
 **Day 1 下午 – Day 2：写契约探针（这是最值钱的两天）**
 
-写一个能跑的最小插件，依次验证五件事并把实际观察结果记进 `docs/spikes.md`：
+写一个能跑的最小插件，依次验证五件事并把实际观察结果记进 `spikes.md`：
 
 - `ctx.plugin(Service)` 能否注册、`super(ctx, 'latexPreview')` 能否生效
 - `ctx.inject(['webServer'], cb)` 能否拿到 webServer
@@ -228,4 +228,4 @@ cargo install tectonic
 
 **设计已经想清楚了，代码一行没写。** 你接手后最重要的不是赶紧写 UI，而是花两天把 §6 的三个悬案验证掉——那三个答案决定数据流怎么写。规格书是可以照着写的，除了 draftMode（别做）和编译超时/并发（必须补）这两处。
 
-有疑问优先看 `DEVELOPMENT_PLAN.md` 的风险登记表和 `AGENTS.md` 的不变式清单，这两处覆盖了 80% 的"为什么当初这么做"。
+有疑问优先看 `DEVELOPMENT_PLAN.md` 的风险登记表和 `../AGENTS.md` 的不变式清单，这两处覆盖了 80% 的"为什么当初这么做"。

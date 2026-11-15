@@ -95,7 +95,7 @@ api.onCompiled((result) => { ... })   // 把一个回调函数传给 Host 服务
 | T0.3 | **契约探针 `pnpm verify`**：`ctx.plugin(Service)`、`ctx.inject`、`ctx.slots.inject/register`、`createUserMessage`、`agent.steer` 五连冒烟 + 打印 DSH 版本 | `test/contract/`、npm script | T0.1 | 五连全绿，输出实际 API 形态 |
 | T0.4 | **二进制检测**：`tectonic --version` / `synctex --version`，缺失时返回结构化错误 + 安装引导文案 | `src/utils/binaries.ts` | T0.3 | 两个都缺、缺一个、都在 —— 三种场景都有可读提示 |
 
-> **Day 2 结束的硬性判决**：B1/B2/B3 必须有结论并记录到 `docs/spikes.md`。没有结论就停在这里找 DSH 文档/问人，不要开始写面板。
+> **Day 2 结束的硬性判决**：B1/B2/B3 必须有结论并记录到 `spikes.md`。没有结论就停在这里找 DSH 文档/问人，不要开始写面板。
 
 ### 阶段 P0 · 双核最小闭环（Week 1–2，约 8 人日）
 

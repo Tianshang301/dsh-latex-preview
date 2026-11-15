@@ -15,7 +15,7 @@
 | B5 | 编译超时/单飞 | 规格书缺，必须补 | 不变 |
 | B6 | pdfjs 资产与同源 | 未验证（需真实 profile 起服务） | 留到 P0.6 |
 | **B7** | client bundle 的 loader 契约 | **未知**，生态里没有可抄的第三方 client 包 | 先用 IIFE 单顶层语句形态，P0.5 前定案 |
-| **B8** | 消息 `source` 的形状 | 规格书写错：不是 `'latex-preview'`，是 `{ kind: 'plugin', plugin: 'latex-preview' }` | 已按真实契约实现 |
+| **B8** | 消息 `source` 的形状 | 规格书写错：不是字符串，是判别式对象。**0.2.2 里 `plugin` kind 已被移除**，插件产出的消息就是 `{ kind: 'user' }` | 已按 0.2.2 契约实现 |
 | **B9** | `synctex` 输出格式 | 已实测：`view` 必须传**绝对路径+正斜杠**；字段是大写 `W:`/`H:`；`Column` 可为 `-1` | P1.1 的解析器按实测写，别照抄规格书正则 |
 | **B10** | 本机 `pnpm run` 被拦 | 本机 pnpm 有供应链策略包装层，`pnpm run` 前置校验因"ignored build scripts"失败 | 本轮用 `npx tsc` / `npx tsx` 直调；不影响产物 |
 
@@ -117,16 +117,27 @@ withInitiator<T>(agent: Agent, op: () => T): T
 
 ## B8 · 消息 `source` 是对象，不是字符串
 
-规格书 §3.5 写 `createUserMessage({ content, source: 'latex-preview' })`。真实契约（`@deepseek-ai/dsh-llm`，`MessageSourceMap`）是判别式联合：
+规格书 §3.5 写 `createUserMessage({ content, source: 'latex-preview' })`——字符串。真实契约是判别式对象，而且**跨版本变过一次**，这点很容易踩：
 
 ```ts
+// @deepseek-ai/dsh-llm@0.1.0-rc.6
 user:   { kind: 'user' }
-plugin: { kind: 'plugin'; plugin: string } & ContextFormed
+plugin: { kind: 'plugin'; plugin: string } & ContextFormed   // ← 曾存在
 model:  ModelMessageSource
 tool:   ToolMessageSource
+
+// @deepseek-ai/dsh-llm@0.2.2-rc.1（本项目目标版本）
+user:   { kind: 'user' }
+model:  ModelMessageSource
+tool:   ToolMessageSource
+'system-prompt': SystemPromptMessageSource
 ```
 
-所以正确写法是 `source: { kind: 'plugin', plugin: 'latex-preview' }`。`createUserMessage` 会分配 `id` 并 `freeze`（契约探针已实测：`role=user`、`frozen=true`、`blocks=[text]`）。
+0.2.2 把 `plugin` kind 删了，所以插件产出的消息**就是一条普通用户消息**：`source: { kind: 'user' }`。本次实现最初按 0.1.0 的形状写成 `{ kind: 'plugin', plugin: 'latex-preview' }`，`tsc` 直接报 `TS2322: Type '"plugin"' is not assignable to ...`——这条报错本身就是契约证据。
+
+`createUserMessage` 会分配 `id` 并 `freeze`（契约探针实测：`role=user`、`frozen=true`、`blocks=[text]`）。
+
+**教训**：DSH developer preview 期间的破坏性变更不只发生在方法签名上，**联合类型的成员也会被删**。锁版本 + 每次升级重跑 `pnpm verify` 是唯一可靠的防线（对应风险登记表 R6）。
 
 ---
 

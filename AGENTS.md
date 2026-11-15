@@ -4,8 +4,8 @@
 
 - **Scaffolded, not feature-complete** (as of 2026-11-16). `package.json`, lockfile, tsconfigs, `cordis.patch.yml`, git history exist. `src/` holds a loadable empty plugin: `utils/binaries.ts` (complete) + `services/latex-preview-service.ts` (skeleton with `@Remote getState/recheckBinaries`). No watcher, no compiler, no panel yet.
 - **Read `docs/spikes.md` before writing any code.** It replaces most of HANDOFF §6's open questions with evidence read out of the real published packages.
-- Source of truth for design: `LaTeX Preview — 开发文档.md` — but note it is **wrong on three points**, corrected in `docs/spikes.md`: (a) callbacks cannot cross Host↔Client, (b) `createUserMessage` takes `source: { kind:'plugin', plugin:'latex-preview' }`, not a bare string, (c) `synctex` field/regex details differ from the spec's parser.
-- Key docs: `docs/spikes.md` (verified contracts), `HANDOFF.md` (status/decisions), `DEVELOPMENT_PLAN.md` (WBS + risks + gates), spec (architecture).
+- Source of truth for design: `docs/LaTeX Preview — 开发文档.md` — but note it is **wrong on three points**, corrected in `docs/spikes.md`: (a) callbacks cannot cross Host↔Client, (b) `createUserMessage` takes `source: { kind: 'user' }` — a discriminated object, and `dsh-llm@0.2.2-rc.1` removed the old `plugin` kind, (c) `synctex` field/regex details differ from the spec's parser.
+- Key docs (all under `docs/`): `spikes.md` (verified contracts), `HANDOFF.md` (status/decisions), `DEVELOPMENT_PLAN.md` (WBS + risks + gates), `LaTeX Preview — 开发文档.md` (architecture).
 - Commands: `npx tsc -p tsconfig.json --noEmit` (typecheck), `npx tsx test/contract/probe.ts` (contract probe), `npx tsc -p tsconfig.json && node scripts/build-client.mjs` (build). `pnpm run <script>` is broken on this machine — see `docs/spikes.md` §B10.
 
 ## What is being built
