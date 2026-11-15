@@ -31,6 +31,7 @@ import { lineDiff } from './diff.ts'
 import { AgentBridge, type AgentRegistryLike } from './agent-bridge.ts'
 import { createApiHandler, type PreviewHost } from './http-api.ts'
 import { mountStaticRoute, ROUTE_PREFIX, type StaticMount, type WebServerLike } from './static-route.ts'
+import { assetsRoot, VIEWER_PATH, viewerAvailable } from '../utils/assets.ts'
 import type { CompileResult, DiffBlock, PreviewState, SyncEditHit, SyncViewHit } from '../types.ts'
 
 /** Service key and wire namespace; must stay identical to the naming convention. */
@@ -102,6 +103,7 @@ export class LatexPreviewService extends TypertRemoteService {
       rootFile: null,
       status: 'idle',
       pdfUrl: null,
+      viewerUrl: null,
       compiledAt: null,
       diagnostics: [],
       binaries: { tectonic: false, synctex: false },
@@ -239,6 +241,13 @@ export class LatexPreviewService extends TypertRemoteService {
       watching: true,
       redact: this.redact,
     })
+
+    // First view of a workspace has no PDF yet; without this the panel stays
+    // empty until the user presses 编译. Failures are already surfaced through
+    // `runCompile`'s state patch, so a rejected promise here adds nothing.
+    if (!this.state.pdfUrl) {
+      void this.runCompile().catch(() => undefined)
+    }
     return this.state
   }
 
@@ -378,7 +387,15 @@ export class LatexPreviewService extends TypertRemoteService {
 
     this.patch({ status: 'compiling', message: '正在编译…' })
     const result = await this.compiler.run()
-    const pdfUrl = result.pdfPath ? `${ROUTE_PREFIX}/pdf/${encodeURIComponent(basename(result.pdfPath))}?v=${this.state.version + 1}` : null
+    const version = this.state.version + 1
+    const pdfRoute = result.pdfPath ? `${ROUTE_PREFIX}/pdf/${encodeURIComponent(basename(result.pdfPath))}` : null
+    const pdfUrl = pdfRoute ? `${pdfRoute}?v=${version}` : null
+    // Our viewer wraps the PDF; without the assets the browser's own viewer is
+    // the only option, hence the null fallback (never a broken iframe URL).
+    const viewerUrl =
+      pdfRoute && viewerAvailable()
+        ? `${ROUTE_PREFIX}${VIEWER_PATH}?file=${encodeURIComponent(pdfRoute)}&v=${version}`
+        : null
 
     if (result.ok) {
       this.previousSource = await this.readSource(rootFile)
@@ -387,6 +404,7 @@ export class LatexPreviewService extends TypertRemoteService {
     this.patch({
       status: result.ok ? 'ok' : 'failed',
       pdfUrl: result.pdfPath ? pdfUrl : this.state.pdfUrl,
+      viewerUrl: result.pdfPath ? viewerUrl : this.state.viewerUrl,
       compiledAt: result.ok ? new Date().toISOString() : this.state.compiledAt,
       diagnostics: result.diagnostics,
       durationMs: result.durationMs,
@@ -447,7 +465,9 @@ export class LatexPreviewService extends TypertRemoteService {
     if (!this.webServer || this.disposeRoute) return
     const mounts: StaticMount[] = [
       { prefix: '/pdf', dir: this.outDir, cacheable: false },
-      { prefix: '/assets', dir: join(process.cwd(), 'assets'), cacheable: true },
+      // Packaged assets, not `process.cwd()/assets`: the viewer must be found
+      // wherever DSH happens to be started from (see utils/assets.ts).
+      { prefix: '/assets', dir: assetsRoot(), cacheable: true },
     ]
     const dispose = mountStaticRoute(this.webServer, mounts, createApiHandler(this.httpHost()))
     if (!dispose) {
@@ -456,6 +476,14 @@ export class LatexPreviewService extends TypertRemoteService {
       return
     }
     this.disposeRoute = dispose
+
+    if (!viewerAvailable()) {
+      this.ctx.logger?.('latex-preview')?.warn?.(
+        'PDF.js assets missing at %s; the panel will fall back to the browser viewer',
+        assetsRoot(),
+      )
+      this.patch({ message: 'PDF.js 资源缺失，已退化为浏览器内置查看器（运行 node scripts/build-assets.mjs 补齐）' })
+    }
   }
 
   /** Release the route; safe to call twice. */

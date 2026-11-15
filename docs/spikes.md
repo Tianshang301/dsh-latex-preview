@@ -9,7 +9,7 @@
 | 编号 | 问题 | 结论 | 对计划的影响 |
 |---|---|---|---|
 | B1 | Host→Client 能否传回调 | **不能，且客户端连 Host 服务都 inject 不到**（真机验证：`pending (waiting for service: latexPreview)`）。Remote 参数只有 `json`/`lookup`，函数无法编码 | 面板改走插件同源 JSON 路由 `/.latex-preview/api/*` |
-| B2 | 槽位 API 与可用槽位 | **已解决一半**：`ctx.slots.inject(key, cb)` 存在且写法正确；但 `editor.panel.item` **不存在**，改用 `sidebar.right.pane.tab`（keyed）。编辑器是否自带仍未知 | P0.5 可开工；P1 的源码视图要自己做 |
+| B2 | 槽位 API 与可用槽位 | **已解决一半**：`ctx.slots.inject(key, cb)` 存在且写法正确；但 `editor.panel.item` **不存在**，改用 `sidebar.right.pane.tab`（keyed）。编辑器是否自带仍未知 | P0.5 已完成，见 §B13（还需第一级类型注册）；P1 的源码视图要自己做 |
 | B3 | `agent` 实例从哪来 | **已解决**：Host 侧 `ctx.agent?: Agent`（`Agent.ctx` 派生上下文自带）+ `ctx.agents: AgentRegistry`；`Agent#steer(message: UserMessage)` | 错误回传可直接实现，不必降级 |
 | B4 | draftMode | 维持"不做"（与 SyncTeX 硬冲突） | 不变 |
 | B5 | 编译超时/单飞 | 规格书缺，必须补 | 不变 |
@@ -18,6 +18,8 @@
 | **B8** | 消息 `source` 的形状 | 规格书写错：不是字符串，是判别式对象。**0.2.2 里 `plugin` kind 已被移除**，插件产出的消息就是 `{ kind: 'user' }` | 已按 0.2.2 契约实现 |
 | **B9** | `synctex` 输出格式 | 已实测：`view` 必须传**绝对路径+正斜杠**；字段是大写 `W:`/`H:`；`Column` 可为 `-1` | P1.1 的解析器按实测写，别照抄规格书正则 |
 | **B10** | 本机 `pnpm run` 被拦 | 本机 pnpm 有供应链策略包装层，`pnpm run` 前置校验因"ignored build scripts"失败 | 本轮用 `npx tsc` / `npx tsx` 直调；不影响产物 |
+| **B12** | PDF.js 查看器从哪来 | pdfjs-dist **不发** `viewer.html`/`viewer.mjs`，只有组件 `web/pdf_viewer.mjs` + `build/pdf.mjs`；`<iframe src=pdf>` 只能拿到浏览器内置查看器，`PDFViewerApplication` 不存在 | 自建 `viewer/` 页（组件拼装），`scripts/build-assets.mjs` 复制进 `assets/`；已真机渲染 1 页 |
+| **B13** | 右侧栏 tab 怎么才算挂上 | 两级注册：`sidebarRightTabs.register({id,kind,…})` + keyed 槽（`key` 必须等于那个 `id`）。只做槽注册则**什么都不显示** | 已实现并真机跑通；服务须用 `ctx.inject` 动态注入 |
 
 ---
 
@@ -411,3 +413,109 @@ allowBuilds:
 2. `src/utils/root.ts`（P0.3）+ `src/services/compile.ts`（P0.2，含超时/单飞/`.prev` 回滚）。
 3. `src/utils/synctex.ts`（P1.1 提前做解析器，成本低且已被 B9 的实测固定）：`parseView`/`parseEdit` 按实测格式写，加 fixture。
 4. P0.4 静态路由（依赖 webServer，需真实 profile）。
+
+## B12 · PDF.js 查看器：pdfjs-dist 不带 viewer，得自己拼
+
+**问题**：面板把 iframe 直接指向 `/.latex-preview/pdf/main.pdf`，浏览器用内置查看器显示——PDF 能看到，但 `window.PDFViewerApplication` 不存在，`client/pdf-viewer.ts` 的三件事全部降级：
+
+- `captureScrollState()` 拿不到 `#viewerContainer` → 滚动保持失效（每次编译回到第 1 页）
+- `scrollPageIntoView()` 不可用 → 诊断点击无法跳页
+- 无法在页面上监听双击 → 反向 SyncTeX 无从触发
+
+**根因不是"忘记拷资源"，而是 pdfjs-dist 4.x 的发布内容**：
+
+```
+pdfjs-dist@4.10.38/
+  build/pdf.mjs, build/pdf.worker.mjs        ← API + worker
+  web/pdf_viewer.mjs, web/pdf_viewer.css     ← 组件（PDFViewer/PDFLinkService/EventBus）
+  web/images/, cmaps/, standard_fonts/       ← chrome 图标、CJK、Base-14 替代
+  x 没有 viewer.html / viewer.mjs            ← 通用查看器应用不在 npm 包里
+```
+
+即：**没有可 iframe 的成品查看器**，只有可编程组件。两条路：
+
+| 方案 | 代价 | 结论 |
+|---|---|---|
+| 从 mozilla 的 `pdf.js` 仓库 `web/` 搬 60+ 个文件 | 需与 4.10.38 对齐、长期跟上游 diff | 否 |
+| 用 `pdf_viewer.mjs` 组件拼一个最小查看器 | ~100 行 + 一个 build script | **采用** |
+
+**实现**（`viewer/`，构建时复制进 `assets/`）：
+
+- `viewer.js`：`import * as pdfjs from '../pdfjs/pdf.mjs'` → `globalThis.pdfjsLib = pdfjs`（`pdf_viewer.mjs` 在模块求值时读这个全局）→ 再动态 `import('../pdfjs/pdf_viewer.mjs')`。顺序不能反，静态 import 会被提升。
+- 结构照抄通用查看器的契约：`#viewerContainer`（**必须** `position:absolute`，`PDFViewer` 构造函数会断言）、`#viewer.pdfViewer`、`.page[data-page-number]`。
+- `annotationMode: 0` + `textLayerMode: 0`：只读预览用不到注释层和文本层，省两次脚本加载与一轮渲染。
+- `l10n` 用四行 stub：`PDFViewer` 只调用 `translate/pause/resume`（grep 实测），不需要 locale 文件。
+- 暴露 `window.PDFViewerApplication = { pdfViewer, pdfDocument, eventBus, linkService }`，**这样 `client/pdf-viewer.ts` 一行都不用改**。
+- 双击 → `postMessage({ source: 'latex-preview-viewer', type: 'sync-reverse', page, x, y })`；坐标 `(css / rect) * viewport * 0.75`（96dpi → 72pt），原点取左上（§B9 的 `y ≈ v`）。
+
+**挂载点修正**：`/assets` 从 `join(process.cwd(), 'assets')` 改成 `assetsRoot()`（由 `import.meta.url` 推插件根）。原来那条路径既不存在、又依赖启动目录，是 `/assets` 404 的直接原因。
+
+**真机验证**（DSH 0.2.2-rc.1，Edge headless，端口 3080）：
+
+| 检查 | 结果 |
+|---|---|
+| `GET /.latex-preview/assets/viewer/index.html` | 200，681 B |
+| `GET .../assets/pdfjs/pdf.mjs` | 200，658 371 B |
+| `GET .../assets/pdfjs/pdf.worker.mjs` | 200，2 209 730 B |
+| `GET .../assets/pdfjs/pdf_viewer.css` | 200，100 297 B |
+| `GET .../assets/pdfjs/cmaps/UniGB-UCS2-H.bcmap` | 200，43 366 B |
+| 查看器页内 `PDFViewerApplication` | 存在，`numPages: 1` |
+| 渲染出的 `.page` / `canvas` | 1 / 1，canvas 816×1056 |
+| 控制台错误 | 无（favicon 已用内联 SVG 去掉） |
+
+`state.viewerUrl` 现在形如 `/.latex-preview/assets/viewer/index.html?file=%2F.latex-preview%2Fpdf%2Fmain.pdf&v=5`；资源缺失时返回 `null`，面板自动退回 `pdfUrl`（浏览器查看器），不会出现坏 iframe。
+
+**打包**：`assets/` 是生成物（约 5.0 MiB），已进 `.gitignore`；`scripts/build-assets.mjs` 可重跑，`package.json` 的 `build` 与 `prepack` 都会调用它，`files` 早已包含 `assets`。
+
+---
+
+## B13 · 右侧栏 tab 需要**两级**注册（B2 的补完）
+
+上一轮只做了第二级：把 body 注册进 keyed 槽 `sidebar.right.pane.tab`。真机里槽条目确实 `active: true`，但**侧栏里什么也没出现**——因为侧栏的 tab 条不是从槽条目画的。
+
+**证据**（`@deepseek-ai/dsh-client-ui-sidebar-right`）：
+
+```js
+// 侧栏从自己的类型注册表 + 会话 layout 画 tab
+const definition = useTabTypes((types) => types.find((d) => d.kind === tab.kind));
+const content = renderSlot(seat, {}, { entryKey: definition?.id ?? tab.kind, ... });
+```
+
+```js
+// 服务面：provide 了两个键
+ctx.reflect.provide("sidebarRightTabs", tabs);   // 类型注册表
+ctx.reflect.provide("sidebarRight", controller); // 导航面（openTab/openResource）
+```
+
+所以顺序是：
+
+1. **第一级（类型）**：`ctx.get('sidebarRightTabs').register({ id, kind, title, keepMounted, guide })`。
+   - `id` 用包名（这是"实现身份"，全局唯一）；
+   - `kind` 是 `openTab` 用的判别值；
+   - **`id` 同时是第二级两个槽的 `key`**——`renderSlot` 用 `entryKey: definition.id` 查表，两边不一致就渲染不出来。
+2. **第二级（内容）**：`ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name, key: id }, Component))`，标题槽同理。
+
+**时序坑**：这两个服务由侧栏插件在自己的 `apply` 里 provide，与本插件的激活顺序没有保证。直接 `ctx.get` 会读到 `undefined`（实测日志：`sidebarRightTabs unavailable; tab type not registered`）。必须用动态注入：
+
+```ts
+ctx.inject(['sidebarRightTabs', 'sidebarRight'], (sub) => { ... })
+```
+
+注意这与 `package.json#dsh.client.inject` 是两回事：后者仍需与导出的 `inject = ['slots']` 逐字一致（§B11 第 2 条），否则整条激活失败。
+
+**打开时机**：`openTab(kind)` 在没有 on-screen Session 时抛异常。首次打开因此是「激活后再等会话」：500ms 重试（最多 20 次）+ 订阅 `sidebarRight.mounted`，任一路径成功即停。一次页面加载只自动打开一次——用户关掉就该保持关掉；之后可从 tab 条 `+` 的 guide 页重新打开（`definition.guide` 提供那一条胶囊）。
+
+**顺带**：`configure()` 在首次配置且没有 PDF 时会立即编译一次，否则面板要等用户点「编译」才有内容。
+
+### 真机验证（2026-11-16）
+
+| 检查 | 结果 |
+|---|---|
+| guide 页出现「LaTeX 预览 / 编译结果、PDF 预览与报错回传」 | ✅ 说明类型注册成功 |
+| 点该胶囊 → 侧栏出现 tab，标题「LaTeX」 | ✅ |
+| tab 内工具条「编译 / 发送给 Agent / 脱敏」+ 状态「已配置主文件：E:////dsh-run////main.tex」 | ✅ |
+| tab 内 iframe | ✅ `/.latex-preview/assets/viewer/index.html?file=%2F.latex-preview%2Fpdf%2Fmain.pdf&v=4` |
+| iframe 内渲染 | ✅ 页面文字 "Hello from DSH LaTeX Preview." / "1 Demo" 可见 |
+| 零点击路径（只打开会话） | ✅ 自动打开 tab 且自动完成首编，iframe 带上 PDF 版本号 |
+
+---

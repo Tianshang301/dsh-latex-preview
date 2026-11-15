@@ -102,17 +102,49 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
     }
   }, [api])
 
-  // Swap the PDF only when the URL actually changed, preserving scroll position.
-  const pdfUrl = state?.pdfUrl ?? null
+  // Our PDF.js page when the assets are built, otherwise the raw PDF so the
+  // browser's viewer still shows something. Swap only when the URL changed.
+  const pdfUrl = state?.viewerUrl ?? state?.pdfUrl ?? null
   useEffect(() => {
     if (!pdfUrl || pdfUrl === lastUrl.current) return
     const frame = frameRef.current
     if (!frame) return
-    // Must happen before the new document loads.
+    // Must happen before the new document loads, even across a viewer swap.
     viewer()?.captureScrollState()
     lastUrl.current = pdfUrl
     frame.src = pdfUrl
   }, [pdfUrl, viewer])
+
+  // The viewer reports readiness and double-clicks over postMessage; `load` on
+  // the iframe fires before the PDF has any pages, so `ready` is the reliable
+  // moment to restore scroll and to accept reverse jumps.
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      const data = event.data as { source?: string; type?: string; page?: number; x?: number; y?: number; message?: string } | null
+      if (!data || data.source !== 'latex-preview-viewer') return
+      if (data.type === 'ready') {
+        viewer()?.restoreScrollState()
+        return
+      }
+      if (data.type === 'error' && data.message) {
+        setNotice(data.message)
+        return
+      }
+      if (data.type === 'sync-reverse' && typeof data.page === 'number') {
+        void (async () => {
+          const result = await unwrap(api.jumpToSource({ page: data.page as number, x: data.x ?? 0, y: data.y ?? 0 }))
+          if (!result.ok) {
+            setNotice(result.message)
+            return
+          }
+          const hit = result.value[0]
+          setHits(hit ? `反向跳转：第 ${hit.line} 行` : '该位置没有源码映射')
+        })()
+      }
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [api, viewer])
 
   /** Run one action with the busy flag and a single error channel. */
   const run = useCallback(async (action: () => Promise<{ ok: boolean; message?: string }>) => {

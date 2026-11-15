@@ -29,6 +29,14 @@ export interface PreviewState {
   readonly status: CompileState
   /** Same-origin URL of the current PDF, cache-busted per successful compile. */
   readonly pdfUrl: string | null
+  /**
+   * URL of our PDF.js viewer page, which wraps {@link pdfUrl}.
+   *
+   * Null when the assets are not built (`node scripts/build-assets.mjs`); the
+   * panel then points the iframe straight at the PDF and the browser's own
+   * viewer takes over, losing scroll preservation and page jumps.
+   */
+  readonly viewerUrl: string | null
   /** ISO timestamp of the last successful compile. */
   readonly compiledAt: string | null
   /** Diagnostics of the most recent attempt, newest compile wins. */

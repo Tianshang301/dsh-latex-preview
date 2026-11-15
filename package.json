@@ -31,10 +31,12 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/build-client.mjs",
+    "assets": "node scripts/build-assets.mjs",
+    "binaries": "tsx scripts/check-binaries.ts",
+    "build": "tsc -p tsconfig.json && node scripts/build-client.mjs && node scripts/build-assets.mjs",
+    "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "verify": "tsx test/contract/probe.ts",
-    "binaries": "tsx scripts/check-binaries.ts"
+    "verify": "tsx test/contract/probe.ts"
   },
   "dependencies": {
     "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.1",
