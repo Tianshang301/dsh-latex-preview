@@ -35,6 +35,16 @@ export interface PreviewState {
   readonly diagnostics: readonly LatexDiagnostic[]
   /** Whether each external binary was found at startup. */
   readonly binaries: { readonly tectonic: boolean; readonly synctex: boolean }
+  /** One-line status for the panel's status bar (root resolution, failures, mount state). */
+  readonly message: string | null
+  /** Whether the file watcher currently has live handles. */
+  readonly watching: boolean
+  /** Mirror of the redaction switch, so the UI can render its state. */
+  readonly redact: boolean
+  /** Duration of the last compile in milliseconds. */
+  readonly durationMs: number | null
+  /** Candidate root files when resolution was ambiguous. */
+  readonly rootCandidates: readonly string[]
 }
 
 /** Result of a forward SyncTeX jump (source line → PDF position). */
@@ -62,4 +72,39 @@ export interface DiffBlock {
   readonly text: string
   readonly startLine: number
   readonly endLine: number
+}
+
+/** Outcome of one compile attempt, as handed back to the client. */
+export interface CompileResult {
+  readonly ok: boolean
+  /** Process exit code; null when the process was killed or never started. */
+  readonly exitCode: number | null
+  readonly timedOut: boolean
+  readonly durationMs: number
+  /** Absolute path of the PDF on disk, or null when none exists yet. */
+  readonly pdfPath: string | null
+  /** Same-origin URL with a cache-busting version, or null. */
+  readonly pdfUrl: string | null
+  /** Absolute path of the parsed `.log`, when Tectonic wrote one. */
+  readonly logPath: string | null
+  readonly diagnostics: readonly LatexDiagnostic[]
+  /** Last lines of stdout — Tectonic prints bundle downloads here on first run. */
+  readonly stdoutTail: string
+  readonly stderrTail: string
+  /** True when a failed compile restored the previous PDF. */
+  readonly rolledBack: boolean
+}
+
+/** Tunables the client may push down; every field has a host-side default. */
+export interface PreviewConfig {
+  readonly rootFile: string | null
+  /** Directory receiving pdf/log/synctex. Defaults to `<rootDir>/.latex-preview`. */
+  readonly outDir: string
+  readonly debounceMs: number
+  /** Ordinary compile budget. */
+  readonly timeoutMs: number
+  /** First compile may download the bundle; give it more room. */
+  readonly firstRunTimeoutMs: number
+  /** Redaction switch for the error hand-off (product requirement, default off). */
+  readonly redact: boolean
 }

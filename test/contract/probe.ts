@@ -87,11 +87,12 @@ await probe('ctx.inject(deps, cb) resolves deferred services', async () => {
 
 // 4 · createUserMessage: what actually comes back, and what `source` must be.
 await probe('createUserMessage({ content, source })', () => {
-  // The spec wrote `source: 'latex-preview'` (a bare string). The real contract
-  // is a discriminated object; a plugin producer is `{ kind: 'plugin', plugin }`.
+  // The spec wrote `source: 'latex-preview'` (a bare string). The real contract is
+  // a discriminated object, and `dsh-llm@0.2.2-rc.1` dropped the `plugin` kind, so
+  // a plugin-produced turn is an ordinary `{ kind: 'user' }` message.
   const message = createUserMessage({
     content: [{ type: 'text', text: 'LaTeX 编译失败，请修复' }],
-    source: { kind: 'plugin', plugin: 'latex-preview' },
+    source: { kind: 'user' },
   })
   if (message.role !== 'user') throw new Error(`role is ${message.role}`)
   if (!message.id) throw new Error('no id assigned')
@@ -118,7 +119,7 @@ await probe('getState() returns a JSON snapshot', async () => {
 record(
   'agent.steer(UserMessage)',
   'SKIP',
-  'needs @deepseek-ai/dsh-agent runtime (AgentRegistry/loop); Host must reach it via ctx.inject(["agents"]) and Agent#steer(message: UserMessage)',
+  'needs @deepseek-ai/dsh-agent runtime; Host reaches it via ctx.inject(["agents"]) then Agent#steer(message: UserMessage) — implemented in services/agent-bridge.ts',
 )
 
 // 7 · webServer: needs the DSH runtime, not part of cordis core.
