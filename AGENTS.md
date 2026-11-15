@@ -2,7 +2,7 @@
 
 ## Repo state (read this first)
 
-- **Scaffolded, not feature-complete** (as of 2026-11-16). `package.json`, lockfile, tsconfigs, `cordis.patch.yml`, git history exist. `src/` holds a loadable empty plugin: `utils/binaries.ts` (complete) + `services/latex-preview-service.ts` (skeleton with `@Remote getState/recheckBinaries`). No watcher, no compiler, no panel yet.
+- **P0 host pipeline is implemented and verified on a real machine** (2026-11-16): `utils/{binaries,root,log-parser,synctex}.ts`, `services/{compile,watcher,diff,agent-bridge,static-route}.ts`, wired through `LatexPreviewService` (8 `@Remote` methods). Client half registers a keyed tab into `sidebar.right.pane.tab` (NOT `editor.panel.item` — that slot does not exist) and renders `client/panel.tsx`. Not yet exercised inside a real DSH profile: the static route shape (B6) and the panel's composed props.
 - **Read `docs/spikes.md` before writing any code.** It replaces most of HANDOFF §6's open questions with evidence read out of the real published packages.
 - Source of truth for design: `docs/LaTeX Preview — 开发文档.md` — but note it is **wrong on three points**, corrected in `docs/spikes.md`: (a) callbacks cannot cross Host↔Client, (b) `createUserMessage` takes `source: { kind: 'user' }` — a discriminated object, and `dsh-llm@0.2.2-rc.1` removed the old `plugin` kind, (c) `synctex` field/regex details differ from the spec's parser.
 - Key docs (all under `docs/`): `spikes.md` (verified contracts), `HANDOFF.md` (status/decisions), `DEVELOPMENT_PLAN.md` (WBS + risks + gates), `LaTeX Preview — 开发文档.md` (architecture).

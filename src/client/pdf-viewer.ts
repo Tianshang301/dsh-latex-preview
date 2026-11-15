@@ -142,6 +142,16 @@ export class PDFViewer {
   reset(): void {
     this.state = null
   }
+
+  /**
+   * Scroll to a page without disturbing the remembered position.
+   * Used by diagnostic clicks, where the target comes from SyncTeX rather than
+   * from where the user was.
+   * @param page - 1-based page number.
+   */
+  jumpToPage(page: number): void {
+    this.adapter.scrollToPage(Math.max(1, page))
+  }
 }
 
 /**

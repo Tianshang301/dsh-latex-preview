@@ -264,6 +264,15 @@ window.__ModuleLoader__.load({
 
 尝试过且**无效**：`package.json` 的 `pnpm.onlyBuiltDependencies`、`.npmrc` 的 `only-built-dependencies[]`、`pnpm-workspace.yaml`（`onlyBuiltDependencies` 用 list 形式报 schema 错，object 形式被接受但仍被忽略）。
 
+**补充（2026-11-16 二次尝试）**：pnpm 11 会自己生成 `pnpm-workspace.yaml`，内容是
+
+```yaml
+allowBuilds:
+  esbuild: set this to true or false
+```
+
+照着填 `esbuild: true` 之后重装，**仍然**报 `ERR_PNPM_IGNORED_BUILDS`。这条 pnpm 外面套了供应链策略层（启动时会打印 "Lockfile passes supply-chain policies"），构建脚本被策略拦掉，不是配置能解决的。结论：`pnpm run` 在这台机器上不可用，继续直调。
+
 **当前做法**：直调 `npx tsc -p tsconfig.json`、`npx tsx test/contract/probe.ts`、`node scripts/build-client.mjs`。`package.json` 里的 scripts 保留原样，在干净环境可用。esbuild 本身工作正常（`npx esbuild --version` → 0.24.2），因为没有 postinstall 也能用。
 
 ---

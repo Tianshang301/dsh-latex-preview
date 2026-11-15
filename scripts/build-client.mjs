@@ -36,11 +36,12 @@ const id = pkg.name
 await rm(OUT, { force: true })
 
 await build({
-  entryPoints: ['src/client/index.ts'],
+  entryPoints: ['src/client/index.tsx'],
   outfile: OUT,
   bundle: true,
   format: 'cjs',
   platform: 'browser',
+  jsx: 'automatic',
   target: ['es2022'],
   sourcemap: true,
   legalComments: 'none',

@@ -1,0 +1,236 @@
+/**
+ * The preview panel.
+ *
+ * Data flow (see docs/spikes.md §B1): the transport cannot push, so this polls
+ * `getState()` and reacts to the `version` counter. A poll that returns the same
+ * version does nothing — no re-render, no iframe reload.
+ *
+ * Scroll preservation ordering is the whole point of the iframe ref: capture the
+ * old document's position **before** the new URL is assigned, restore after the
+ * iframe reports `load`. Getting that order wrong is the bug users uninstall over.
+ *
+ * @module dsh-latex-preview/client/panel
+ */
+
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { POLL_INTERVAL_MS, unwrap, type PreviewApi } from './api.ts'
+import { PDFViewer, PDFViewerAdapter } from './pdf-viewer.ts'
+import type { LatexDiagnostic, PreviewState } from '../types.ts'
+
+/** Everything the panel needs from the shell. */
+export interface PanelProps {
+  readonly api: PreviewApi
+  /** Workspace file the panel should preview; omitted when the shell supplies none. */
+  readonly file?: string
+}
+
+const styles = {
+  root: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, font: '12px/1.5 system-ui, sans-serif' },
+  bar: { display: 'flex', gap: 6, alignItems: 'center', padding: '6px 8px', flexWrap: 'wrap' as const },
+  button: {
+    font: 'inherit',
+    padding: '2px 8px',
+    border: '1px solid rgba(0,0,0,.18)',
+    borderRadius: 4,
+    background: 'transparent',
+    cursor: 'pointer',
+  },
+  status: { opacity: 0.75, flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const },
+  frame: { flex: '1 1 auto', minHeight: 0, border: 'none', width: '100%', background: '#f5f5f5' },
+  list: { maxHeight: '30%', overflow: 'auto', margin: 0, padding: 0, listStyle: 'none', borderTop: '1px solid rgba(0,0,0,.1)' },
+  item: { padding: '4px 8px', cursor: 'pointer', borderBottom: '1px solid rgba(0,0,0,.06)' },
+  error: { color: '#b3261e' },
+  warning: { color: '#8a6d00' },
+  empty: { padding: 12, opacity: 0.7 },
+} as const
+
+/**
+ * Render the panel.
+ * @param props - the Host API face and optional workspace file.
+ * @returns the panel tree.
+ */
+export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
+  const [state, setState] = useState<PreviewState | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [working, setWorking] = useState(false)
+  const [hits, setHits] = useState<string | null>(null)
+
+  const frameRef = useRef<HTMLIFrameElement | null>(null)
+  const viewerRef = useRef<PDFViewer | null>(null)
+  const lastVersion = useRef(-1)
+  const lastUrl = useRef<string | null>(null)
+  const configured = useRef(false)
+
+  /** Lazily create the viewer adapter once the iframe exists. */
+  const viewer = useCallback((): PDFViewer | null => {
+    const frame = frameRef.current
+    if (!frame) return null
+    if (!viewerRef.current) viewerRef.current = new PDFViewer(new PDFViewerAdapter(frame))
+    return viewerRef.current
+  }, [])
+
+  // Point the Host at our workspace once.
+  useEffect(() => {
+    if (configured.current || !file) return
+    configured.current = true
+    void unwrap(api.configure({ file })).then((result) => {
+      if (!result.ok) setNotice(result.message)
+    })
+  }, [api, file])
+
+  // Poll the Host. The transport has no push channel, so this is the data flow.
+  useEffect(() => {
+    let alive = true
+    const tick = async () => {
+      const result = await unwrap(api.getState())
+      if (!alive) return
+      if (!result.ok) {
+        setNotice(result.message)
+        return
+      }
+      if (result.value.version === lastVersion.current) return
+      lastVersion.current = result.value.version
+      setState(result.value)
+    }
+    void tick()
+    const timer = window.setInterval(() => void tick(), POLL_INTERVAL_MS)
+    return () => {
+      alive = false
+      window.clearInterval(timer)
+    }
+  }, [api])
+
+  // Swap the PDF only when the URL actually changed, preserving scroll position.
+  const pdfUrl = state?.pdfUrl ?? null
+  useEffect(() => {
+    if (!pdfUrl || pdfUrl === lastUrl.current) return
+    const frame = frameRef.current
+    if (!frame) return
+    // Must happen before the new document loads.
+    viewer()?.captureScrollState()
+    lastUrl.current = pdfUrl
+    frame.src = pdfUrl
+  }, [pdfUrl, viewer])
+
+  /** Run one action with the busy flag and a single error channel. */
+  const run = useCallback(async (action: () => Promise<{ ok: boolean; message?: string }>) => {
+    setWorking(true)
+    setNotice(null)
+    try {
+      const result = await action()
+      if (!result.ok && result.message) setNotice(result.message)
+    } finally {
+      setWorking(false)
+    }
+  }, [])
+
+  const onCompile = useCallback(() => {
+    void run(async () => {
+      const result = await unwrap(api.compileNow())
+      return result.ok ? { ok: true } : { ok: false, message: result.message }
+    })
+  }, [api, run])
+
+  const onSendToAgent = useCallback(() => {
+    void run(async () => {
+      const result = await unwrap(api.sendErrorToAgent({}))
+      if (!result.ok) return { ok: false, message: result.message }
+      setNotice('错误已发送给 Agent')
+      return { ok: true }
+    })
+  }, [api, run])
+
+  const onToggleRedact = useCallback(
+    (redact: boolean) => {
+      void run(async () => {
+        const result = await unwrap(api.configure({ redact }))
+        return result.ok ? { ok: true } : { ok: false, message: result.message }
+      })
+    },
+    [api, run],
+  )
+
+  const onSelectDiagnostic = useCallback(
+    (diagnostic: LatexDiagnostic) => {
+      void run(async () => {
+        const result = await unwrap(api.jumpToPdf({ line: diagnostic.line }))
+        if (!result.ok) return { ok: false, message: result.message }
+        const hit = result.value[0]
+        if (!hit) {
+          setHits('该位置没有 PDF 映射（可能在导言区或宏定义内）')
+          return { ok: true }
+        }
+        viewer()?.jumpToPage(hit.page)
+        setHits(`第 ${hit.page} 页 · x=${hit.x.toFixed(1)} y=${hit.y.toFixed(1)}`)
+        return { ok: true }
+      })
+    },
+    [api, run, viewer],
+  )
+
+  const errors = useMemo(() => state?.diagnostics.filter((d) => d.severity === 'error') ?? [], [state])
+  const warnings = useMemo(() => state?.diagnostics.filter((d) => d.severity === 'warning') ?? [], [state])
+
+  if (!state) {
+    return <div style={styles.root}><div style={styles.empty}>正在连接 LaTeX Preview 服务…</div></div>
+  }
+
+  if (!state.binaries.tectonic) {
+    return (
+      <div style={styles.root}>
+        <div style={styles.empty}>
+          未检测到 <code>tectonic</code>。请先安装并确保它在 PATH 中，然后点下面的按钮重新检测。
+          <div style={{ marginTop: 8 }}>
+            <button style={styles.button} onClick={() => void run(async () => unwrap(api.recheckBinaries()).then((r) => ({ ok: r.ok })))}>
+              重新检测
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div style={styles.root}>
+      <div style={styles.bar}>
+        <button style={styles.button} disabled={working} onClick={onCompile}>
+          {state.status === 'compiling' ? '编译中…' : '编译'}
+        </button>
+        <button style={styles.button} disabled={working || errors.length === 0} onClick={onSendToAgent}>
+          发送给 Agent
+        </button>
+        <label style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+          <input type="checkbox" checked={state.redact} onChange={(event) => onToggleRedact(event.target.checked)} />
+          脱敏
+        </label>
+        <span style={styles.status} title={state.rootFile ?? ''}>
+          {notice ?? hits ?? state.message ?? (state.rootFile ? state.rootFile : '未配置主文件')}
+        </span>
+      </div>
+
+      <iframe
+        ref={frameRef}
+        style={styles.frame}
+        title="LaTeX PDF preview"
+        onLoad={() => viewer()?.restoreScrollState()}
+      />
+
+      {(errors.length > 0 || warnings.length > 0) && (
+        <ul style={styles.list}>
+          {[...errors, ...warnings].map((diagnostic, index) => (
+            <li
+              key={`${diagnostic.file}:${diagnostic.line}:${index}`}
+              style={{ ...styles.item, ...(diagnostic.severity === 'error' ? styles.error : styles.warning) }}
+              onClick={() => onSelectDiagnostic(diagnostic)}
+              title={diagnostic.context}
+            >
+              {diagnostic.severity === 'error' ? '✕' : '!'}{' '}
+              {diagnostic.line > 0 ? `第 ${diagnostic.line} 行 · ` : ''}
+              {diagnostic.message}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
