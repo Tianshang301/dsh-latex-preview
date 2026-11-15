@@ -13,8 +13,14 @@
  * from the PDF as content — formulas and ligatures extract badly — the rectangle
  * is only ever used to ask SyncTeX which source lines it covers.
  *
+ * It also draws the diff overlay: the panel sends the rectangles of the lines
+ * changed since the previous compile, and this page paints them over the pages.
+ * The overlay is `pointer-events: none` so it never steals a selection from the
+ * text layer — hover/click are resolved by hit-testing instead.
+ *
  * Contract with the host panel (`client/panel.tsx`):
- *   parent ← { source: 'latex-preview-viewer', type: 'ready' | 'page' | 'sync-reverse' | 'edit-request' | 'error' }
+ *   parent ← { source: 'latex-preview-viewer', type: 'ready' | 'page' | 'sync-reverse' | 'edit-request' | 'diff-click' | 'error' }
+ *   viewer ← { source: 'latex-preview-panel', type: 'diff', regions, visible }
  *
  * @module dsh-latex-preview/viewer
  */
@@ -205,6 +211,138 @@ function showBar(region, quoted, anchor) {
   el.querySelector('.editBarInput').focus()
 }
 
+// ── Diff overlay ────────────────────────────────────────────────────────────
+
+/** Message source the host panel uses when talking to the viewer. */
+const PANEL_SOURCE = 'latex-preview-panel'
+
+/** Rectangles for the loaded PDF, in points; empty hides the overlay. */
+let diffRegions = []
+let diffVisible = true
+
+/** Painted rectangles, kept for hit-testing (the layer itself ignores the mouse). */
+let painted = []
+
+/** Floating label that explains the region under the cursor. */
+let diffTip = null
+
+/** Set when a rubber-band ended, so the trailing click is not read as a jump. */
+let suppressClickUntil = 0
+
+/**
+ * Paint (or clear) the overlay for one page.
+ * @param {HTMLElement} pageEl - the `.page` element.
+ */
+async function paintDiffPage(pageEl) {
+  pageEl.querySelector('.diffLayer')?.remove()
+  painted = painted.filter((entry) => entry.pageEl !== pageEl)
+  if (!pdfDocument) return
+
+  const pageNumber = Number(pageEl.dataset.pageNumber)
+  const list = diffVisible ? diffRegions.filter((region) => region.page === pageNumber) : []
+  if (list.length === 0) return
+
+  const page = await pdfDocument.getPage(pageNumber)
+  // `getViewport({scale:1})` is in PDF points (§B15). Positioning in percent keeps
+  // the bands glued to the text through zoom and re-layout, with no resize hook.
+  const viewport = page.getViewport({ scale: 1 })
+  const layer = document.createElement('div')
+  layer.className = 'diffLayer'
+
+  for (const region of list) {
+    const box = document.createElement('div')
+    box.className = `diffRegion diff-${region.kind}`
+    box.style.left = `${(region.x / viewport.width) * 100}%`
+    box.style.top = `${(region.y / viewport.height) * 100}%`
+    box.style.width = `${(region.width / viewport.width) * 100}%`
+    // A deletion has no text left to tint: draw a 2 px seam instead of a band, so
+    // it cannot be mistaken for "this line changed".
+    box.style.height = region.kind === 'delete' ? '2px' : `${(region.height / viewport.height) * 100}%`
+    layer.append(box)
+    painted.push({ pageEl, region, width: viewport.width, height: viewport.height })
+  }
+  pageEl.append(layer)
+}
+
+/** Repaint every page that exists right now. */
+async function paintDiff() {
+  const pages = [...viewerEl.querySelectorAll('.page')]
+  for (const pageEl of pages) await paintDiffPage(pageEl)
+}
+
+/** Region under a viewport point, or null. */
+function diffRegionAt(clientX, clientY) {
+  for (const entry of painted) {
+    const box = entry.pageEl.getBoundingClientRect()
+    if (box.width <= 0 || box.height <= 0) continue
+    const left = box.left + (entry.region.x / entry.width) * box.width
+    const top = box.top + (entry.region.y / entry.height) * box.height
+    const right = left + (entry.region.width / entry.width) * box.width
+    // A 2 px seam is unhittable; widen it vertically for hover and click.
+    const bottom = top + Math.max((entry.region.height / entry.height) * box.height, 8)
+    if (clientX >= left && clientX <= right && clientY >= top && clientY <= bottom) return entry.region
+  }
+  return null
+}
+
+/**
+ * Show or move the tooltip.
+ * @param {string} text - label, empty hides it.
+ * @param {number} x - viewport x.
+ * @param {number} y - viewport y.
+ */
+function showDiffTip(text, x, y) {
+  if (text === '') {
+    diffTip?.remove()
+    diffTip = null
+    return
+  }
+  if (!diffTip) {
+    diffTip = document.createElement('div')
+    diffTip.id = 'diffTip'
+    document.body.append(diffTip)
+  }
+  diffTip.textContent = text
+  const width = diffTip.offsetWidth
+  diffTip.style.left = `${Math.max(8, Math.min(x + 12, window.innerWidth - width - 8))}px`
+  diffTip.style.top = `${Math.max(8, y - 28)}px`
+}
+
+// Pages render on demand (the viewer only keeps a window of them), so a repaint
+// triggered by a message would miss pages that mount later.
+eventBus.on('pagerendered', (event) => {
+  const pageEl = viewerEl.querySelector(`.page[data-page-number="${event.pageNumber}"]`)
+  if (pageEl) void paintDiffPage(pageEl)
+})
+
+window.addEventListener('message', (event) => {
+  const data = event.data
+  if (!data || data.source !== PANEL_SOURCE || data.type !== 'diff') return
+  diffRegions = Array.isArray(data.regions) ? data.regions : []
+  diffVisible = data.visible !== false
+  void paintDiff()
+})
+
+container.addEventListener('mousemove', (event) => {
+  if (drag) {
+    showDiffTip('', 0, 0)
+    return
+  }
+  const region = diffRegionAt(event.clientX, event.clientY)
+  showDiffTip(region?.title ?? '', event.clientX, event.clientY)
+})
+
+container.addEventListener('mouseleave', () => showDiffTip('', 0, 0))
+
+// A click on a band jumps to the source line that produced it. Hit-tested rather
+// than bound to the element, because the layer must stay transparent to the mouse.
+container.addEventListener('click', (event) => {
+  if (Date.now() < suppressClickUntil) return
+  if (!window.getSelection()?.isCollapsed) return
+  const region = diffRegionAt(event.clientX, event.clientY)
+  if (region) tell('diff-click', { line: region.lineStart })
+})
+
 // ── Gestures ────────────────────────────────────────────────────────────────
 
 /**
@@ -279,6 +417,7 @@ container.addEventListener('mouseup', async (event) => {
   if (!drag) return
   const { pageEl, startX, startY, box } = drag
   drag = null
+  suppressClickUntil = Date.now() + 300
   box?.remove()
   if (Math.abs(event.clientX - startX) < MIN_REGION || Math.abs(event.clientY - startY) < MIN_REGION) return
   const rect = {

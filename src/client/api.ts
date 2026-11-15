@@ -13,7 +13,16 @@
  * @module dsh-latex-preview/client/api
  */
 
-import type { CompileResult, DiffBlock, EditOutcome, EditRequest, PreviewState, SyncEditHit, SyncViewHit } from '../types.ts'
+import type {
+  CompileResult,
+  DiffBlock,
+  DiffRegions,
+  EditOutcome,
+  EditRequest,
+  PreviewState,
+  SyncEditHit,
+  SyncViewHit,
+} from '../types.ts'
 
 /** Transport envelope every Remote call resolves to. */
 export type RemoteResult<T> =
@@ -29,6 +38,8 @@ export interface PreviewApi {
   ): Promise<RemoteResult<PreviewState>>
   compileNow(signal?: AbortSignal): Promise<RemoteResult<CompileResult>>
   getDiff(signal?: AbortSignal): Promise<RemoteResult<readonly DiffBlock[]>>
+  /** Highlight rectangles for the changes since the previous compile. */
+  getDiffRegions(signal?: AbortSignal): Promise<RemoteResult<DiffRegions>>
   jumpToPdf(request: { line: number; file?: string }, signal?: AbortSignal): Promise<RemoteResult<readonly SyncViewHit[]>>
   jumpToSource(request: { page: number; x: number; y: number }, signal?: AbortSignal): Promise<RemoteResult<readonly SyncEditHit[]>>
   sendErrorToAgent(request: { redact?: boolean; sessionId?: string }, signal?: AbortSignal): Promise<RemoteResult<{ ok: boolean; detail?: string }>>
@@ -102,6 +113,10 @@ export class HttpPreviewApi implements PreviewApi {
 
   getDiff(signal?: AbortSignal): Promise<RemoteResult<readonly DiffBlock[]>> {
     return this.call('diff', {}, signal)
+  }
+
+  getDiffRegions(signal?: AbortSignal): Promise<RemoteResult<DiffRegions>> {
+    return this.call('diff-regions', {}, signal)
   }
 
   jumpToPdf(request: { line: number; file?: string }, signal?: AbortSignal): Promise<RemoteResult<readonly SyncViewHit[]>> {

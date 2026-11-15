@@ -28,11 +28,22 @@ import { synctexEdit, synctexView } from '../utils/synctex.ts'
 import { CompileService, compilePaths } from './compile.ts'
 import { FileWatcher } from './watcher.ts'
 import { lineDiff } from './diff.ts'
+import { bandsFromHits, diffHunks } from './diff-regions.ts'
 import { AgentBridge, buildSelectionPrompt, type AgentLike, type AgentRegistryLike } from './agent-bridge.ts'
 import { createApiHandler, type PreviewHost } from './http-api.ts'
 import { mountStaticRoute, ROUTE_PREFIX, type StaticMount, type WebServerLike } from './static-route.ts'
 import { assetsRoot, VIEWER_PATH, viewerAvailable } from '../utils/assets.ts'
-import type { CompileResult, DiffBlock, EditOutcome, EditRequest, PreviewState, SyncEditHit, SyncViewHit } from '../types.ts'
+import type {
+  CompileResult,
+  DiffBlock,
+  DiffRegion,
+  DiffRegions,
+  EditOutcome,
+  EditRequest,
+  PreviewState,
+  SyncEditHit,
+  SyncViewHit,
+} from '../types.ts'
 
 /** Service key and wire namespace; must stay identical to the naming convention. */
 export const SERVICE_KEY = 'latexPreview'
@@ -58,6 +69,12 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
 /** How many source lines one "change this spot" request may quote. */
 const MAX_EDIT_LINES = 12
 
+/** Hunks highlighted per revision; beyond this the overlay stops being readable. */
+const MAX_DIFF_HUNKS = 24
+
+/** `synctex view` calls one overlay may spend; each is a process per line. */
+const MAX_DIFF_LINES = 40
+
 const DEFAULT_DEBOUNCE_MS = 500
 const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_FIRST_RUN_TIMEOUT_MS = 300_000
@@ -71,7 +88,17 @@ export class LatexPreviewService extends TypertRemoteService {
   private webServer: WebServerLike | undefined
   private disposeRoute: (() => void) | null = null
   private redact = false
+  /**
+   * Source that produced the previous PDF (the `.pdf.prev` artifact).
+   *
+   * Kept separate from {@link compiledSource} because a diff has to answer "what
+   * did *this* PDF change", not "what differs from the file on disk right now" —
+   * the user may already have typed the next edit while the panel still shows the
+   * old render.
+   */
   private previousSource: string | null = null
+  /** Source that produced the PDF currently on screen. */
+  private compiledSource: string | null = null
   private outDir: string
   private debounceMs = DEFAULT_DEBOUNCE_MS
 
@@ -225,7 +252,9 @@ export class LatexPreviewService extends TypertRemoteService {
       timeoutMs: DEFAULT_TIMEOUT_MS,
       firstRunTimeoutMs: DEFAULT_FIRST_RUN_TIMEOUT_MS,
     })
-    this.previousSource = await this.readSource(rootFile)
+    const initial = await this.readSource(rootFile)
+    this.previousSource = initial
+    this.compiledSource = initial
 
     await this.stopWatching()
     this.watcher = new FileWatcher({
@@ -280,11 +309,88 @@ export class LatexPreviewService extends TypertRemoteService {
 
   /** Diff body shared by the Remote method and the HTTP API. */
   private async readDiff(): Promise<readonly DiffBlock[]> {
+    const head = this.compiledSource
+    if (this.previousSource === null || head === null) return []
+    return lineDiff(this.previousSource, head)
+  }
+
+  /**
+   * Rectangles for the changes since the previous compile.
+   *
+   * Deletions have no lines in the current PDF, so they are anchored where they
+   * were removed and drawn as a marker — the removed text itself is only
+   * visible in the previous revision, which the panel does not show.
+   * @param signal - client cancellation.
+   * @returns regions tagged with the state version they were computed for.
+   */
+  @Remote
+  async getDiffRegions(signal: AbortSignal): Promise<DiffRegions> {
+    signal.throwIfAborted()
+    return this.readDiffRegions()
+  }
+
+  /** Body shared by the Remote method and the HTTP API. */
+  private async readDiffRegions(): Promise<DiffRegions> {
+    const version = this.state.version
+    const empty: DiffRegions = { version, regions: [], skipped: 0 }
     const rootFile = this.state.rootFile
-    if (!rootFile || this.previousSource === null) return []
-    const current = await this.readSource(rootFile)
-    if (current === null) return []
-    return lineDiff(this.previousSource, current)
+    const head = this.compiledSource
+    if (!rootFile || this.previousSource === null || head === null || !this.state.pdfUrl) return empty
+
+    const hunks = diffHunks(lineDiff(this.previousSource, head))
+    const totalLines = Math.max(1, head.split(/\r?\n/).length)
+    const pdf = compilePaths(rootFile, this.outDir).pdf
+    const regions: DiffRegion[] = []
+    let budget = MAX_DIFF_LINES
+    let skipped = Math.max(0, hunks.length - MAX_DIFF_HUNKS)
+
+    for (const hunk of hunks.slice(0, MAX_DIFF_HUNKS)) {
+      if (budget <= 0) {
+        skipped += 1
+        continue
+      }
+      const first = Math.min(Math.max(1, hunk.lineStart), totalLines)
+      const last = Math.min(Math.max(first, hunk.lineEnd), totalLines)
+      const hits: SyncViewHit[] = []
+
+      if (hunk.kind === 'delete') {
+        // Anchor above the hole, not below it: the line that took the deleted
+        // block's place is often `\end{document}` or a comment, and `synctex view`
+        // answers for those with the *page-number* box at the bottom of the sheet.
+        // The text above the hole always renders, and the seam belongs at its foot.
+        budget -= 1
+        const anchor = first > 1 ? await this.mappedLine(rootFile, pdf, totalLines, first - 1, 'before') : null
+        if (anchor === null) {
+          skipped += 1
+          continue
+        }
+        hits.push(...anchor)
+      } else {
+        const lines = sampleLines(first, last, budget)
+        budget -= lines.length
+        for (const line of lines) {
+          hits.push(...(await synctexView(rootFile, line, pdf, { cwd: this.outDir })))
+        }
+      }
+
+      const where = first === last ? `第 ${first} 行` : `第 ${first}-${last} 行`
+      const what =
+        hunk.kind === 'delete'
+          ? `在第 ${first} 行之前删除了 ${hunk.removed} 行（新 PDF 里已无内容，只留接缝）`
+          : hunk.kind === 'insert'
+            ? `新增${where}`
+            : `修改${where}`
+      const title = hunk.preview === '' ? what : `${what}：${hunk.preview}`
+
+      for (const band of bandsFromHits(hits)) {
+        // The seam sits at the foot of the line above the hole, which is where the
+        // deleted content used to begin.
+        const y = hunk.kind === 'delete' ? band.y + band.height : band.y
+        regions.push({ ...band, y, kind: hunk.kind, lineStart: first, lineEnd: last, title })
+      }
+    }
+
+    return { version, regions, skipped }
   }
 
   /**
@@ -393,6 +499,37 @@ export class LatexPreviewService extends TypertRemoteService {
       message: `已把这个位置的修改要求发给 Agent（${basename(first.file)}:${lineStart === lineEnd ? lineStart : `${lineStart}-${lineEnd}`}）`,
     })
     return { ok: true, file: basename(first.file), line: lineStart, lineEnd }
+  }
+
+  /**
+   * First nearby line that SyncTeX can actually place on a page.
+   *
+   * @param rootFile - absolute path of the root source.
+   * @param pdf - the compiled PDF.
+   * @param totalLines - line count of the compiled source.
+   * @param line - the line to start from.
+   * @param direction - search up or down first when `line` itself renders nothing.
+   * @returns hits for the first line that renders, or null when none does.
+   */
+  private async mappedLine(
+    rootFile: string,
+    pdf: string,
+    totalLines: number,
+    line: number,
+    direction: 'before' | 'after' = 'after',
+  ): Promise<SyncViewHit[] | null> {
+    const offsets = direction === 'before' ? [0, -1, -2, -3, -4, 1, 2, 3, 4] : [0, 1, 2, 3, 4, -1, -2, -3, -4]
+    const candidates: number[] = []
+    for (const offset of offsets) {
+      const candidate = line + offset
+      if (candidate >= 1 && candidate <= totalLines && !candidates.includes(candidate)) candidates.push(candidate)
+    }
+    for (const candidate of candidates) {
+      const hits = await synctexView(rootFile, candidate, pdf, { cwd: this.outDir })
+      const useful = hits.filter((hit) => hit.page > 0 && hit.width > 0 && hit.height > 0)
+      if (useful.length > 0) return useful
+    }
+    return null
   }
 
   /**
@@ -517,7 +654,14 @@ export class LatexPreviewService extends TypertRemoteService {
         : null
 
     if (result.ok) {
-      this.previousSource = await this.readSource(rootFile)
+      const compiled = await this.readSource(rootFile)
+      // Advance only when the content actually moved. A redundant compile (the
+      // user pressing 编译 twice) must not erase the marks they are looking at,
+      // and a failed compile keeps the old PDF, so its baseline stays.
+      if (compiled !== this.compiledSource) {
+        this.previousSource = this.compiledSource ?? compiled
+        this.compiledSource = compiled
+      }
     }
 
     this.patch({
@@ -572,6 +716,7 @@ export class LatexPreviewService extends TypertRemoteService {
       configure: (request) => this.applyConfigure(request),
       compile: () => this.runCompile(),
       diff: () => this.readDiff(),
+      diffRegions: () => this.readDiffRegions(),
       jumpToPdf: (request) => this.view(request),
       jumpToSource: (request) => this.edit(request),
       sendError: (request) => this.handOff(request),
@@ -630,3 +775,22 @@ export class LatexPreviewService extends TypertRemoteService {
 }
 
 export default LatexPreviewService
+
+/**
+ * Pick the lines of a range that fit the budget, spread evenly.
+ *
+ * A 40-line paragraph cannot cost 40 `synctex view` processes, and highlighting
+ * only its top would look like the change ends early. Even sampling keeps a mark
+ * near the beginning, middle, and end of the block.
+ * @param first - first line, 1-based.
+ * @param last - last line, inclusive.
+ * @param budget - how many lines may still be resolved.
+ * @returns the lines to resolve, ascending.
+ */
+function sampleLines(first: number, last: number, budget: number): number[] {
+  const count = last - first + 1
+  if (count <= budget) return Array.from({ length: count }, (_, i) => first + i)
+  if (budget <= 0) return []
+  const step = count / budget
+  return Array.from({ length: budget }, (_, i) => first + Math.floor(i * step))
+}

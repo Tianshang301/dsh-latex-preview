@@ -14,6 +14,8 @@
  * @module dsh-latex-preview/client/pdf-viewer
  */
 
+import type { DiffRegion } from '../types.ts'
+
 /** A captured viewport position, expressed so it survives a page-count change. */
 export interface ScrollState {
   /** 1-based page that occupied the viewport top. */
@@ -49,6 +51,17 @@ export class PDFViewerAdapter {
       | { PDFViewerApplication?: { pdfViewer?: { scrollPageIntoView(o: { pageNumber: number }): void }; pdfDocument?: { numPages: number } } }
       | null
     return win?.PDFViewerApplication ?? null
+  }
+
+  /**
+   * Deliver a message to the viewer.
+   *
+   * Same-origin only, which is also why the viewer can be scripted at all; a
+   * cross-origin mount would have to switch this to a real channel.
+   * @param message - payload to post.
+   */
+  post(message: unknown): void {
+    this.iframe.contentWindow?.postMessage(message, '*')
   }
 
   /** 1-based number of the page whose top is closest to the container top. */
@@ -141,6 +154,15 @@ export class PDFViewer {
       requestAnimationFrame(() => this.adapter.scrollToRatio(state.ratio))
     })
     return true
+  }
+
+  /**
+   * Show or clear the diff overlay.
+   * @param regions - rectangles in PDF points, already resolved by the Host.
+   * @param visible - false hides them without forgetting them.
+   */
+  showDiff(regions: readonly DiffRegion[], visible: boolean): void {
+    this.adapter.post({ source: 'latex-preview-panel', type: 'diff', regions, visible })
   }
 
   /** Drop any captured state (called when the user opens a different file). */

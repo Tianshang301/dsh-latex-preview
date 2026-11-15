@@ -15,7 +15,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { POLL_INTERVAL_MS, unwrap, type PreviewApi } from './api.ts'
 import { PDFViewer, PDFViewerAdapter } from './pdf-viewer.ts'
-import type { LatexDiagnostic, PreviewState } from '../types.ts'
+import type { DiffRegions, LatexDiagnostic, PreviewState } from '../types.ts'
 
 /** Everything the panel needs from the shell. */
 export interface PanelProps {
@@ -68,12 +68,19 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
   const [notice, setNotice] = useState<string | null>(null)
   const [working, setWorking] = useState(false)
   const [hits, setHits] = useState<string | null>(null)
+  const [diff, setDiff] = useState<DiffRegions | null>(null)
+  const [showDiff, setShowDiff] = useState(true)
 
   const frameRef = useRef<HTMLIFrameElement | null>(null)
   const viewerRef = useRef<PDFViewer | null>(null)
   const lastVersion = useRef(-1)
   const lastUrl = useRef<string | null>(null)
   const configured = useRef(false)
+  // The viewer announces `ready` after a document swap, which is the only moment
+  // a message reaches it; these carry the latest overlay state there.
+  const diffRef = useRef<DiffRegions | null>(null)
+  const showDiffRef = useRef(true)
+  showDiffRef.current = showDiff
 
   /** Lazily create the viewer adapter once the iframe exists. */
   const viewer = useCallback((): PDFViewer | null => {
@@ -116,6 +123,34 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
     }
   }, [api])
 
+  // Regions belong to one compiled revision. Fetch them whenever the version
+  // moves, and drop the old ones immediately — showing last revision's bands on
+  // a new PDF is worse than showing nothing.
+  useEffect(() => {
+    const version = state?.version
+    if (version === undefined) return
+    let alive = true
+    setDiff(null)
+    diffRef.current = null
+    void (async () => {
+      const result = await unwrap(api.getDiffRegions())
+      if (!alive || !result.ok) return
+      if (result.value.version !== lastVersion.current) return
+      setDiff(result.value)
+      diffRef.current = result.value
+    })()
+    return () => {
+      alive = false
+    }
+  }, [api, state?.version])
+
+  // Push on every change; `ready` pushes again, because a swapped document starts
+  // with a fresh listener that missed everything sent before it existed.
+  useEffect(() => {
+    diffRef.current = diff
+    viewer()?.showDiff(diff?.regions ?? [], showDiff)
+  }, [diff, showDiff, viewer])
+
   // Our PDF.js page when the assets are built, otherwise the raw PDF so the
   // browser's viewer still shows something. Swap only when the URL changed.
   const pdfUrl = state?.viewerUrl ?? state?.pdfUrl ?? null
@@ -145,12 +180,15 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
             y2?: number
             text?: string
             instruction?: string
+            line?: number
+            title?: string
             message?: string
           }
         | null
       if (!data || data.source !== 'latex-preview-viewer') return
       if (data.type === 'ready') {
         viewer()?.restoreScrollState()
+        viewer()?.showDiff(diffRef.current?.regions ?? [], showDiffRef.current)
         return
       }
       if (data.type === 'error' && data.message) {
@@ -180,6 +218,11 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
             : `${result.value.file}:${result.value.line}`
           setNotice(`已把修改要求发给 Agent（${where}）`)
         })()
+        return
+      }
+      if (data.type === 'diff-click' && typeof data.line === 'number') {
+        // Pin what the hover tooltip said; it disappears with the cursor.
+        setHits(typeof data.title === 'string' && data.title !== '' ? data.title : `差异位置：第 ${data.line} 行`)
         return
       }
       if (data.type === 'sync-reverse' && typeof data.page === 'number') {
@@ -254,6 +297,12 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
     [api, run, viewer],
   )
 
+  // One hunk paints several bands, so count distinct hunks, not rectangles.
+  const diffCount = useMemo(
+    () => new Set((diff?.regions ?? []).map((region) => `${region.kind}:${region.lineStart}`)).size,
+    [diff],
+  )
+
   const errors = useMemo(() => state?.diagnostics.filter((d) => d.severity === 'error') ?? [], [state])
   const warnings = useMemo(() => state?.diagnostics.filter((d) => d.severity === 'warning') ?? [], [state])
 
@@ -293,6 +342,20 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
           }
         >
           发送给 Agent
+        </button>
+        <button
+          style={{ ...styles.button, opacity: diffCount === 0 ? 0.5 : showDiff ? 1 : 0.65 }}
+          disabled={diffCount === 0}
+          onClick={() => setShowDiff((value) => !value)}
+          title={
+            diffCount === 0
+              ? '与上一次编译相比没有变化'
+              : `${showDiff ? '隐藏' : '显示'}高亮：${diffCount} 处改动${
+                  diff && diff.skipped > 0 ? `（另有 ${diff.skipped} 处超出标注上限）` : ''
+                }`
+          }
+        >
+          差异 {diffCount}
         </button>
         <label style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
           <input type="checkbox" checked={state.redact} onChange={(event) => onToggleRedact(event.target.checked)} />

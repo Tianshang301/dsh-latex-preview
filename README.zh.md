@@ -28,7 +28,7 @@
 - **SyncTeX 双向跳转**：PDF 双击 → 源码行；源码行 → PDF 位置。始终 shell 调用 `synctex` CLI，不手写解析 `.synctex`。
 - **编译错误一键交给 Agent**：把「文件:行 + 错误 + 源码上下文」组成 prompt，投递到当前会话；Agent 改完 `.tex`，文件监听自动重编。
 - **在 PDF 上指一处让 AI 改**：选中文字或在任意位置拖框 → 原地浮出输入栏 → 写一句要求 → Agent 拿到**源码行范围**去改。
-- **行级 diff**：`diff-match-patch` 对比上一版源码，高亮改了什么。
+- **PDF 上的差异高亮**：`差异 N` 按钮 + 色带，直接标在这次编译改过的行上——绿=新增、琥珀=修改、红色虚线=删除接缝。悬停看行号与内容，点击钉在状态栏。对比的是**上一次编译**的版本，不是磁盘上的当前文件。
 - **脱敏开关**：开启后只发「消息 + 行号」，不带源码、不带选中文字。
 - **诊断可点击**：错误/警告列表点条目即跳转到对应源码位置。
 
@@ -86,6 +86,8 @@ npx dsh web --patch ./latex-preview.yml
 | 双击 PDF 某处 | 反查源码并跳转 |
 | 点某条诊断 | 跳到对应源码行 |
 | 「发送给 Agent」 | 把本次编译错误投递给当前会话（无错误时按钮禁用并说明原因） |
+| 「差异 N」 | 开关高亮；title 说明共几处、是否有超出上限的未标注 |
+| 悬停色带 | 显示改的是哪一行、改成了什么 |
 
 ### 在 PDF 上指一处改一处
 
@@ -111,6 +113,8 @@ npx dsh web --patch ./latex-preview.yml
 - **反查精度到行，不到字符。** SyncTeX 返回的是盒子到行的映射，`Column` 常为 `-1`。选一个词得到的是它所在的行（可能多行）。
 - **扫描版 PDF 无文字层**，框选可能定位失败。本插件的 PDF 都是 Tectonic 现编的，一定有文字层。
 - **跨页选区**只按当前页那一段反查。
+- **删除没有内容可染色**，只留一道虚线接缝，锚定在删除位置上方那一行的底部；被删掉的文字只存在于上一版 PDF，面板不显示旧版。
+- **高亮有上限**：每版最多 24 处改动、40 行解析；更长的块用均匀采样而不是截断，超出部分在按钮 title 里说明。
 - 一次指哪改哪最多附带 **12 行**源码（`MAX_EDIT_LINES`），避免框住整页时把整页塞进 prompt。
 - 首次编译可能要下载 TeX 宏包，超时放宽到 5 分钟（后续 2 分钟）。
 
@@ -120,7 +124,7 @@ npx dsh web --patch ./latex-preview.yml
 src/
   index.ts                       Host 入口，注册服务
   services/
-    latex-preview-service.ts     Typert Remote 服务（9 个 @Remote 方法）
+    latex-preview-service.ts     Typert Remote 服务（10 个 @Remote 方法）
     compile.ts                   Tectonic 调用 + 产物回滚
     watcher.ts                   chokidar + 防抖
     diff.ts                      行级 diff
@@ -137,7 +141,7 @@ viewer/                          PDF.js 查看器页面（选区、框选、浮�
 - **Host↔Client 传不了回调**。客户端轮询 `getState()`，靠 `version` 计数器判断是否变化——版本没变就什么都不做，不重渲染、不重载 iframe。
 - **面板走 HTTP 路由，那条链路上没有 Agent driver**，所以 `currentInitiator()` 恒为空。面板改为从侧栏的 `data-sidebar-right-session` 读出会话 id，Host 用 `agents.get(id)` 解析出 live Agent。
 
-面板可用的 HTTP 接口（`POST`，除 `state` 为 `GET`）：`state` `configure` `compile` `diff` `jump-to-pdf` `jump-to-source` `send-error` `edit-at` `binaries`。
+面板可用的 HTTP 接口（`POST`，除 `state` 为 `GET`）：`state` `configure` `compile` `diff` `diff-regions` `jump-to-pdf` `jump-to-source` `send-error` `edit-at` `binaries`。
 
 ## 开发
 

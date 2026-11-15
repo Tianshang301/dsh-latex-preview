@@ -107,6 +107,35 @@ export interface DiffBlock {
   readonly endLine: number
 }
 
+/** What a changed region means, in diff terms. */
+export type DiffRegionKind = 'insert' | 'delete' | 'modify'
+
+/** One highlight box drawn on a page of the current PDF. */
+export interface DiffRegion {
+  /** 1-based page. */
+  readonly page: number
+  /** Rectangle in PDF points, top-left origin (docs/spikes.md §B15). */
+  readonly x: number
+  readonly y: number
+  readonly width: number
+  readonly height: number
+  readonly kind: DiffRegionKind
+  /** Source line range in the *new* revision; equal values mean one line. */
+  readonly lineStart: number
+  readonly lineEnd: number
+  /** Hover text: what changed and where. */
+  readonly title: string
+}
+
+/** Regions for one compiled revision, plus what the caps left out. */
+export interface DiffRegions {
+  /** `PreviewState.version` these regions belong to; the panel applies on match. */
+  readonly version: number
+  readonly regions: readonly DiffRegion[]
+  /** Hunks skipped by the caps, so the UI can say so instead of lying. */
+  readonly skipped: number
+}
+
 /** Outcome of one compile attempt, as handed back to the client. */
 export interface CompileResult {
   readonly ok: boolean

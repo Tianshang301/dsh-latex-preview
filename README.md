@@ -28,7 +28,7 @@ Compiling, rendering, SyncTeX, and diffing all run **on your machine**. Only the
 - **Two-way SyncTeX** — double-click the PDF to get the source line; go from a source line to the PDF location. Always shells out to the `synctex` CLI; the `.synctex` file is never hand-parsed.
 - **One-click error hand-off** — builds a prompt from "file:line + message + source context" and steers it into the current session. The Agent fixes the `.tex`, the watcher recompiles.
 - **Point at the PDF, change the source** — select text, or drag a box over anything → an inline bar appears → type one sentence → the Agent receives the **source line range** to edit.
-- **Line-level diff** — `diff-match-patch` compares against the previous source revision and highlights what changed.
+- **Diff highlight on the PDF** — a `差异 N` button and coloured bands over the lines this compile changed: green for added, amber for modified, a red dash for a deletion seam. Hover for the source line and its text; click to pin it in the status bar. Computed against the *previous compiled* revision, not the file on disk.
 - **Redaction switch** — when on, only "message + line number" is sent; no source, no selected text.
 - **Clickable diagnostics** — clicking an error or warning jumps to its source location.
 
@@ -86,6 +86,8 @@ The top strip holds status and actions (compile state and duration, `编译` / C
 | Double-click the PDF | Reverse-jumps to the source file and line |
 | Click a diagnostic | Jumps to that source line |
 | "Send to Agent" | Hands this compile's errors to the current session (disabled with an explanation when there are none) |
+| "差异 N" / Diff N | Toggles the change highlight; the title says how many hunks and whether the caps left any out |
+| Hover a band | Shows which source line changed and the first sensible characters of it |
 
 ### Point at a spot, change the source
 
@@ -111,6 +113,8 @@ Redaction (`redact`, off by default) sends "message + line number" only: no sour
 - **Reverse lookup is line-accurate, not character-accurate.** SyncTeX maps boxes to lines and `Column` is often `-1`; selecting one word yields the line (or lines) containing it.
 - **Scanned PDFs have no text layer**, so boxing may fail to resolve. Tectonic always emits a text layer, so this does not affect previews produced here.
 - **Cross-page selections** reverse-jump only the current page's part.
+- **A deletion has no text to tint** — only a dashed seam where it was removed, anchored at the foot of the line above. The removed text exists only in the previous revision, which the panel does not display.
+- **The highlight is capped** at 24 hunks / 40 resolved lines per revision; longer blocks are sampled evenly rather than truncated, and the surplus is reported in the button's title.
 - One point-and-edit quotes at most **12 source lines** (`MAX_EDIT_LINES`), so boxing a whole page cannot dump a whole page into the prompt.
 - The first compile may download TeX packages, so its timeout is 5 minutes (2 minutes afterwards).
 
@@ -120,7 +124,7 @@ Redaction (`redact`, off by default) sends "message + line number" only: no sour
 src/
   index.ts                       Host entry; registers the service
   services/
-    latex-preview-service.ts     Typert Remote service (9 @Remote methods)
+    latex-preview-service.ts     Typert Remote service (10 @Remote methods)
     compile.ts                   Tectonic invocation + artifact rollback
     watcher.ts                   chokidar + debounce
     diff.ts                      line-level diff
@@ -137,7 +141,7 @@ Two constraints worth knowing up front:
 - **Callbacks cannot cross the Host↔Client wire.** The client polls `getState()` and reacts to the `version` counter — an unchanged version does nothing: no re-render, no iframe reload.
 - **The panel talks over an HTTP route, which has no Agent driver**, so `currentInitiator()` is always empty there. The panel reads the session id from the sidebar's `data-sidebar-right-session` and the Host resolves it with `agents.get(id)`.
 
-HTTP routes the panel uses (`POST`, except `state` which is `GET`): `state` `configure` `compile` `diff` `jump-to-pdf` `jump-to-source` `send-error` `edit-at` `binaries`.
+HTTP routes the panel uses (`POST`, except `state` which is `GET`): `state` `configure` `compile` `diff` `diff-regions` `jump-to-pdf` `jump-to-source` `send-error` `edit-at` `binaries`.
 
 ## Development
 
