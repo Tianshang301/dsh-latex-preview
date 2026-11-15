@@ -45,6 +45,20 @@ const styles = {
 } as const
 
 /**
+ * Session the sidebar is drawing this pane for.
+ *
+ * The panel cannot ask for it through props (the seat passes none) and the URL
+ * carries no session id, but the sidebar marks the enclosing node with
+ * `data-sidebar-right-session`. Reading it lets the Host resolve that Session's
+ * Agent instead of relying on an initiator boundary an HTTP route never has.
+ * @param node - any element inside the sidebar pane.
+ * @returns the session key, or undefined outside a sidebar.
+ */
+function sessionIdOf(node: Element | null): string | undefined {
+  return node?.closest('[data-sidebar-right-session]')?.getAttribute('data-sidebar-right-session') ?? undefined
+}
+
+/**
  * Render the panel.
  * @param props - the Host API face and optional workspace file.
  * @returns the panel tree.
@@ -167,7 +181,7 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
 
   const onSendToAgent = useCallback(() => {
     void run(async () => {
-      const result = await unwrap(api.sendErrorToAgent({}))
+      const result = await unwrap(api.sendErrorToAgent({ sessionId: sessionIdOf(frameRef.current) }))
       if (!result.ok) return { ok: false, message: result.message }
       setNotice('错误已发送给 Agent')
       return { ok: true }
@@ -230,7 +244,16 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
         <button style={styles.button} disabled={working} onClick={onCompile}>
           {state.status === 'compiling' ? '编译中…' : '编译'}
         </button>
-        <button style={styles.button} disabled={working || errors.length === 0} onClick={onSendToAgent}>
+        <button
+          style={styles.button}
+          disabled={working || errors.length === 0}
+          onClick={onSendToAgent}
+          title={
+            errors.length === 0
+              ? '上次编译没有错误，无需发送'
+              : '把这次的编译错误发给当前会话的 Agent'
+          }
+        >
           发送给 Agent
         </button>
         <label style={{ display: 'flex', gap: 4, alignItems: 'center' }}>

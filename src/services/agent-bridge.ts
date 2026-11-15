@@ -27,6 +27,8 @@ export interface AgentLike {
 export interface AgentRegistryLike {
   currentInitiator?(): AgentLike | undefined
   requireInitiator?(): AgentLike
+  /** Look up the live agent for a Session id; the only reliable path outside a driver. */
+  get?(id: string): AgentLike | undefined
 }
 
 /** Why a send did not happen. */
@@ -82,15 +84,23 @@ export class AgentBridge {
 
   /**
    * Send one compile's diagnostics to the agent that initiated the session.
+   *
+   * An HTTP route has no driver boundary, so `currentInitiator()` is empty there;
+   * the panel therefore passes the Session id it is drawn in and that Agent is
+   * used first. The initiator chain remains the fallback for in-process callers.
    * @param diagnostics - what the compile produced.
    * @param options - redaction and item cap.
+   * @param explicit - agent resolved from the caller's Session, when known.
    * @returns whether the message was handed to an agent.
    */
-  send(diagnostics: readonly LatexDiagnostic[], options: HandOffOptions): SendOutcome {
+  send(diagnostics: readonly LatexDiagnostic[], options: HandOffOptions, explicit?: AgentLike): SendOutcome {
     if (diagnostics.length === 0) return { ok: false, reason: 'no-diagnostics' }
 
     const registry = this.resolveRegistry()
-    const agent = registry?.currentInitiator?.() ?? (registry?.requireInitiator ? safeRequire(registry) : undefined)
+    const agent =
+      explicit ??
+      registry?.currentInitiator?.() ??
+      (registry?.requireInitiator ? safeRequire(registry) : undefined)
     if (!agent) {
       return {
         ok: false,

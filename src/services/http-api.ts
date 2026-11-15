@@ -33,7 +33,7 @@ export interface PreviewHost {
   diff(): Promise<readonly DiffBlock[]>
   jumpToPdf(request: { line: number; file?: string }): Promise<readonly SyncViewHit[]>
   jumpToSource(request: { page: number; x: number; y: number }): Promise<readonly SyncEditHit[]>
-  sendError(request: { redact?: boolean }): Promise<{ ok: boolean; detail?: string }>
+  sendError(request: { redact?: boolean; sessionId?: string }): Promise<{ ok: boolean; detail?: string }>
   binaries(): Promise<PreviewState['binaries']>
 }
 
@@ -103,7 +103,7 @@ async function dispatch(host: PreviewHost, name: string, body: Record<string, un
     case 'jump-to-source':
       return host.jumpToSource(body as Parameters<PreviewHost['jumpToSource']>[0])
     case 'send-error':
-      return host.sendError(body as { redact?: boolean })
+      return host.sendError(body as { redact?: boolean; sessionId?: string })
     case 'binaries':
       return host.binaries()
     default:

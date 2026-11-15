@@ -84,14 +84,19 @@ export class PDFViewerAdapter {
 
   /** Scroll so the page is at the top of the viewport. */
   scrollToPage(page: number): void {
+    // `scrollPageIntoView` only logs a warning for a bad page number (observed:
+    // `scrollPageIntoView: "1" is not a valid pageNumber parameter.`), so a value
+    // that arrived as a string would silently do nothing. Normalise here.
+    const pageNumber = Math.trunc(Number(page))
+    if (!Number.isFinite(pageNumber) || pageNumber < 1) return
     const app = this.app
     if (app?.pdfViewer) {
-      app.pdfViewer.scrollPageIntoView({ pageNumber: page })
+      app.pdfViewer.scrollPageIntoView({ pageNumber })
       return
     }
     // Fallback for viewers without the application object exposed.
     const container = this.container
-    const target = this.pages[page - 1]
+    const target = this.pages[pageNumber - 1]
     if (container && target) container.scrollTop = target.offsetTop
   }
 
@@ -150,7 +155,7 @@ export class PDFViewer {
    * @param page - 1-based page number.
    */
   jumpToPage(page: number): void {
-    this.adapter.scrollToPage(Math.max(1, page))
+    this.adapter.scrollToPage(page)
   }
 }
 

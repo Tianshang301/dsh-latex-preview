@@ -28,7 +28,7 @@ import { synctexEdit, synctexView } from '../utils/synctex.ts'
 import { CompileService, compilePaths } from './compile.ts'
 import { FileWatcher } from './watcher.ts'
 import { lineDiff } from './diff.ts'
-import { AgentBridge, type AgentRegistryLike } from './agent-bridge.ts'
+import { AgentBridge, type AgentLike, type AgentRegistryLike } from './agent-bridge.ts'
 import { createApiHandler, type PreviewHost } from './http-api.ts'
 import { mountStaticRoute, ROUTE_PREFIX, type StaticMount, type WebServerLike } from './static-route.ts'
 import { assetsRoot, VIEWER_PATH, viewerAvailable } from '../utils/assets.ts'
@@ -333,16 +333,44 @@ export class LatexPreviewService extends TypertRemoteService {
   }
 
   /** Error hand-off body shared by the Remote method and the HTTP API. */
-  private async handOff(request: { redact?: boolean }): Promise<{ ok: boolean; detail?: string }> {
-    const outcome = this.bridge.send(this.state.diagnostics, {
-      redact: request.redact ?? this.redact,
-    })
+  private async handOff(request: { redact?: boolean; sessionId?: string }): Promise<{ ok: boolean; detail?: string }> {
+    const outcome = this.bridge.send(
+      this.state.diagnostics,
+      { redact: request.redact ?? this.redact },
+      this.agentFor(request.sessionId),
+    )
     if (!outcome.ok) {
       throw new RemoteError('latex-preview/handoff-failed', outcome.detail ?? outcome.reason ?? 'unknown', {
         reason: outcome.reason ?? 'unknown',
       })
     }
     return { ok: true }
+  }
+
+  /**
+   * Resolve the live Agent of a Session.
+   *
+   * Needed because this route is not driven by an Agent, so there is no initiator
+   * boundary to inherit from (`docs/spikes.md` §B14). The DOM exposes the sidebar's
+   * session key, which may or may not carry its own prefix, so both spellings are
+   * tried and neither is trusted.
+   * @param sessionId - value read by the panel from the sidebar's session node.
+   * @returns the agent, or undefined when the id matches no live Session.
+   */
+  private agentFor(sessionId: string | undefined): AgentLike | undefined {
+    if (!sessionId) return undefined
+    const registry = this.agents
+    if (!registry?.get) return undefined
+    const candidates = [sessionId, sessionId.replace(/^session-/, '')]
+    for (const candidate of candidates) {
+      try {
+        const agent = registry.get(candidate)
+        if (agent) return agent
+      } catch {
+        // A malformed id is a miss, not a failure; try the next spelling.
+      }
+    }
+    return undefined
   }
 
   /**

@@ -20,6 +20,7 @@
 | **B10** | 本机 `pnpm run` 被拦 | 本机 pnpm 有供应链策略包装层，`pnpm run` 前置校验因"ignored build scripts"失败 | 本轮用 `npx tsc` / `npx tsx` 直调；不影响产物 |
 | **B12** | PDF.js 查看器从哪来 | pdfjs-dist **不发** `viewer.html`/`viewer.mjs`，只有组件 `web/pdf_viewer.mjs` + `build/pdf.mjs`；`<iframe src=pdf>` 只能拿到浏览器内置查看器，`PDFViewerApplication` 不存在 | 自建 `viewer/` 页（组件拼装），`scripts/build-assets.mjs` 复制进 `assets/`；已真机渲染 1 页 |
 | **B13** | 右侧栏 tab 怎么才算挂上 | 两级注册：`sidebarRightTabs.register({id,kind,…})` + keyed 槽（`key` 必须等于那个 `id`）。只做槽注册则**什么都不显示** | 已实现并真机跑通；服务须用 `ctx.inject` 动态注入 |
+| **B14** | HTTP 路由里「发送给 Agent」 | `agents.currentInitiator()` 在无 driver 的请求里恒为空；须由面板传 sessionId，Host 用 `agents.get(id)` 解析 | 已实现并真机跑通（Agent 收到 prompt 并改文件） |
 
 ---
 
@@ -517,5 +518,36 @@ ctx.inject(['sidebarRightTabs', 'sidebarRight'], (sub) => { ... })
 | tab 内 iframe | ✅ `/.latex-preview/assets/viewer/index.html?file=%2F.latex-preview%2Fpdf%2Fmain.pdf&v=4` |
 | iframe 内渲染 | ✅ 页面文字 "Hello from DSH LaTeX Preview." / "1 Demo" 可见 |
 | 零点击路径（只打开会话） | ✅ 自动打开 tab 且自动完成首编，iframe 带上 PDF 版本号 |
+
+---
+
+## B14 · 「发送给 Agent」在 HTTP 路由里拿不到 initiator（已修）
+
+真机点按钮的返回是：
+
+```json
+{"ok":false,"error":{"code":"latex-preview/handoff-failed",
+ "message":"当前没有可投递的会话（编译由文件监听触发，而非会话发起）；请从对话窗口重试"}}
+```
+
+**原因**：`ctx.agents.currentInitiator()` 只在 driver 的异步边界内有效；面板走的是 HTTP 路由，整条链路没有任何 Agent 在跑，所以 initiator 恒为空。这不是"编译由监听触发"的问题，而是**跨进程调用天然没有因果父**。
+
+**修法**（`dsh-agent` 的 `AgentRegistry.get(id: SessionId)` 是公开的）：
+
+1. 面板从 DOM 读到所在会话键——侧栏把 `data-sidebar-right-session` 打在包裹节点上，`frameRef.closest('[data-sidebar-right-session]')` 即可（URL 里没有会话 id，SPA 状态不外露）。
+2. 随 `sendErrorToAgent({ sessionId })` 传下去。
+3. Host 侧 `agents.get(sessionId)` 解析出 live Agent —— 两种拼写都试（`session-<uuid>` 与去掉前缀的 `<uuid>`），失败则回落到 initiator 链。
+
+**真机验证**：按钮由禁用变可点（有 1 个错误），点击后面板状态变「错误已发送给 Agent」，会话里出现完整 prompt（含 `main.tex:3`、`Undefined control sequence.`、源码上下文），Agent 随即 `读取 main.tex → 编辑 main.tex（+1 −1）`。
+
+另外补了按钮的 `title`：`上次编译没有错误，无需发送` / `把这次的编译错误发给当前会话的 Agent`——之前禁用状态没有任何解释。
+
+**顺带修掉的真 bug**：编译后换 PDF 时控制台出现
+
+```
+scrollPageIntoView: "1" is not a valid pageNumber parameter.
+```
+
+PDF.js 对坏页码**只警告不抛错**，所以滚动保持会静默失效。`scrollToPage` 现在统一 `Math.trunc(Number(page))` 并拒绝非正数。
 
 ---

@@ -31,7 +31,7 @@ export interface PreviewApi {
   getDiff(signal?: AbortSignal): Promise<RemoteResult<readonly DiffBlock[]>>
   jumpToPdf(request: { line: number; file?: string }, signal?: AbortSignal): Promise<RemoteResult<readonly SyncViewHit[]>>
   jumpToSource(request: { page: number; x: number; y: number }, signal?: AbortSignal): Promise<RemoteResult<readonly SyncEditHit[]>>
-  sendErrorToAgent(request: { redact?: boolean }, signal?: AbortSignal): Promise<RemoteResult<{ ok: boolean; detail?: string }>>
+  sendErrorToAgent(request: { redact?: boolean; sessionId?: string }, signal?: AbortSignal): Promise<RemoteResult<{ ok: boolean; detail?: string }>>
   recheckBinaries(signal?: AbortSignal): Promise<RemoteResult<PreviewState['binaries']>>
 }
 
@@ -113,7 +113,7 @@ export class HttpPreviewApi implements PreviewApi {
     return this.call('jump-to-source', request, signal)
   }
 
-  sendErrorToAgent(request: { redact?: boolean }, signal?: AbortSignal): Promise<RemoteResult<{ ok: boolean; detail?: string }>> {
+  sendErrorToAgent(request: { redact?: boolean; sessionId?: string }, signal?: AbortSignal): Promise<RemoteResult<{ ok: boolean; detail?: string }>> {
     return this.call('send-error', request, signal)
   }
 
