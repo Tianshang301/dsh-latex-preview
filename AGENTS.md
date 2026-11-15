@@ -2,6 +2,7 @@
 
 ## Repo state (read this first)
 
+- **P0 verified end-to-end inside a real DSH 0.2.2-rc.1 boot** (2026-11-16, headless Edge): plugin loads, `webServer` route answers (PDF 200, Range 206), compile 988ms, client bundle served and applied, keyed tab registered. The panel talks to the Host over its own same-origin JSON route `/.latex-preview/api/*` — the client cannot inject a Host service. See `docs/spikes.md` §B11.
 - **P0 host pipeline is implemented and verified on a real machine** (2026-11-16): `utils/{binaries,root,log-parser,synctex}.ts`, `services/{compile,watcher,diff,agent-bridge,static-route}.ts`, wired through `LatexPreviewService` (8 `@Remote` methods). Client half registers a keyed tab into `sidebar.right.pane.tab` (NOT `editor.panel.item` — that slot does not exist) and renders `client/panel.tsx`. Not yet exercised inside a real DSH profile: the static route shape (B6) and the panel's composed props.
 - **Read `docs/spikes.md` before writing any code.** It replaces most of HANDOFF §6's open questions with evidence read out of the real published packages.
 - Source of truth for design: `docs/LaTeX Preview — 开发文档.md` — but note it is **wrong on three points**, corrected in `docs/spikes.md`: (a) callbacks cannot cross Host↔Client, (b) `createUserMessage` takes `source: { kind: 'user' }` — a discriminated object, and `dsh-llm@0.2.2-rc.1` removed the old `plugin` kind, (c) `synctex` field/regex details differ from the spec's parser.

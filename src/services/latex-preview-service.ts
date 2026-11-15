@@ -23,12 +23,13 @@ import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typer
 import { basename, dirname, join } from 'node:path'
 import { readFile } from 'node:fs/promises'
 import { checkBinaries } from '../utils/binaries.ts'
-import { resolveRoot, type RootResolution } from '../utils/root.ts'
+import { isRootCandidate, listTexFiles, resolveRoot, type RootResolution } from '../utils/root.ts'
 import { synctexEdit, synctexView } from '../utils/synctex.ts'
 import { CompileService, compilePaths } from './compile.ts'
 import { FileWatcher } from './watcher.ts'
 import { lineDiff } from './diff.ts'
 import { AgentBridge, type AgentRegistryLike } from './agent-bridge.ts'
+import { createApiHandler, type PreviewHost } from './http-api.ts'
 import { mountStaticRoute, ROUTE_PREFIX, type StaticMount, type WebServerLike } from './static-route.ts'
 import type { CompileResult, DiffBlock, PreviewState, SyncEditHit, SyncViewHit } from '../types.ts'
 
@@ -146,7 +147,17 @@ export class LatexPreviewService extends TypertRemoteService {
     signal: AbortSignal,
   ): Promise<PreviewState> {
     signal.throwIfAborted()
+    return this.applyConfigure(request)
+  }
 
+  /** Shared configure body: the Remote method and the HTTP API both land here. */
+  private async applyConfigure(request: {
+    file?: string
+    rootFile?: string
+    outDir?: string
+    redact?: boolean
+    debounceMs?: number
+  }): Promise<PreviewState> {
     if (typeof request.redact === 'boolean') this.redact = request.redact
     if (typeof request.debounceMs === 'number' && request.debounceMs >= 0) {
       this.debounceMs = Math.min(5000, Math.max(0, request.debounceMs))
@@ -154,6 +165,30 @@ export class LatexPreviewService extends TypertRemoteService {
 
     let rootFile = request.rootFile ?? null
     let resolution: RootResolution | null = null
+    if (!rootFile && !request.file) {
+      // No hint at all: adopt the DSH process directory when it holds exactly one
+      // compilable document. This is what makes "open DSH in a paper folder" work
+      // without any configuration step.
+      const candidates: string[] = []
+      for (const candidate of await listTexFiles(process.cwd())) {
+        if (await isRootCandidate(candidate)) candidates.push(candidate)
+      }
+      if (candidates.length === 1) {
+        rootFile = candidates[0] as string
+      } else {
+        await this.stopWatching()
+        this.patch({
+          status: 'idle',
+          rootCandidates: candidates,
+          redact: this.redact,
+          message:
+            candidates.length === 0
+              ? `当前工作目录没有含 \\documentclass 的 .tex：${process.cwd()}`
+              : `工作目录有 ${candidates.length} 个候选主文件，请指定 rootFile`,
+        })
+        return this.state
+      }
+    }
     if (!rootFile && request.file) {
       resolution = await resolveRoot(request.file)
       rootFile = resolution.rootFile
@@ -226,6 +261,11 @@ export class LatexPreviewService extends TypertRemoteService {
   @Remote
   async getDiff(signal: AbortSignal): Promise<readonly DiffBlock[]> {
     signal.throwIfAborted()
+    return this.readDiff()
+  }
+
+  /** Diff body shared by the Remote method and the HTTP API. */
+  private async readDiff(): Promise<readonly DiffBlock[]> {
     const rootFile = this.state.rootFile
     if (!rootFile || this.previousSource === null) return []
     const current = await this.readSource(rootFile)
@@ -242,6 +282,11 @@ export class LatexPreviewService extends TypertRemoteService {
   @Remote
   async jumpToPdf(request: { line: number; file?: string }, signal: AbortSignal): Promise<readonly SyncViewHit[]> {
     signal.throwIfAborted()
+    return this.view(request)
+  }
+
+  /** Forward-jump body shared by the Remote method and the HTTP API. */
+  private async view(request: { line: number; file?: string }): Promise<readonly SyncViewHit[]> {
     const pdf = this.requirePdf()
     const file = request.file ?? this.state.rootFile
     if (!file) throw new RemoteError('latex-preview/no-root-file', 'no file to jump from', { hint: '先 configure' })
@@ -257,6 +302,11 @@ export class LatexPreviewService extends TypertRemoteService {
   @Remote
   async jumpToSource(request: { page: number; x: number; y: number }, signal: AbortSignal): Promise<readonly SyncEditHit[]> {
     signal.throwIfAborted()
+    return this.edit(request)
+  }
+
+  /** Reverse-jump body shared by the Remote method and the HTTP API. */
+  private async edit(request: { page: number; x: number; y: number }): Promise<readonly SyncEditHit[]> {
     const pdf = this.requirePdf()
     return synctexEdit(request.page, request.x, request.y, pdf, { cwd: this.outDir })
   }
@@ -270,6 +320,11 @@ export class LatexPreviewService extends TypertRemoteService {
   @Remote
   async sendErrorToAgent(request: { redact?: boolean }, signal: AbortSignal): Promise<{ ok: boolean; detail?: string }> {
     signal.throwIfAborted()
+    return this.handOff(request)
+  }
+
+  /** Error hand-off body shared by the Remote method and the HTTP API. */
+  private async handOff(request: { redact?: boolean }): Promise<{ ok: boolean; detail?: string }> {
     const outcome = this.bridge.send(this.state.diagnostics, {
       redact: request.redact ?? this.redact,
     })
@@ -366,6 +421,27 @@ export class LatexPreviewService extends TypertRemoteService {
     }
   }
 
+  /**
+   * Bind the same-origin JSON API to this service.
+   *
+   * Separate from the `@Remote` surface on purpose: the Remote names cannot be
+   * reused 1:1 (`compileNow` vs `compile`), and keeping the mapping in one place
+   * documents that both faces share the same bodies.
+   * @returns the host operations exposed over HTTP.
+   */
+  private httpHost(): PreviewHost {
+    return {
+      state: () => this.state,
+      configure: (request) => this.applyConfigure(request),
+      compile: () => this.runCompile(),
+      diff: () => this.readDiff(),
+      jumpToPdf: (request) => this.view(request),
+      jumpToSource: (request) => this.edit(request),
+      sendError: (request) => this.handOff(request),
+      binaries: async () => (await this.refreshBinaries()) ?? this.state.binaries,
+    }
+  }
+
   /** Mount the static route if the web server is known and the shape fits. */
   private mountRoutes(): void {
     if (!this.webServer || this.disposeRoute) return
@@ -373,7 +449,7 @@ export class LatexPreviewService extends TypertRemoteService {
       { prefix: '/pdf', dir: this.outDir, cacheable: false },
       { prefix: '/assets', dir: join(process.cwd(), 'assets'), cacheable: true },
     ]
-    const dispose = mountStaticRoute(this.webServer, mounts)
+    const dispose = mountStaticRoute(this.webServer, mounts, createApiHandler(this.httpHost()))
     if (!dispose) {
       this.ctx.logger?.('latex-preview')?.warn?.('webServer.register unavailable; PDF will not be reachable over HTTP')
       this.patch({ message: '静态路由挂载失败：webServer 接口不匹配（见 docs/spikes.md B6）' })

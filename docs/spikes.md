@@ -8,7 +8,7 @@
 
 | 编号 | 问题 | 结论 | 对计划的影响 |
 |---|---|---|---|
-| B1 | Host→Client 能否传回调 | **不能**。Remote 参数只有 `json` / `lookup` 两种来源，函数无法编码；官方跨半通道是"转发事件"，但需 Host 装配层白名单 | 客户端改**轮询 `getState()`**；`api.onCompiled(cb)` 删除 |
+| B1 | Host→Client 能否传回调 | **不能，且客户端连 Host 服务都 inject 不到**（真机验证：`pending (waiting for service: latexPreview)`）。Remote 参数只有 `json`/`lookup`，函数无法编码 | 面板改走插件同源 JSON 路由 `/.latex-preview/api/*` |
 | B2 | 槽位 API 与可用槽位 | **已解决一半**：`ctx.slots.inject(key, cb)` 存在且写法正确；但 `editor.panel.item` **不存在**，改用 `sidebar.right.pane.tab`（keyed）。编辑器是否自带仍未知 | P0.5 可开工；P1 的源码视图要自己做 |
 | B3 | `agent` 实例从哪来 | **已解决**：Host 侧 `ctx.agent?: Agent`（`Agent.ctx` 派生上下文自带）+ `ctx.agents: AgentRegistry`；`Agent#steer(message: UserMessage)` | 错误回传可直接实现，不必降级 |
 | B4 | draftMode | 维持"不做"（与 SyncTeX 硬冲突） | 不变 |
@@ -217,7 +217,101 @@ SyncTeX result end
 
 ---
 
-## B6 · pdfjs 资产（未验证，P0.6 前处理）
+## B6 · 静态路由：形状已确认（真机跑通）
+
+`@deepseek-ai/dsh-host-webserver` 的 `WebServer.register` 签名：
+
+```ts
+export interface WebRoute {
+  kind: 'exact' | 'prefix'
+  path: string                                            // 绝对路径，无尾斜杠
+  handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+}
+register(route: WebRoute | WebResourceRoute): () => void   // 返回 disposer
+```
+
+真机验证（DSH 0.2.2-rc.1，端口 3080）：
+
+| 请求 | 结果 |
+|---|---|
+| `GET /.latex-preview/api/state` | `{"ok":true,"value":{…}}` |
+| `POST /.latex-preview/api/configure {}` | 自动认领 `process.cwd()` 下的 `main.tex` |
+| `POST /.latex-preview/api/compile` | `ok:true, exitCode:0, durationMs:988` |
+| `GET /.latex-preview/pdf/main.pdf` | `200 application/pdf`，6454 bytes，`%PDF-` 头 |
+| 同 URL + `Range: bytes=0-99` | `206`，100 bytes |
+
+即**同源静态路由可用，PDF.js 需要的 Range 也通过**。pdfjs 自身资产（worker/cmaps）仍未接。
+
+## B11 · 真机联调（2026-11-16，DSH 0.2.2-rc.1 + Edge headless）
+
+装好 CLI、用 `--patch` 把插件插进 web profile、headless 浏览器实际加载页面后，暴露了四个**只靠读类型发现不了**的问题：
+
+### 1. 客户端不能 `inject` Host 服务（B1 的真正落点）
+
+首轮真机的报错是：
+
+```
+dsh-latex-preview: pending (waiting for service: latexPreview)
+```
+
+Host 服务只存在于 Host 进程，客户端 `export const inject = ['latexPreview']` 会**永远等下去**。这正是 B1 的结论在运行时的样子：跨半通道只有 Remote 描述符/转发事件，没有服务对象本身。
+
+而 Remote 描述符要靠 `@deepseek-ai/dsh-typert-generator` 做程序分析产出（它是库 API + tsdown 插件，不是 CLI），第三方包必须自己发布 `lib/typert.host.*` 与 `lib/typert.remote-client.*` 并以 `package/typert`、`package/client/typert` 暴露。
+
+**决策**：面板改走**插件自己的同源 JSON 路由** `/.latex-preview/api/*`（`services/http-api.ts`），响应外层形状故意与 `RemoteResult` 一致（`{ok,value}` / `{ok,error}`），将来接上 Remote 只需换客户端的传输实现。
+
+### 2. 代码里的 `inject` 必须与 `package.json#dsh.client.inject` 一致
+
+两边不一致时，条目在 activation 阶段直接 `failed`，且**没有任何错误详情**（浏览器只打印 `web boot: 1 entry did not activate`，DOM 里也只有 `dsh-latex-preview: failed`）。
+
+改法：`package.json` 写 `"inject": ["slots"]`，代码里就 `export const inject = ['slots']`。
+
+### 3. keyed 槽位用 `key`，不是 `id`
+
+`sidebar.right.pane.tab` 是 `kind: 'keyed'`。真实写法（来自 `@deepseek-ai/dsh-client-ui-sidebar-documentpreview`）：
+
+```js
+ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
+  name: 'sidebar.right.pane.tab',
+  key: TEXTPREVIEW_ID,          // ← key，不是 id
+  // …children / store / inject
+}, TextPreview)), 'ui-sidebar-documentpreview: text body')
+```
+
+标题槽同理，只传 `{ name, key }`（**没有 `label` 字段**，标题由组件渲染）。传 `id` 会失败。
+
+顺带修正规格书坑 14：真实插件是 `ctx.effect(() => ctx.slots.inject(...), label)`——包 `ctx.effect` 是**对的**（`inject` 返回幂等 disposer，包一层只是把 dispose 挂到 fiber）。规格书那句"不要包 effect"针对的是把 `register` 的返回值错当 effect 用。
+
+### 4. 声明了 peer 依赖会被版本门禁拦下
+
+把 `@deepseek-ai/dsh-client-ui-sidebar-right` 写成（即使 optional 的）peer 后，启动日志变成：
+
+```
+disabling profile plugin row "latex-preview": Plugin dsh-latex-preview@0.0.0 is
+incompatible with dsh 0.2.2-rc.1: requirements {"@deepseek-ai/dsh-client-ui-sidebar-right":"0.1.5-alpha.1"}
+```
+
+DSH 会把 peer 依赖当作**硬性运行时要求**逐条比对。结论：面板对侧栏的依赖是"运行期探测"，不应写进 peer；需要时用 `dsh plugin allow-version` 显式豁免。
+
+### 真机验证清单
+
+| 检查 | 结果 |
+|---|---|
+| Host 插件加载 | ✅ 无 `disabled`、无失败 |
+| `ctx.inject(['webServer'])` | ✅ 路由挂上并响应 |
+| 二进制探测 | ✅ `tectonic:true, synctex:true`（进程 PATH 决定） |
+| configure 自动认领 cwd | ✅ `E://dsh-run//main.tex` |
+| 编译 | ✅ 988ms，PDF 6454 bytes |
+| 静态路由 + Range | ✅ 200 / 206 |
+| 客户端 bundle 送达 | ✅ 走 `/plugins/??dsh-latex-preview/client.js&rev=…`，14684 bytes |
+| `apply` 执行 + 槽位注册 | ✅ 两个 keyed 槽注册完成，无异常 |
+| 标签页可见 | ⚠️ 未验证：需要打开一个 workspace 会话才会出现右侧栏 |
+
+### 遗留问题
+
+- **面板首次可见性未验证**：着陆页没有右侧栏，必须先进入某个 workspace 会话。headless 下点击项目没有进入会话（可能是需要真实工作区目录），这一步留给手工确认。
+- **面板拿不到工作区文件路径**：目前靠 Host 的 `process.cwd()` 认领；正确做法是接 session/workspace 服务（`ctx.workspace`？未验证）。
+- **pdfjs 资产**：仍需接 `assets/pdfjs/`（worker、cmaps、standard_fonts）。
 
 `pdfjs-dist@4.10.38` 已装。仍未验证：`viewer.html` + `pdf.worker` + `cmaps/` + `standard_fonts/` 在同源静态路由下的可访问性，以及 `iframe.contentDocument` 是否拿得到（取决于 `webServer` 挂载点是否与 Web UI 同域）。这条只能在真实 profile 里跑。
 

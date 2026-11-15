@@ -20,19 +20,27 @@
 
 import type { ReactNode } from 'react'
 import { LatexPreviewPanel } from './panel.tsx'
-import type { PreviewApi } from './api.ts'
+import { HttpPreviewApi, type PreviewApi } from './api.ts'
 
 export const name = 'latex-preview-client'
 
-/** Hard dependency: the generated Remote namespace for the Host service. */
-export const inject = ['latexPreview']
+/**
+ * No service dependency: the Host service lives in the Host process and is
+ * unreachable from here (B1). The panel talks to the Host over its same-origin
+ * JSON route instead, so this half only needs the slot service.
+ */
+export const inject = ['slots']
 
 /** Tab slot and its title slot, both declared by the right sidebar plugin. */
 const TAB_SLOT = 'sidebar.right.pane.tab'
 const TITLE_SLOT = 'sidebar.right.pane.tab.title'
 
-/** Registration id; must be stable, it is the slot's entry key. */
-const ENTRY_ID = 'latex-preview'
+/**
+ * Keyed-slot key. Keyed slots (`kind: 'keyed'`) identify an entry by `key`, not
+ * `id` — passing `id` fails validation and the whole client entry fails to
+ * activate (observed on a real boot).
+ */
+const ENTRY_KEY = 'latex-preview'
 
 /**
  * The subset of `SlotsService` we call. The real service's `register` is heavily
@@ -47,8 +55,9 @@ interface SlotsServiceLike {
 
 /** The client context surface this plugin needs. */
 export interface ClientContextLike {
-  latexPreview: PreviewApi
   slots?: SlotsServiceLike
+  /** Cordis fiber effect; owns disposal and unload cascade. */
+  effect?: <T>(factory: () => T, label?: string) => T
   get?: (key: string) => unknown
 }
 
@@ -64,11 +73,23 @@ export function apply(ctx: ClientContextLike): void {
     return
   }
 
-  const api = ctx.latexPreview
+  const api: PreviewApi = new HttpPreviewApi()
+  // `ctx.effect` ties the registration to this fiber so an unload removes it; the
+  // reference plugins register exactly this way.
+  const own: <T>(factory: () => T, label?: string) => T =
+    typeof ctx.effect === 'function' ? ctx.effect.bind(ctx) : (factory) => factory()
 
-  slots.inject(TITLE_SLOT, () =>
-    slots.register({ name: TITLE_SLOT, id: ENTRY_ID, label: 'LaTeX' }, () => 'LaTeX' as unknown as ReactNode),
+  try {
+  own(
+    () => slots.inject(TITLE_SLOT, () => slots.register({ name: TITLE_SLOT, key: ENTRY_KEY }, () => 'LaTeX')),
+    'latex-preview: tab title',
   )
-
-  slots.inject(TAB_SLOT, () => slots.register({ name: TAB_SLOT, id: ENTRY_ID }, () => <LatexPreviewPanel api={api} />))
+  own(
+    () => slots.inject(TAB_SLOT, () => slots.register({ name: TAB_SLOT, key: ENTRY_KEY }, () => <LatexPreviewPanel api={api} />)),
+    'latex-preview: preview tab',
+  )
+  } catch (error) {
+    console.error('[latex-preview] apply failed', error)
+    throw error
+  }
 }

@@ -69,11 +69,13 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
     return viewerRef.current
   }, [])
 
-  // Point the Host at our workspace once.
+  // Point the Host at our workspace once. Without a file prop this asks the Host
+  // to adopt its own working directory, which is the common "opened in a paper
+  // folder" case.
   useEffect(() => {
-    if (configured.current || !file) return
+    if (configured.current) return
     configured.current = true
-    void unwrap(api.configure({ file })).then((result) => {
+    void unwrap(api.configure(file ? { file } : {})).then((result) => {
       if (!result.ok) setNotice(result.message)
     })
   }, [api, file])

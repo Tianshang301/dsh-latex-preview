@@ -60,10 +60,15 @@ export interface StaticMount {
 /**
  * Build a request handler serving the given mounts.
  * @param mounts - namespace table.
+ * @param api - optional JSON API handler, tried first; returns true when it answered.
  * @returns a handler usable by any web server that passes Node's req/res.
  */
-export function createStaticHandler(mounts: readonly StaticMount[]) {
+export function createStaticHandler(
+  mounts: readonly StaticMount[],
+  api?: (req: IncomingMessage, res: ServerResponse) => Promise<boolean>,
+) {
   return async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (api && (await api(req, res))) return
     const url = new URL(req.url ?? '/', 'http://localhost')
     if (!url.pathname.startsWith(ROUTE_PREFIX)) {
       res.writeHead(404).end('not found')
@@ -180,9 +185,13 @@ export interface WebServerLike {
  * @param mounts - namespaces to serve.
  * @returns a disposer, or null when the server API did not accept the route.
  */
-export function mountStaticRoute(webServer: WebServerLike, mounts: readonly StaticMount[]): (() => void) | null {
+export function mountStaticRoute(
+  webServer: WebServerLike,
+  mounts: readonly StaticMount[],
+  api?: (req: IncomingMessage, res: ServerResponse) => Promise<boolean>,
+): (() => void) | null {
   if (typeof webServer.register !== 'function') return null
-  const handler = createStaticHandler(mounts)
+  const handler = createStaticHandler(mounts, api)
   const result = webServer.register({ kind: 'prefix', path: ROUTE_PREFIX, handler })
   if (typeof result === 'function') return result as () => void
   // Some servers return a handle with its own disposer.
