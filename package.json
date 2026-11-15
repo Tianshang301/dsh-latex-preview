@@ -3,6 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "description": "LaTeX Preview: live PDF preview, SyncTeX jumps, and one-click compile-error hand-off for DSH",
+  "author": "Tianshang301",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",

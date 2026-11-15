@@ -163,4 +163,4 @@ Read [`docs/spikes.md`](docs/spikes.md) before changing code — it records the 
 
 ## License
 
-[MIT](LICENSE) © 2026 Tianshang
+[MIT](LICENSE) © 2026 Tianshang301

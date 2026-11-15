@@ -163,4 +163,4 @@ npm run binaries     # 检查 tectonic / synctex
 
 ## License
 
-[MIT](LICENSE) © 2026 Tianshang
+[MIT](LICENSE) © 2026 Tianshang301
