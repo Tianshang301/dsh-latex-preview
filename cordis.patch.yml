@@ -1,0 +1,3 @@
+- insert:
+    - id: latex-preview
+      name: dsh-latex-preview

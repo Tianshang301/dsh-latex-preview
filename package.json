@@ -1,0 +1,63 @@
+{
+  "name": "dsh-latex-preview",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Live LaTeX preview for DeepSeek Harness: Tectonic compile, PDF.js viewer, SyncTeX jumps",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "lib",
+    "assets",
+    "i18n",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "slots"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/build-client.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "verify": "tsx test/contract/probe.ts",
+    "binaries": "tsx scripts/check-binaries.ts"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.1",
+    "chokidar": "3.6.0",
+    "diff-match-patch": "1.0.5",
+    "pdfjs-dist": "4.10.38"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
+    "@types/diff-match-patch": "1.0.36",
+    "@types/node": "22.10.2",
+    "esbuild": "0.24.2",
+    "tsx": "4.19.2",
+    "typescript": "5.7.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
