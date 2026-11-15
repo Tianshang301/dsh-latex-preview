@@ -1,4 +1,6 @@
-# Visual LaTeX for DeepSeek Harness — 开发文档
+# LaTeX Preview — 开发文档
+
+> 产品名：**LaTeX Preview**（npm 包 `dsh-latex-preview`）。曾用名 `Visual LaTeX` / `dsh-visual-latex`，已废弃——"visual LaTeX" 在英语里会被读成"图形化 LaTeX"（WYSIWYG 编辑器），与本插件"实时预览 + 双向跳转 + 报错回传"的定位不符，且不利于搜索。**本文件不再使用的名称，请勿在代码、文档、发布信息中复活。**
 
 **文档定位**：本文档交付给一位独立开发者在 4–6 周内完成从脚手架到上架 DSH 插件商店的完整开发。技术栈围绕“DSH 原生插件 + 本地 Tectonic 编译引擎 + Web 端 PDF.js 渲染”展开。
 

@@ -1,6 +1,6 @@
 # dsh-latex-preview 开发计划
 
-> 依据：`Visual LaTeX for DeepSeek Harness — 开发文档.md`（下称"规格书"）。
+> 依据：`LaTeX Preview — 开发文档.md`（下称"规格书"）。
 > 本文档只做三件事：**把规格书拆成可执行任务**、**把必须先验证的不确定性提前**、**给出每阶段的验收门**。
 
 ---

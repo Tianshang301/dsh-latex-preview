@@ -12,7 +12,7 @@
 |---|---|---|---|
 | 1 | 本文件 | 现状、决策、未决问题、怎么起步 | 15 分钟 |
 | 2 | `DEVELOPMENT_PLAN.md` | 六周任务分解、验收门、风险登记 | 30 分钟 |
-| 3 | `Visual LaTeX for DeepSeek Harness — 开发文档.md` | 规格书：架构、模块伪代码、API 契约 | 60 分钟 |
+| 3 | `LaTeX Preview — 开发文档.md` | 规格书：架构、模块伪代码、API 契约 | 60 分钟 |
 | 4 | `AGENTS.md` | 仓库级不变式速查（写代码时反复回看） | 5 分钟 |
 
 规格书是**权威依据**，计划是**执行方案**。两者冲突时以规格书为准，但计划第 1 节列的 6 个悬案除外——那几处是我认为规格书判断有误或缺失的地方，逐条给了理由。
@@ -70,22 +70,23 @@ cargo install tectonic
 
 ## 4. 命名约定（已定，不要改回去）
 
-原名 `dsh-visual-latex` 已废弃，理由：`visual LaTeX` 在英语里会被读成"图形化 LaTeX"，且不利于被搜索到。新名强调可发现性与一眼可懂。
+产品名：**LaTeX Preview**。旧名（`Visual LaTeX` / `dsh-visual-latex`）已于 2026-11-16 全量废弃，理由：`visual LaTeX` 在英语里会被读成"图形化 LaTeX"（WYSIWYG 编辑器），与"实时预览 + 双向跳转 + 报错回传"的实际定位相反，且不利于被搜索到。**不要在代码、文档、README、npm 页面、发布信息里复活旧名。**
 
 | 用途 | 值 |
 |---|---|
-| npm 包名 | `dsh-latex-preview`（npm 上未被占用） |
+| 产品名 | `LaTeX Preview` |
+| npm 包名 | `dsh-latex-preview`（npm 上未被占用；`dsh-` 前缀是 DSH 插件生态的命名空间约定，不是"for DeepSeek Harness"的标题后缀） |
 | cordis patch id | `latex-preview` |
 | 槽位 id | `latex-preview` |
 | 服务键 / `ctx.<键>` | `latexPreview` |
 | 服务类名 | `LatexPreviewService` |
 | 文件名 | `latex-preview-service.ts` 等 |
 | 事件前缀 | `latex-preview:` |
-| 消息来源标记 | `source: 'latex-preview'` |
+| 消息来源标记 | `{ kind: 'plugin', plugin: 'latex-preview' }` |
 
-**唯一例外**：本地工作目录仍叫 `E:\dsh-visual-latex`（交接时未改，避免影响已有会话）。发布时仓库名应为 `dsh-latex-preview`。
+**工作目录**：`E:\dsh-latex-preview`（旧路径 `E:\dsh-visual-latex` 已随改版切换）。发布时仓库名应为 `dsh-latex-preview`。
 
-⚠️ 全仓已无 `visual-latex` / `visualLatex` 残留。若你看到旧名，那是漏改，请一并修正。
+⚠️ 全仓已无旧名残留（`visual-latex` / `visualLatex` / `Visual LaTeX` 均已清除，仅规格书文首保留一行"曾用名"注记用于追溯）。若你看到旧名，那是漏改，请一并修正。
 
 ---
 

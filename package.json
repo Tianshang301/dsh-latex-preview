@@ -2,7 +2,7 @@
   "name": "dsh-latex-preview",
   "version": "0.0.0",
   "private": true,
-  "description": "Live LaTeX preview for DeepSeek Harness: Tectonic compile, PDF.js viewer, SyncTeX jumps",
+  "description": "LaTeX Preview: live PDF preview, SyncTeX jumps, and one-click compile-error hand-off for DSH",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
