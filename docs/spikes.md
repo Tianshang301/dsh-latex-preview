@@ -9,12 +9,12 @@
 | 编号 | 问题 | 结论 | 对计划的影响 |
 |---|---|---|---|
 | B1 | Host→Client 能否传回调 | **不能**。Remote 参数只有 `json` / `lookup` 两种来源，函数无法编码；官方跨半通道是"转发事件"，但需 Host 装配层白名单 | 客户端改**轮询 `getState()`**；`api.onCompiled(cb)` 删除 |
-| B2 | 源码编辑器是自带还是自建 | **仍未知**，但已排除一种可能：`slots` 核心包里没有 `ctx.slots.inject(key, cb)` 这个方法 | P0.5 前必须确认，否则面板挂不上 |
+| B2 | 槽位 API 与可用槽位 | **已解决一半**：`ctx.slots.inject(key, cb)` 存在且写法正确；但 `editor.panel.item` **不存在**，改用 `sidebar.right.pane.tab`（keyed）。编辑器是否自带仍未知 | P0.5 可开工；P1 的源码视图要自己做 |
 | B3 | `agent` 实例从哪来 | **已解决**：Host 侧 `ctx.agent?: Agent`（`Agent.ctx` 派生上下文自带）+ `ctx.agents: AgentRegistry`；`Agent#steer(message: UserMessage)` | 错误回传可直接实现，不必降级 |
 | B4 | draftMode | 维持"不做"（与 SyncTeX 硬冲突） | 不变 |
 | B5 | 编译超时/单飞 | 规格书缺，必须补 | 不变 |
 | B6 | pdfjs 资产与同源 | 未验证（需真实 profile 起服务） | 留到 P0.6 |
-| **B7** | client bundle 的 loader 契约 | **未知**，生态里没有可抄的第三方 client 包 | 先用 IIFE 单顶层语句形态，P0.5 前定案 |
+| **B7** | client bundle 的 loader 契约 | **已解决**：`window.__ModuleLoader__.load({ id, factory })`，工厂内返回 exports、副作用全在闭包里 | 构建脚本已按此实现并核对产物 |
 | **B8** | 消息 `source` 的形状 | 规格书写错：不是字符串，是判别式对象。**0.2.2 里 `plugin` kind 已被移除**，插件产出的消息就是 `{ kind: 'user' }` | 已按 0.2.2 契约实现 |
 | **B9** | `synctex` 输出格式 | 已实测：`view` 必须传**绝对路径+正斜杠**；字段是大写 `W:`/`H:`；`Column` 可为 `-1` | P1.1 的解析器按实测写，别照抄规格书正则 |
 | **B10** | 本机 `pnpm run` 被拦 | 本机 pnpm 有供应链策略包装层，`pnpm run` 前置校验因"ignored build scripts"失败 | 本轮用 `npx tsc` / `npx tsx` 直调；不影响产物 |
@@ -60,23 +60,42 @@ export type TypertRemoteEvent = Extract<keyof Events, keyof TypertRemoteEventSel
 
 ---
 
-## B2 · 编辑器与槽位：关键 API 仍未证实（P0 最大风险）
+## B2 · 槽位：API 已证实，`editor.panel.item` 不存在（改用 keyed 槽）
 
-已确认的事实：
+**结论**：`ctx.slots.inject(key, cb)` **确实存在**，规格书没记错；但规格书给的槽位 key `editor.panel.item` **在真实 DSH 里不存在**。
 
-- `@deepseek-ai/dsh-client-ui-slots@0.0.1-rc.1` 的 `index.d.ts` 是一个**纯注册表**（`SlotCore`）：`SlotMap` 由各 owner 通过 `declare module` 合并扩展，注册入口是 `register(options, Component)`。
-- 该包里 **没有** `inject(key, factory)` 这个方法。包内唯一的 `inject` 是"槽位级注入面"（`inject?: object`，给组件注入 hooks/业务面），与"延迟注册到某个槽位"是两回事。
-- `@deepseek-ai/dsh-client-web` 的 `PLATFORM_MODULES` 里确实列了 `@deepseek-ai/dsh-client-ui-slots`，说明 slots 是平台级共享模块。
-- `editor.panel.item` 这个 key 我们**无法验证存在**：`SlotMap` 的合并声明在 `dsh-client-ui-layout` 之类的包里，而这些包不在公开 registry 的可见范围内（`npm search` 只看得到 `ui-theme` / `ui-plan` / `ui-settings` 等）。
+证据来自 `@deepseek-ai/dsh-client-runtime@0.0.1-rc.1` 的 `SlotsService`：
 
-**风险**：规格书 §2.1 和坑 14 反复强调的 `ctx.slots.inject(key, () => ctx.slots.register(...))`，在本轮可见的包里**找不到该方法**。可能是运行时 wrapper（`SlotsService`）提供、而我们没拿到那个包；也可能规格书把 API 记混了。
+```ts
+export declare class SlotsService extends Service {
+  readonly register: SlotCore['register']        // 唯一注册入口
+  /** 安装一个 effect，绑定到某个槽位声明的生命周期。 */
+  inject(key: keyof SlotMap & string, callback: () => SlotInjectionEffect): () => void
+  // 另有 entries(key) / getVersion(key) / subscribe(key, listener)
+}
+```
 
-**下一步（P0.5 前必须做）**：
-1. 在真实 DSH Web profile 里 `console.log(Object.keys(ctx.slots))` 与 `Object.keys(ctx)`，确认 slots 服务实际暴露的方法名；
-2. 打印已注册槽位 key 列表，确认 `editor.panel.item` 是否存在、宿主是谁（这同时回答 B2 的另一半："编辑器是否自带"）；
-3. 若确实没有 `inject`，改用 `register()` 直接注册，并按真实签名调整 `src/client/index.ts`。
+`inject` 的语义正是"等这个槽位被声明后，执行回调并接管其 dispose"——所以规格书那条
+`ctx.slots.inject(key, () => ctx.slots.register(opts, Component))` 是正确写法，且**不该包 `ctx.effect`**（dispose 由 caller 的 fiber 管）。
 
-在这三条确认前**不要写面板组件**——写 3 天 UI 再返工是 3 天。
+真正可用槽位（从已发布插件的 `lib/client.js` 里逐个读出来的）：
+
+| 槽位 key | kind | 谁声明 | 能否第三方占用 |
+|---|---|---|---|
+| `root` | single | runtime（shell 渲染） | ❌ 由 layout 的 AppFrame 占用 |
+| `rightbar` | single | ui-sidebar-right | ❌ 已被占用 |
+| `sidebar.right.pane.tab` | **keyed** | ui-sidebar-right（子槽位） | ✅ 按 id 注册，正是"右侧面板的一个标签页" |
+| `sidebar.right.pane.tab.title` | keyed | 同上 | ✅ 标签标题 |
+| `sidebar.right.tab.menu.item` | list | 同上 | ✅ 标签右键菜单项 |
+| `sidebar.settings` | single | ui-settings | ❌ |
+| `conversation.input.plan` / `conversation.session.header.corner` | — | ui-plan | 与预览无关 |
+| `tool.call.toolview` | — | ui-skill | 与预览无关 |
+
+**决策**：预览面板注册到 `sidebar.right.pane.tab`（keyed，scope session），id 用 `latex-preview`；标题注册到 `sidebar.right.pane.tab.title`。这与 ui-settings / ui-plan 的做法一致，是生态里唯一被验证过的第三方面板路径。
+
+**代价**：面板依赖 `@deepseek-ai/dsh-client-ui-sidebar-right` 在场；它不在时 `inject` 的回调永不触发，面板静默不出现（不是错误，但 README 要写明）。
+
+**B2 的另一半（编辑器是否自带）仍未回答**：所有可见包都没有源码编辑器面板，`editor.panel.item` 也不存在。P1 的"源码点击跳 PDF"需要重新找落点——候选是把源码视图做成我们自己 tab 内的只读 CodeMirror，成本回到规格书原本的估计。
 
 ---
 
@@ -204,13 +223,38 @@ SyncTeX result end
 
 ---
 
-## B7 · client bundle 的 loader 契约（新增，未定）
+## B7 · client bundle 的 loader 契约：已解决
 
-生态里可见的第三方插件只有一个（`@yimiliya/dsh-api-prompt-optimizer`），它是**纯 Host**（Typert Remote controller），**没有 client 半**，所以没有可抄的样板。
+`@deepseek-ai/dsh-client-modules@0.0.1-rc.1` 的 `manifest.d.ts` 把契约写死了：
 
-当前选择（`scripts/build-client.mjs`）：esbuild 出 **IIFE + 全局名**，产物顶层只有一条语句 `var __dshLatexPreviewClient = (() => {…})();`，所有副作用都在工厂内部。这满足"顶层唯一语句、副作用在工厂内"的硬约束，且加一行 wrapper 就能改成任何 loader 想要的形状。
+```ts
+/** The shape a client bundle hands to window.__ModuleLoader__.load (registration handoff). */
+export interface ClientPluginHandoff {
+  id: string                                   // 插件 id = 包名，必须与 graph row 一致
+  factory: (require: (spec: string) => unknown) => Record<string, unknown>
+}
+window.__ModuleLoader__?: { load(handoff: ClientPluginHandoff): void }
+```
 
-**代价**：真实 loader 若要求 `module.exports = factory`（CJS）或 `define()`（AMD），需要改 banner/footer 一行。P0.5 前定案。
+原文注释把要点说尽了：*"executing a plugin bundle only REGISTERS its factory; every module body side effect — including CSS injection — lives inside the factory closure and runs at materialization, not at script execution."*
+
+所以产物必须是**恰好一条顶层语句**：
+
+```js
+window.__ModuleLoader__.load({
+  id: "dsh-latex-preview",
+  factory: function (require) {
+    var module = { exports: {} };
+    var exports = module.exports;
+    /* …整个 bundle… */
+    return module.exports;
+  },
+});
+```
+
+`require` 是模块表给的同步 require，平台单例（`react`、`@deepseek-ai/cordis`、slots 包）从这里来，**不能打进 bundle**——第二份 React 会让 hooks 与 slot renderer 同时失效。
+
+`scripts/build-client.mjs` 已按此实现（esbuild `format: 'cjs'` + banner/footer 包壳，id 从 `package.json` 读），产物结构已核对：顶层只有 `window.__ModuleLoader__.load({…})` 一条语句。
 
 ---
 
