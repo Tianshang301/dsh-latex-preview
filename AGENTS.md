@@ -2,6 +2,7 @@
 
 ## Repo state (read this first)
 
+- **Two READMEs** (2026-11-16): `README.md` is the English main page and `README.zh.md` the Chinese one. Edit both in the same commit; each links to the other at the top. Panel strings are Chinese, so the English page quotes the label plus its translation.
 - **Point-and-edit works** (2026-11-16): the viewer enables the text layer, a selection or rubber-band region becomes a PDF-point rectangle, the Host reverse-jumps it with `synctex edit` into a source line range, and the Agent gets that range plus the user's sentence. PDF text is never used as content. Shares the sessionId→Agent path from §B14. See `docs/spikes.md` §B15/§B16.
 - **Right-sidebar tab needs two registrations** (2026-11-16): `ctx.get('sidebarRightTabs').register({id, kind, ...})` declares the tab type, then the keyed slots `sidebar.right.pane.tab` / `.title` supply the body and chip under `key === definition.id`. Slot-only registration renders nothing. Both services must be reached with dynamic `ctx.inject`, since the sidebar provides them on its own schedule. See `docs/spikes.md` §B13.
 - **PDF.js viewer is bundled, not assumed** (2026-11-16): pdfjs-dist ships components only (`web/pdf_viewer.mjs`), no `viewer.html`, so `viewer/` holds a ~100-line page assembled from them and `scripts/build-assets.mjs` copies the runtime + that page into `assets/` (git-ignored, ~5 MiB). `utils/assets.ts` resolves the directory from `import.meta.url`; `/assets` is mounted from there, not from `process.cwd()`. See `docs/spikes.md` §B12.

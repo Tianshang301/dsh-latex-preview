@@ -1,62 +1,64 @@
 # dsh-latex-preview
 
-**在 DSH（DeepSeek Harness）里写 LaTeX：改稿即出新 PDF，编译不过一键丢给 Agent 修，在 PDF 上指哪儿改哪儿。**
+**Write LaTeX inside DSH (DeepSeek Harness): save and the PDF is already there, compile errors go straight to the Agent, and you can point at a spot in the PDF to have it changed.**
 
-一个 Cordis 双半插件（Host = Node / Client = Web），把 Tectonic 编译、PDF.js 预览与 SyncTeX 双向定位装进右侧栏。
+A Cordis dual-half plugin (Host = Node, Client = Web) that puts Tectonic compilation, PDF.js preview, and two-way SyncTeX navigation into the right sidebar.
+
+English · [简体中文](README.zh.md)
 
 ---
 
-## 它解决什么
+## The problem it removes
 
-写 LaTeX 的循环通常是这样：改 `.tex` → 切终端按编译 → 等 → 翻 PDF 找报错那一行 → 回编辑器找对应源码。三次上下文切换，一次报错。
+The LaTeX loop usually goes like this: edit the `.tex` → switch to a terminal → compile → wait → find the error line in the PDF → hunt for the matching source line. Three context switches per typo.
 
-这个插件把这条链压进侧栏：
+This plugin collapses that into the sidebar:
 
-| 平时 | 出错时 | 想改某处时 |
+| While writing | When it breaks | When you want something changed |
 |---|---|---|
-| 保存即编译，PDF 原地刷新，滚动位置不动 | 诊断列表点一下跳到源码行 | 在 PDF 上选中/框选 → 一句话 → Agent 改源码 → 自动重编 |
+| Save → compile → PDF refreshes in place, scroll position kept | Click a diagnostic to jump to its source line | Select or box a region in the PDF → one sentence → the Agent edits the source → recompile |
 
-编译、渲染、SyncTeX、diff **全部在本机完成**，只有你主动发送的错误上下文或选区锚点会进 Agent 会话。
+Compiling, rendering, SyncTeX, and diffing all run **on your machine**. Only the error context or selection anchor you explicitly send reaches the Agent session.
 
-## 功能
+## Features
 
-- **实时预览**：`chokidar` 监听 + 500 ms 防抖，保存即编译，PDF 原地刷新。
-- **滚动保持**：刷新前后保留阅读位置——这条是刻意做的，不是附赠（`captureScrollState()` 必须在新 PDF 加载**之前**跑）。
-- **编译失败不清空**：编译前把旧 PDF 备份为 `.pdf.prev`，失败即回滚。**一次编译失败永远不会让预览变白。**
-- **SyncTeX 双向跳转**：PDF 双击 → 源码行；源码行 → PDF 位置。始终 shell 调用 `synctex` CLI，不手写解析 `.synctex`。
-- **编译错误一键交给 Agent**：把「文件:行 + 错误 + 源码上下文」组成 prompt，投递到当前会话；Agent 改完 `.tex`，文件监听自动重编。
-- **在 PDF 上指一处让 AI 改**：选中文字或在任意位置拖框 → 原地浮出输入栏 → 写一句要求 → Agent 拿到**源码行范围**去改。
-- **行级 diff**：`diff-match-patch` 对比上一版源码，高亮改了什么。
-- **脱敏开关**：开启后只发「消息 + 行号」，不带源码、不带选中文字。
-- **诊断可点击**：错误/警告列表点条目即跳转到对应源码位置。
+- **Live preview** — `chokidar` watch plus a 500 ms debounce; save and the PDF refreshes in place.
+- **Scroll preservation** — your reading position survives the refresh. This is deliberate, not incidental: `captureScrollState()` has to run **before** the new PDF loads.
+- **A failed compile never blanks the preview** — the old PDF is copied to `.pdf.prev` before compiling and restored on failure.
+- **Two-way SyncTeX** — double-click the PDF to get the source line; go from a source line to the PDF location. Always shells out to the `synctex` CLI; the `.synctex` file is never hand-parsed.
+- **One-click error hand-off** — builds a prompt from "file:line + message + source context" and steers it into the current session. The Agent fixes the `.tex`, the watcher recompiles.
+- **Point at the PDF, change the source** — select text, or drag a box over anything → an inline bar appears → type one sentence → the Agent receives the **source line range** to edit.
+- **Line-level diff** — `diff-match-patch` compares against the previous source revision and highlights what changed.
+- **Redaction switch** — when on, only "message + line number" is sent; no source, no selected text.
+- **Clickable diagnostics** — clicking an error or warning jumps to its source location.
 
-## 环境要求
+## Requirements
 
-| 依赖 | 说明 |
+| Dependency | Notes |
 |---|---|
-| DSH | `0.2.2-rc.1`（插件按此版本的 Typert / slots 契约实现） |
-| Node.js | ≥ 20（开发用 22.x） |
-| `tectonic` | **需自行安装并在 PATH 中**，启动时校验 |
-| `synctex` | 随 TeX 发行版提供，**需在 PATH 中**，启动时校验 |
+| DSH | `0.2.2-rc.1` (the plugin targets this version's Typert / slots contracts) |
+| Node.js | ≥ 20 (developed on 22.x) |
+| `tectonic` | **You install it** and put it on `PATH`; verified at startup |
+| `synctex` | Shipped with your TeX distribution, **must be on `PATH`**; verified at startup |
 
-`tectonic` 官方二进制覆盖 win-x64 / macos-universal / linux-x64；arm64 需 `cargo install tectonic`。缺失时面板会直接告诉你缺哪个（`latex-preview/binary-missing`），不会静默失败。
+Official `tectonic` binaries cover win-x64 / macos-universal / linux-x64; on arm64 use `cargo install tectonic`. When something is missing the panel names it (`latex-preview/binary-missing`) instead of failing silently.
 
-## 安装
+## Install
 
-插件以「目录 + Cordis patch」方式挂载。把它放进工作区的 `node_modules`，再用 patch 声明加载：
+The plugin is mounted as "a directory plus a Cordis patch". Put it in your workspace's `node_modules`, then declare it:
 
 ```bash
-# 1. 取得插件（或直接把本仓库放到位）
+# 1. Get the plugin (or drop this repo in place)
 cd your-workspace
 mkdir -p node_modules
-ln -s /path/to/dsh-latex-preview node_modules/dsh-latex-preview   # Windows 用 mklink /D
+ln -s /path/to/dsh-latex-preview node_modules/dsh-latex-preview   # Windows: mklink /D
 
-# 2. 构建
+# 2. Build it
 cd node_modules/dsh-latex-preview
 npm install
 npm run build        # tsc + client bundle + assets
 
-# 3. 写一个 patch
+# 3. Write a patch
 cd your-workspace
 cat > latex-preview.yml <<'EOF'
 - insert:
@@ -64,100 +66,100 @@ cat > latex-preview.yml <<'EOF'
       name: dsh-latex-preview
 EOF
 
-# 4. 启动
+# 4. Start
 npx dsh web --patch ./latex-preview.yml
 ```
 
-启动后右侧栏出现 LaTeX 预览页签；工作区根目录的 `main.tex` 默认作为编译入口，也可在面板里改。
+A LaTeX preview tab shows up in the right sidebar. `main.tex` in the workspace root is the default compile entry; the panel can change it.
 
-> `assets/` 与 `lib/` 是构建产物（已 gitignore）。`npm run build` 会把 PDF.js 运行时与查看器页面一起拷进 `assets/`（约 5 MiB）。
+> `assets/` and `lib/` are build output (git-ignored). `npm run build` copies the PDF.js runtime and the viewer page into `assets/` (~5 MiB).
 
-## 使用
+## Usage
 
-### 面板
+### The panel
 
-顶部是状态与操作区（编译状态与耗时、`编译`、`发送给 Agent`，二进制缺失时另有`重新检测`），中间是 PDF，底部是诊断列表。
+The top strip holds status and actions (compile state and duration, `编译` / Compile, `发送给 Agent` / Send to Agent, plus `重新检测` / Re-check when a binary is missing), the middle is the PDF, the bottom is the diagnostics list.
 
-| 操作 | 结果 |
+| Action | Result |
 |---|---|
-| 保存 `.tex` | 防抖 500 ms 后自动编译 |
-| 双击 PDF 某处 | 反查源码并跳转 |
-| 点某条诊断 | 跳到对应源码行 |
-| 「发送给 Agent」 | 把本次编译错误投递给当前会话（无错误时按钮禁用并说明原因） |
+| Save a `.tex` | Compiles automatically after the 500 ms debounce |
+| Double-click the PDF | Reverse-jumps to the source file and line |
+| Click a diagnostic | Jumps to that source line |
+| "Send to Agent" | Hands this compile's errors to the current session (disabled with an explanation when there are none) |
 
-### 在 PDF 上指一处改一处
+### Point at a spot, change the source
 
-1. **选中文字**：直接拖选，选区下方浮出输入栏（文字层已开启）。
-2. **框选区域**：在没有文字层的地方（公式、图、表格、页边）拖一个框，松手同样浮出输入栏。
-3. 写一句要求（如「这句改成中文」「把这个公式化简」），回车发送。
-4. Host 用 `synctex edit` 反查两个角点 → 取同文件内的行范围 → 读那几行源码 → 连同你的要求发给 Agent。
-5. Agent 改 `.tex` → 文件监听重编 → PDF 原地刷新。
+1. **Select text** — drag to select; an inline bar appears below the selection (the text layer is enabled).
+2. **Box a region** — where there is no text layer (formulas, figures, tables, margins), drag a rectangle; the same bar appears on release.
+3. Type one sentence ("make this Chinese", "simplify this formula") and press Enter.
+4. The Host reverse-jumps both corners with `synctex edit`, takes the line range within one file, reads those source lines, and sends them with your request.
+5. The Agent edits the `.tex` → the watcher recompiles → the PDF refreshes in place.
 
-**关键设计：PDF 只当锚点，不当内容。** 真正给 Agent 的是**源码行**，不是从 PDF 抽出的文本——公式与连字抽出来常是乱码，源码永远干净。选中的字符串只作为「仅供参考」的附注。因此选中一个公式也不会让 Agent 瞎改。
+**The PDF is an anchor, never the content.** What reaches the Agent is **source lines**, not text extracted from the PDF — formulas and ligatures extract badly, source is always clean. The selected string rides along as an explicitly unreliable hint. That is why selecting a formula does not make the Agent guess.
 
-## 隐私边界
+## Privacy boundary
 
-编译、渲染、SyncTeX、diff **全在本机**。只有两种情况会把内容送进 Agent 会话：
+Compiling, rendering, SyncTeX, and diffing stay **local**. Content enters the Agent session only when:
 
-1. 你点「发送给 Agent」（或触发一次指哪改哪）；
-2. 你显式打开脱敏开关前的每一次发送都会有提示。
+1. you press "Send to Agent" (or trigger a point-and-edit), or
+2. you send with redaction on — every send says so first.
 
-脱敏（`redact`，默认关闭）开启后，只发送「消息 + 行号」，不带源码行、不带选中文字。
+Redaction (`redact`, off by default) sends "message + line number" only: no source lines, no selected text.
 
-## 已知限制
+## Known limits
 
-- **反查精度到行，不到字符。** SyncTeX 返回的是盒子到行的映射，`Column` 常为 `-1`。选一个词得到的是它所在的行（可能多行）。
-- **扫描版 PDF 无文字层**，框选可能定位失败。本插件的 PDF 都是 Tectonic 现编的，一定有文字层。
-- **跨页选区**只按当前页那一段反查。
-- 一次指哪改哪最多附带 **12 行**源码（`MAX_EDIT_LINES`），避免框住整页时把整页塞进 prompt。
-- 首次编译可能要下载 TeX 宏包，超时放宽到 5 分钟（后续 2 分钟）。
+- **Reverse lookup is line-accurate, not character-accurate.** SyncTeX maps boxes to lines and `Column` is often `-1`; selecting one word yields the line (or lines) containing it.
+- **Scanned PDFs have no text layer**, so boxing may fail to resolve. Tectonic always emits a text layer, so this does not affect previews produced here.
+- **Cross-page selections** reverse-jump only the current page's part.
+- One point-and-edit quotes at most **12 source lines** (`MAX_EDIT_LINES`), so boxing a whole page cannot dump a whole page into the prompt.
+- The first compile may download TeX packages, so its timeout is 5 minutes (2 minutes afterwards).
 
-## 架构
+## Architecture
 
 ```
 src/
-  index.ts                       Host 入口，注册服务
+  index.ts                       Host entry; registers the service
   services/
-    latex-preview-service.ts     Typert Remote 服务（9 个 @Remote 方法）
-    compile.ts                   Tectonic 调用 + 产物回滚
-    watcher.ts                   chokidar + 防抖
-    diff.ts                      行级 diff
-    agent-bridge.ts              prompt 组装 + agent.steer 投递
-    http-api.ts                  同源 JSON 路由 /.latex-preview/api/*
-    static-route.ts              /assets 静态挂载
+    latex-preview-service.ts     Typert Remote service (9 @Remote methods)
+    compile.ts                   Tectonic invocation + artifact rollback
+    watcher.ts                   chokidar + debounce
+    diff.ts                      line-level diff
+    agent-bridge.ts              prompt assembly + agent.steer delivery
+    http-api.ts                  same-origin JSON routes /.latex-preview/api/*
+    static-route.ts              /assets static mount
   utils/                         binaries / root / log-parser / synctex / assets
   client/                        panel.tsx / pdf-viewer.ts / api.ts / index.tsx
-viewer/                          PDF.js 查看器页面（选区、框选、浮条）
+viewer/                          the PDF.js viewer page (selection, box, inline bar)
 ```
 
-两条必须知道的约束：
+Two constraints worth knowing up front:
 
-- **Host↔Client 传不了回调**。客户端轮询 `getState()`，靠 `version` 计数器判断是否变化——版本没变就什么都不做，不重渲染、不重载 iframe。
-- **面板走 HTTP 路由，那条链路上没有 Agent driver**，所以 `currentInitiator()` 恒为空。面板改为从侧栏的 `data-sidebar-right-session` 读出会话 id，Host 用 `agents.get(id)` 解析出 live Agent。
+- **Callbacks cannot cross the Host↔Client wire.** The client polls `getState()` and reacts to the `version` counter — an unchanged version does nothing: no re-render, no iframe reload.
+- **The panel talks over an HTTP route, which has no Agent driver**, so `currentInitiator()` is always empty there. The panel reads the session id from the sidebar's `data-sidebar-right-session` and the Host resolves it with `agents.get(id)`.
 
-面板可用的 HTTP 接口（`POST`，除 `state` 为 `GET`）：`state` `configure` `compile` `diff` `jump-to-pdf` `jump-to-source` `send-error` `edit-at` `binaries`。
+HTTP routes the panel uses (`POST`, except `state` which is `GET`): `state` `configure` `compile` `diff` `jump-to-pdf` `jump-to-source` `send-error` `edit-at` `binaries`.
 
-## 开发
+## Development
 
 ```bash
 npm run typecheck    # tsc --noEmit
-npm run verify       # 契约探针（5 pass / 0 fail / 2 skip）
+npm run verify       # contract probe (5 pass / 0 fail / 2 skip)
 npm run build        # tsc + client bundle + assets
-npm run assets       # 只重建 PDF.js 运行时与查看器页面
-npm run binaries     # 检查 tectonic / synctex
+npm run assets       # rebuild only the PDF.js runtime and viewer page
+npm run binaries     # check tectonic / synctex
 ```
 
-> 本机 `pnpm run` 不可用，请用 `npm run` 或 `npx`。
+> `pnpm run` is broken on the machine this was developed on; use `npm run` or `npx`.
 
-改代码前请先读 [`docs/spikes.md`](docs/spikes.md)：那里是逐条实测读出来的契约证据（PDF.js 坐标换算、slots 注册、`createUserMessage` 的真实签名等），能省掉大半试错。其余文档：
+Read [`docs/spikes.md`](docs/spikes.md) before changing code — it records the contracts as measured against the real packages (PDF.js coordinate conversion, slot registration, the actual `createUserMessage` signature) and saves most of the trial and error. Other docs:
 
-| 文件 | 内容 |
+| File | Contents |
 |---|---|
-| [`docs/spikes.md`](docs/spikes.md) | 已验证的契约与踩坑记录（B1–B16） |
-| [`docs/HANDOFF.md`](docs/HANDOFF.md) | 状态、决策、未决问题 |
-| [`docs/DEVELOPMENT_PLAN.md`](docs/DEVELOPMENT_PLAN.md) | 任务分解、验收门、风险登记 |
-| [`docs/LaTeX Preview — 开发文档.md`](docs/LaTeX%20Preview%20—%20开发文档.md) | 架构与 API 契约规格书 |
-| [`AGENTS.md`](AGENTS.md) | 仓库级不变式速查 |
+| [`docs/spikes.md`](docs/spikes.md) | Verified contracts and traps (B1–B16) |
+| [`docs/HANDOFF.md`](docs/HANDOFF.md) | Status, decisions, open questions |
+| [`docs/DEVELOPMENT_PLAN.md`](docs/DEVELOPMENT_PLAN.md) | Work breakdown, gates, risk register |
+| [`docs/LaTeX Preview — 开发文档.md`](docs/LaTeX%20Preview%20—%20开发文档.md) | Architecture and API contract spec |
+| [`AGENTS.md`](AGENTS.md) | Repo-level invariants cheat sheet |
 
 ## License
 
