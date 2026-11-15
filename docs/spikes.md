@@ -21,6 +21,8 @@
 | **B12** | PDF.js 查看器从哪来 | pdfjs-dist **不发** `viewer.html`/`viewer.mjs`，只有组件 `web/pdf_viewer.mjs` + `build/pdf.mjs`；`<iframe src=pdf>` 只能拿到浏览器内置查看器，`PDFViewerApplication` 不存在 | 自建 `viewer/` 页（组件拼装），`scripts/build-assets.mjs` 复制进 `assets/`；已真机渲染 1 页 |
 | **B13** | 右侧栏 tab 怎么才算挂上 | 两级注册：`sidebarRightTabs.register({id,kind,…})` + keyed 槽（`key` 必须等于那个 `id`）。只做槽注册则**什么都不显示** | 已实现并真机跑通；服务须用 `ctx.inject` 动态注入 |
 | **B14** | HTTP 路由里「发送给 Agent」 | `agents.currentInitiator()` 在无 driver 的请求里恒为空；须由面板传 sessionId，Host 用 `agents.get(id)` 解析 | 已实现并真机跑通（Agent 收到 prompt 并改文件） |
+| **B15** | PDF 坐标换算 | `getViewport({scale:1})` 已是**点**；再乘 96/72 会把 y 缩到 0.75，反查落到页外 | 已修，双向跳转与选区定位都对齐到正确行 |
+| **B16** | 框选 PDF 让 AI 改源码 | 文字层选区或拖框 → `synctex edit` 反查行范围 → 带源码行的 prompt → Agent 改 `.tex` → 自动重编 | 已实现并真机跑通（选中第 3 行准确命中） |
 
 ---
 
@@ -549,5 +551,54 @@ scrollPageIntoView: "1" is not a valid pageNumber parameter.
 ```
 
 PDF.js 对坏页码**只警告不抛错**，所以滚动保持会静默失效。`scrollToPage` 现在统一 `Math.trunc(Number(page))` 并拒绝非正数。
+
+---
+
+## B15 · PDF 坐标换算：`getViewport({scale:1})` 已经是点，不用再乘 96/72
+
+**症状**：选中 PDF 里第 3 行的 “Hello world.”，反查结果却是 `main.tex:6`（`\end{document}`）。整页纵向偏了约三行。
+
+**定位**：在真实页面里取一组几何量，再对 `synctex edit` 做 y 扫描：
+
+```
+spanText  Hello world.
+rect.top  177.16   box.top   8     box.h  1056
+viewport  612 × 792
+y (旧算法) 95.15
+```
+
+`612×792` 正好是 Letter 的**点**尺寸（8.5×11 in × 72）。也就是说 `page.getViewport({ scale: 1 })` 返回的已经是 PDF 点，而 DOM 上的 `.page` 元素是 816×1056 CSS px（96 dpi）。旧代码把「占元素高度的比例 × 792」的结果又乘了 `72/96`，等于把 y 缩到 0.75 倍，落进了页眉空白区。
+
+y 扫描（x=120，单位点，origin 左上）：
+
+| y | 30–90 | 120 | 150 | 200–400 | 500+ |
+|---|---|---|---|---|---|
+| 反查行 | 6（无 tag，落到末行） | 3 | 4 | 5 | 5/6 |
+
+**结论与修法**：`x = 比例 × viewport.width`，`y = 比例 × viewport.height`，不乘任何 dpi 系数；原点确实是左上（y 增大向下），`flipY` 保持可选。`viewer/viewer.js` 的 `toPdfRect` 与 `client/pdf-viewer.ts` 的 `pdfPointFromClick` 都已改。改完后第 3 行→`main.tex:3`、第 5 行→`main.tex:5`，与源码逐行对得上。
+
+---
+
+## B16 · 「在 PDF 上选一处，让 AI 改」的落地
+
+**交互**：在 PDF 里选中文字，或在没有文字层的地方拖一个框 → 原地浮出一条输入栏 → 写一句要求 → 发给当前会话的 Agent。改的始终是 `.tex`，PDF 只是定位入口。
+
+**实现要点**：
+
+- 文字层必须开（`textLayerMode: 1`）；它为 `window.getSelection()` 提供可选文本。注释层仍关闭。
+- 框选只在鼠标按下点**不在** `.textLayer` 内时启动，所以普通文本选择不会被打断；阈值 12px，避免误触变成选区。
+- 两个角点都做 `synctex edit` 反查，取同一文件内的 `min..max` 行，跨行选区因此得到行范围；上限 12 行（`MAX_EDIT_LINES`），避免框住整页时把整页源码塞给 Agent。
+- **不提取 PDF 文本作为内容**：公式、连字抽出来常是乱码。选中的文字只作为「仅供参考」的一句附注，真正给 Agent 的是源码行。
+- 输入栏画在查看器页面内（`#editBar`），而不是 React 侧——省掉跨 iframe 的坐标换算；提交后只 postMessage 一个 `edit-request`。
+- Host 侧新增 `POST /.latex-preview/api/edit-at`，复用 §B14 的 sessionId→Agent 解析；脱敏开关照旧（开时不带源码、不带选中文字）。
+
+**真机验证**（DSH 0.2.2-rc.1 + Edge headless）：
+
+| 场景 | 结果 |
+|---|---|
+| 选中 "Hello world." → 输入要求 → 提交 | 状态「已把修改要求发给 Agent（main.tex:3）」，会话收到带 `3: Hello ...` 源码块的 prompt |
+| 选中第 5 行文本 | 反查 `main.tex:5`，与源码一致 |
+| 在正文空白处拖框（无文字层） | 浮条显示「第 1 页选区」，反查 `main.tex:5-6`（行范围） |
+| Agent 收到后 | 直接编辑 `.tex`，文件监听触发重编，PDF 原地刷新 |
 
 ---

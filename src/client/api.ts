@@ -13,7 +13,7 @@
  * @module dsh-latex-preview/client/api
  */
 
-import type { CompileResult, DiffBlock, PreviewState, SyncEditHit, SyncViewHit } from '../types.ts'
+import type { CompileResult, DiffBlock, EditOutcome, EditRequest, PreviewState, SyncEditHit, SyncViewHit } from '../types.ts'
 
 /** Transport envelope every Remote call resolves to. */
 export type RemoteResult<T> =
@@ -32,6 +32,8 @@ export interface PreviewApi {
   jumpToPdf(request: { line: number; file?: string }, signal?: AbortSignal): Promise<RemoteResult<readonly SyncViewHit[]>>
   jumpToSource(request: { page: number; x: number; y: number }, signal?: AbortSignal): Promise<RemoteResult<readonly SyncEditHit[]>>
   sendErrorToAgent(request: { redact?: boolean; sessionId?: string }, signal?: AbortSignal): Promise<RemoteResult<{ ok: boolean; detail?: string }>>
+  /** Turn a rectangle in the PDF into a change request on its source lines. */
+  editAt(request: EditRequest, signal?: AbortSignal): Promise<RemoteResult<EditOutcome>>
   recheckBinaries(signal?: AbortSignal): Promise<RemoteResult<PreviewState['binaries']>>
 }
 
@@ -115,6 +117,10 @@ export class HttpPreviewApi implements PreviewApi {
 
   sendErrorToAgent(request: { redact?: boolean; sessionId?: string }, signal?: AbortSignal): Promise<RemoteResult<{ ok: boolean; detail?: string }>> {
     return this.call('send-error', request, signal)
+  }
+
+  editAt(request: EditRequest, signal?: AbortSignal): Promise<RemoteResult<EditOutcome>> {
+    return this.call('edit-at', request, signal)
   }
 
   recheckBinaries(signal?: AbortSignal): Promise<RemoteResult<PreviewState['binaries']>> {

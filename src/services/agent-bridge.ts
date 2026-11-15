@@ -79,6 +79,56 @@ export function buildErrorPrompt(diagnostics: readonly LatexDiagnostic[], option
   return [...head, '', ...body, '', ...tail].join('\n')
 }
 
+/** One rectangle in the PDF turned into a request to change its source. */
+export interface SelectionPromptInput {
+  /** Source file SyncTeX reported; absolute. */
+  readonly file: string
+  /** First and last source line the rectangle covers. */
+  readonly lineStart: number
+  readonly lineEnd: number
+  /** Those lines of source, already read (empty when redacting). */
+  readonly lines: readonly string[]
+  /** Text the user selected, as a hint only; bad for formulas and ligatures. */
+  readonly quoted: string
+  /** What the user asked for, in their own words. */
+  readonly instruction: string
+  readonly redact: boolean
+}
+
+/**
+ * Build the prompt for a "change this spot" request.
+ *
+ * The rectangle is the anchor, not the content: the source lines are what the
+ * Agent edits, which is why a garbled text extraction does not matter here.
+ * @param input - resolved source location plus the user's instruction.
+ * @returns the prompt text.
+ */
+export function buildSelectionPrompt(input: SelectionPromptInput): string {
+  const range = input.lineStart === input.lineEnd ? `${input.lineStart}` : `${input.lineStart}-${input.lineEnd}`
+  const head = [
+    `用户在你编译出的 PDF 上指了一处位置，想要修改对应的源码。`,
+    `位置：${basename(input.file)}:${range}`,
+    `用户的要求：${input.instruction}`,
+  ]
+
+  if (input.redact) {
+    head.push('（已开启脱敏模式：未附带源码与选中文本，请依据行号自行读取文件。）')
+    head.push('请只改这一处相关的内容，不要新建文件，也不要改动无关部分；改完我会重新编译。')
+    return head.join('\n')
+  }
+
+  if (input.quoted.trim() !== '') {
+    head.push(`用户选中的文字（从 PDF 提取，可能因连字或公式而不准，仅作参考）：「${input.quoted.trim().slice(0, 200)}」`)
+  }
+  head.push('', '这一段当前的源码：', '```latex')
+  for (let i = 0; i < input.lines.length; i++) {
+    head.push(`${input.lineStart + i}: ${input.lines[i] ?? ''}`)
+  }
+  head.push('```', '')
+  head.push('请只修改这一段相关的内容，不要新建文件，也不要改动无关部分；改完我会重新编译验证。')
+  return head.join('\n')
+}
+
 export class AgentBridge {
   constructor(private readonly resolveRegistry: () => AgentRegistryLike | undefined) {}
 
@@ -95,7 +145,16 @@ export class AgentBridge {
    */
   send(diagnostics: readonly LatexDiagnostic[], options: HandOffOptions, explicit?: AgentLike): SendOutcome {
     if (diagnostics.length === 0) return { ok: false, reason: 'no-diagnostics' }
+    return this.deliver(buildErrorPrompt(diagnostics, options), explicit)
+  }
 
+  /**
+   * Deliver one prepared prompt to an Agent.
+   * @param text - the message body.
+   * @param explicit - agent resolved from the caller's Session, when known.
+   * @returns whether the message was handed over.
+   */
+  deliver(text: string, explicit?: AgentLike): SendOutcome {
     const registry = this.resolveRegistry()
     const agent =
       explicit ??
@@ -105,14 +164,14 @@ export class AgentBridge {
       return {
         ok: false,
         reason: 'no-agent',
-        detail: '当前没有可投递的会话（编译由文件监听触发，而非会话发起）；请从对话窗口重试',
+        detail: '当前没有可投递的会话（未从会话发起，且找不到对应 Agent）；请从对话窗口重试',
       }
     }
 
     try {
       agent.steer(
         createUserMessage({
-          content: [{ type: 'text', text: buildErrorPrompt(diagnostics, options) }],
+          content: [{ type: 'text', text }],
           // `MessageSourceMap` in dsh-llm 0.2.2-rc.1 has no `plugin` kind (it
           // existed in 0.1.0-rc.6 and was removed), so a plugin-produced turn is
           // an ordinary user message. See docs/spikes.md §B8.

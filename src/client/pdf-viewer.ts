@@ -162,11 +162,10 @@ export class PDFViewer {
 /**
  * Convert a click in the page element to PDF user-space coordinates.
  *
- * PDF.js lays pages out in CSS pixels (96 dpi, top-left origin); SyncTeX reports
- * PDF points (72 dpi). Whether the PDF origin is bottom-left or top-left is still
- * being verified (docs/spikes.md §B9 records `y ≈ v`, which suggests top-left),
- * so `flipY` is explicit rather than baked in: calibrate once on a real machine
- * and pass the answer here.
+ * PDF.js reports the page viewport in PDF points at `scale: 1` (a Letter page is
+ * 612×792), so a click only needs to be expressed as a fraction of the rendered
+ * element — no dpi conversion (docs/spikes.md §B15). The origin is top-left, which
+ * the same sweep confirmed; `flipY` stays explicit for other renderers.
  * @param event - the click/double-click event.
  * @param pageElement - the `.page` element that was hit.
  * @param options.scale - the viewer's current page scale.
@@ -184,7 +183,9 @@ export function pdfPointFromClick(
   const paddingTop = options.paddingTop ?? 0
   const cssX = event.clientX - rect.left
   const cssY = event.clientY - rect.top
-  const pdfX = (cssX / scale) * (72 / 96)
-  const pdfY = options.flipY ? ((rect.height - cssY) / scale) * (72 / 96) - paddingTop : (cssY / scale) * (72 / 96) - paddingTop
+  // `rect` is the rendered page (viewport × scale) in CSS px; dividing by the
+  // scale lands in PDF points directly.
+  const pdfX = cssX / scale
+  const pdfY = options.flipY ? (rect.height - cssY) / scale - paddingTop : cssY / scale - paddingTop
   return { x: pdfX, y: pdfY }
 }

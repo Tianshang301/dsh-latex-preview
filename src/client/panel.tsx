@@ -134,7 +134,20 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
   // moment to restore scroll and to accept reverse jumps.
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
-      const data = event.data as { source?: string; type?: string; page?: number; x?: number; y?: number; message?: string } | null
+      const data = event.data as
+        | {
+            source?: string
+            type?: string
+            page?: number
+            x?: number
+            y?: number
+            x2?: number
+            y2?: number
+            text?: string
+            instruction?: string
+            message?: string
+          }
+        | null
       if (!data || data.source !== 'latex-preview-viewer') return
       if (data.type === 'ready') {
         viewer()?.restoreScrollState()
@@ -142,6 +155,31 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
       }
       if (data.type === 'error' && data.message) {
         setNotice(data.message)
+        return
+      }
+      if (data.type === 'edit-request' && typeof data.page === 'number' && typeof data.instruction === 'string') {
+        const request = {
+          page: data.page,
+          x: data.x ?? 0,
+          y: data.y ?? 0,
+          ...(typeof data.x2 === 'number' ? { x2: data.x2 } : {}),
+          ...(typeof data.y2 === 'number' ? { y2: data.y2 } : {}),
+          instruction: data.instruction,
+          ...(data.text ? { text: data.text } : {}),
+          sessionId: sessionIdOf(frameRef.current),
+        }
+        void (async () => {
+          setNotice('正在定位源码并发送…')
+          const result = await unwrap(api.editAt(request))
+          if (!result.ok) {
+            setNotice(result.message)
+            return
+          }
+          const where = result.value.lineEnd && result.value.lineEnd !== result.value.line
+            ? `${result.value.file}:${result.value.line}-${result.value.lineEnd}`
+            : `${result.value.file}:${result.value.line}`
+          setNotice(`已把修改要求发给 Agent（${where}）`)
+        })()
         return
       }
       if (data.type === 'sync-reverse' && typeof data.page === 'number') {

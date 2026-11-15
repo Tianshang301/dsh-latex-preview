@@ -18,6 +18,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { CompileResult, DiffBlock, PreviewState, SyncEditHit, SyncViewHit } from '../types.ts'
 import { ROUTE_PREFIX } from './static-route.ts'
+import type { EditOutcome, EditRequest } from '../types.ts'
 
 /** URL prefix of the API, nested under the plugin's route. */
 export const API_PREFIX = `${ROUTE_PREFIX}/api`
@@ -34,6 +35,7 @@ export interface PreviewHost {
   jumpToPdf(request: { line: number; file?: string }): Promise<readonly SyncViewHit[]>
   jumpToSource(request: { page: number; x: number; y: number }): Promise<readonly SyncEditHit[]>
   sendError(request: { redact?: boolean; sessionId?: string }): Promise<{ ok: boolean; detail?: string }>
+  editAt(request: EditRequest): Promise<EditOutcome>
   binaries(): Promise<PreviewState['binaries']>
 }
 
@@ -46,6 +48,7 @@ const ROUTES: Record<string, 'GET' | 'POST'> = {
   'jump-to-pdf': 'POST',
   'jump-to-source': 'POST',
   'send-error': 'POST',
+  'edit-at': 'POST',
   binaries: 'POST',
 }
 
@@ -104,6 +107,8 @@ async function dispatch(host: PreviewHost, name: string, body: Record<string, un
       return host.jumpToSource(body as Parameters<PreviewHost['jumpToSource']>[0])
     case 'send-error':
       return host.sendError(body as { redact?: boolean; sessionId?: string })
+    case 'edit-at':
+      return host.editAt(body as unknown as EditRequest)
     case 'binaries':
       return host.binaries()
     default:

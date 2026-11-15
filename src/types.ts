@@ -74,6 +74,31 @@ export interface SyncEditHit {
   readonly column: number
 }
 
+/** One "change this spot" request, resolved from a rectangle in the PDF. */
+export interface EditRequest {
+  readonly page: number
+  readonly x: number
+  readonly y: number
+  /** Second corner, when the user dragged a region instead of clicking. */
+  readonly x2?: number
+  readonly y2?: number
+  /** What the user wants changed, in their own words. */
+  readonly instruction: string
+  /** Selected text: a hint from the PDF, never the thing being edited. */
+  readonly text?: string
+  readonly sessionId?: string
+  readonly redact?: boolean
+}
+
+/** Where the request landed, and whether the Agent took it. */
+export interface EditOutcome {
+  readonly ok: boolean
+  readonly file?: string
+  readonly line?: number
+  readonly lineEnd?: number
+  readonly detail?: string
+}
+
 /** One line-level diff block. */
 export interface DiffBlock {
   readonly type: 'insert' | 'delete' | 'equal'

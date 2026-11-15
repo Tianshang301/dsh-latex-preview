@@ -46,3 +46,129 @@ body {
 #status[hidden] {
   display: none;
 }
+
+/* Rubber band while dragging a region that has no text layer. */
+#regionBox {
+  position: fixed;
+  border: 1px dashed #2f6feb;
+  background: rgba(47, 111, 235, 0.12);
+  pointer-events: none;
+  z-index: 20;
+}
+
+/* The instruction bar that follows a selection or region. */
+#editBar {
+  position: fixed;
+  z-index: 30;
+  width: 284px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.16);
+  background: #ffffff;
+  color: #1f2328;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  font: 12px/1.5 system-ui, sans-serif;
+}
+
+#editBar .editBarQuote {
+  max-height: 32px;
+  overflow: hidden;
+  color: #57606a;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+#editBar .editBarInput {
+  font: inherit;
+  padding: 4px 6px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  border-radius: 4px;
+  background: #fff;
+  color: inherit;
+}
+
+#editBar .editBarRow {
+  display: flex;
+  gap: 6px;
+}
+
+#editBar button {
+  font: inherit;
+  padding: 2px 10px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  background: transparent;
+  cursor: pointer;
+}
+
+#editBar .editBarSend {
+  border-color: #2f6feb;
+  background: #2f6feb;
+  color: #fff;
+}
+
+/* Rubber band while dragging a region that has no text layer. */
+#regionBox {
+  position: fixed;
+  border: 1px dashed #2f6feb;
+  background: rgba(47, 111, 235, 0.12);
+  pointer-events: none;
+  z-index: 20;
+}
+
+/* The instruction bar that follows a selection or region. */
+#editBar {
+  position: fixed;
+  z-index: 30;
+  width: 284px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.16);
+  background: #ffffff;
+  color: #1f2328;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  font: 12px/1.5 system-ui, sans-serif;
+}
+
+#editBar .editBarQuote {
+  max-height: 32px;
+  overflow: hidden;
+  color: #57606a;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+#editBar .editBarInput {
+  font: inherit;
+  padding: 4px 6px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  border-radius: 4px;
+  background: #fff;
+  color: inherit;
+}
+
+#editBar .editBarRow {
+  display: flex;
+  gap: 6px;
+}
+
+#editBar button {
+  font: inherit;
+  padding: 2px 10px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  background: transparent;
+  cursor: pointer;
+}
+
+#editBar .editBarSend {
+  border-color: #2f6feb;
+  background: #2f6feb;
+  color: #fff;
+}

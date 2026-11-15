@@ -28,11 +28,11 @@ import { synctexEdit, synctexView } from '../utils/synctex.ts'
 import { CompileService, compilePaths } from './compile.ts'
 import { FileWatcher } from './watcher.ts'
 import { lineDiff } from './diff.ts'
-import { AgentBridge, type AgentLike, type AgentRegistryLike } from './agent-bridge.ts'
+import { AgentBridge, buildSelectionPrompt, type AgentLike, type AgentRegistryLike } from './agent-bridge.ts'
 import { createApiHandler, type PreviewHost } from './http-api.ts'
 import { mountStaticRoute, ROUTE_PREFIX, type StaticMount, type WebServerLike } from './static-route.ts'
 import { assetsRoot, VIEWER_PATH, viewerAvailable } from '../utils/assets.ts'
-import type { CompileResult, DiffBlock, PreviewState, SyncEditHit, SyncViewHit } from '../types.ts'
+import type { CompileResult, DiffBlock, EditOutcome, EditRequest, PreviewState, SyncEditHit, SyncViewHit } from '../types.ts'
 
 /** Service key and wire namespace; must stay identical to the naming convention. */
 export const SERVICE_KEY = 'latexPreview'
@@ -50,8 +50,13 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
     'latex-preview/binary-missing': { readonly missing: readonly string[] }
     'latex-preview/no-pdf': { readonly hint: string }
     'latex-preview/handoff-failed': { readonly reason: string }
+    'latex-preview/empty-instruction': Record<string, never>
+    'latex-preview/no-source-map': Record<string, never>
   }
 }
+
+/** How many source lines one "change this spot" request may quote. */
+const MAX_EDIT_LINES = 12
 
 const DEFAULT_DEBOUNCE_MS = 500
 const DEFAULT_TIMEOUT_MS = 120_000
@@ -321,6 +326,92 @@ export class LatexPreviewService extends TypertRemoteService {
   }
 
   /**
+   * Turn a rectangle in the PDF into a change request on its source.
+   *
+   * Only the rectangle is taken from the PDF; the source lines behind it are what
+   * the Agent edits, which is why extracting text from prose/formulas does not
+   * matter. Both corners are resolved when the user dragged a region, so a
+   * multi-line selection becomes a line range rather than one line.
+   * @param request - page, rectangle, the user's instruction, and their session.
+   * @param signal - client cancellation.
+   * @returns the resolved location once the Agent has taken the message.
+   */
+  @Remote
+  async editAt(request: EditRequest, signal: AbortSignal): Promise<EditOutcome> {
+    signal.throwIfAborted()
+    return this.applyEdit(request)
+  }
+
+  /** Shared body of the Remote method and the HTTP API. */
+  private async applyEdit(request: EditRequest): Promise<EditOutcome> {
+    const pdf = this.requirePdf()
+    const instruction = (request.instruction ?? '').trim()
+    if (instruction === '') {
+      throw new RemoteError('latex-preview/empty-instruction', '请先说明想怎么改这里', {})
+    }
+
+    const hits = await synctexEdit(request.page, request.x, request.y, pdf, { cwd: this.outDir })
+    if (typeof request.x2 === 'number' && typeof request.y2 === 'number') {
+      hits.push(...(await synctexEdit(request.page, request.x2, request.y2, pdf, { cwd: this.outDir })))
+    }
+
+    const located = hits.filter((hit) => hit.line > 0)
+    const first = located[0]
+    if (!first) {
+      throw new RemoteError('latex-preview/no-source-map', '这个位置没有可定位的源码行（可能在导言区、宏定义或图片内部）', {})
+    }
+
+    const sameFile = located.filter((hit) => hit.file === first.file)
+    const lineStart = Math.min(...sameFile.map((hit) => hit.line))
+    const rawEnd = Math.max(...sameFile.map((hit) => hit.line))
+    // A tall region can cover a whole page; cap what is quoted to the Agent.
+    const lineEnd = Math.min(rawEnd, lineStart + MAX_EDIT_LINES - 1)
+
+    const redact = request.redact ?? this.redact
+    const lines = redact ? [] : await this.readLines(first.file, lineStart, lineEnd)
+
+    const outcome = this.bridge.deliver(
+      buildSelectionPrompt({
+        file: first.file,
+        lineStart,
+        lineEnd,
+        lines,
+        quoted: request.text ?? '',
+        instruction,
+        redact,
+      }),
+      this.agentFor(request.sessionId),
+    )
+
+    if (!outcome.ok) {
+      throw new RemoteError('latex-preview/handoff-failed', outcome.detail ?? outcome.reason ?? 'unknown', {
+        reason: outcome.reason ?? 'unknown',
+      })
+    }
+
+    this.patch({
+      message: `已把这个位置的修改要求发给 Agent（${basename(first.file)}:${lineStart === lineEnd ? lineStart : `${lineStart}-${lineEnd}`}）`,
+    })
+    return { ok: true, file: basename(first.file), line: lineStart, lineEnd }
+  }
+
+  /**
+   * Read a 1-based inclusive line range from a source file.
+   * @param file - absolute path SyncTeX reported.
+   * @param start - first line, 1-based.
+   * @param end - last line, 1-based inclusive.
+   * @returns the lines; empty when the file cannot be read.
+   */
+  private async readLines(file: string, start: number, end: number): Promise<string[]> {
+    try {
+      const text = await readFile(file, 'utf8')
+      return text.split(/\r?\n/).slice(start - 1, end)
+    } catch {
+      return []
+    }
+  }
+
+  /**
    * Hand the current compile failure to the Agent.
    * @param request.redact - overrides the stored switch for this send only.
    * @param signal - client cancellation.
@@ -484,6 +575,7 @@ export class LatexPreviewService extends TypertRemoteService {
       jumpToPdf: (request) => this.view(request),
       jumpToSource: (request) => this.edit(request),
       sendError: (request) => this.handOff(request),
+      editAt: (request) => this.applyEdit(request),
       binaries: async () => (await this.refreshBinaries()) ?? this.state.binaries,
     }
   }
