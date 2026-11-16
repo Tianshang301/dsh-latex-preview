@@ -177,7 +177,6 @@ Read [`docs/spikes.md`](docs/spikes.md) before changing code — it records the 
 | [`docs/LaTeX Preview — 开发文档.md`](docs/LaTeX%20Preview%20—%20开发文档.md) | Architecture and API contract spec |
 | [`AGENTS.md`](AGENTS.md) | Repo-level invariants cheat sheet |
 | [`CHANGELOG.md`](CHANGELOG.md) | What each unreleased change added, fixed or changed |
-| [`records/`](records/README.md) | Dated work records: what was decided, what was rejected, and why |
 
 ## License
 

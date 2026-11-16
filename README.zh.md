@@ -177,7 +177,6 @@ npm run binaries     # 检查 tectonic / synctex
 | [`docs/LaTeX Preview — 开发文档.md`](docs/LaTeX%20Preview%20—%20开发文档.md) | 架构与 API 契约规格书 |
 | [`AGENTS.md`](AGENTS.md) | 仓库级不变式速查 |
 | [`CHANGELOG.md`](CHANGELOG.md) | 每个尚未发布的变更改了什么、修了什么 |
-| [`records/`](records/README.md) | 按天的开发记录：决定了什么、否掉了什么、为什么 |
 
 ## License
 
