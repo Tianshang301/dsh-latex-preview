@@ -29,7 +29,8 @@ Compiling, rendering, SyncTeX, and diffing all run **on your machine**. Only the
 - **One-click error hand-off** — builds a prompt from "file:line + message + source context" and steers it into the current session. The Agent fixes the `.tex`, the watcher recompiles.
 - **Point at the PDF, change the source** — select text, or drag a box over anything → an inline bar appears → type one sentence → the Agent receives the **source line range** to edit.
 - **Three review modes** — `手动审核` (you accept every change), `自动审核` (a **separate AI** reviews each change and rolls the source back when it says no), `完全放开` (no gate). The verdict and its reason land in the status bar.
-- **Diff highlight on the PDF** — a `差异 N` button and coloured bands over the lines this compile changed: green for added, amber for modified, a red dash for a deletion seam. Hover for the source line and its text; click to pin it in the status bar. Computed against the *previous compiled* revision, not the file on disk.
+- **Diff highlight on the PDF (git-diff look)** — a `差异 N` button and coloured bands over the lines this compile changed: green for added, amber for modified, with a red/green **gutter strip** on each band's left edge; a deletion draws a red hatched seam plus a `−N 行` count chip. **Hovering a seam pops the removed source lines up — struck through, monospace, red** — the deleted words have no pixels left in the new PDF, and this is the only way to show them without re-typesetting. Click to pin in the status bar. Computed against the *previous compiled* revision, not the file on disk.
+- **对比视图 (latexdiff view, optional)** — the `对比` button hands the accepted and current revisions to `latexdiff`, which merges them into a third document that is then compiled: removed text is **typeset struck through in red**, added text is coloured — as readable as a git diff. Costs one extra compile and requires `latexdiff` (MiKTeX's `latexdiff.exe` additionally needs Perl on Windows, e.g. Strawberry Perl); when it is missing the button explains instead of failing.
 - **Redaction switch** — when on, only "message + line number" is sent; no source, no selected text.
 - **Clickable diagnostics** — clicking an error or warning jumps to its source location.
 
@@ -88,7 +89,8 @@ The top strip holds status and actions (compile state and duration, `编译` / C
 | Click a diagnostic | Jumps to that source line |
 | "Send to Agent" | Hands this compile's errors to the current session (disabled with an explanation when there are none) |
 | "差异 N" / Diff N | Toggles the change highlight; the title says how many hunks and whether the caps left any out |
-| Hover a band | Shows which source line changed and the first sensible characters of it |
+| Hover a band | Shows which source line changed and the first sensible characters of it; hovering a deletion seam/chip pops up **the removed lines**, struck through |
+| "对比" / Diff view | Builds and shows the latexdiff document (removed text typeset struck through); click again to return to the live PDF; needs `latexdiff` (plus Perl for MiKTeX on Windows), with guidance when missing |
 | Review dropdown | Manual / Auto (independent AI) / Fully open |
 | "接受 N" / Accept N | Marks the change set accepted and clears the marks (manual mode only) |
 | "撤销" / Revert | Writes the source back to the previous revision and recompiles; needs a second click |
@@ -117,7 +119,7 @@ Redaction (`redact`, off by default) sends "message + line number" only: no sour
 - **Reverse lookup is line-accurate, not character-accurate.** SyncTeX maps boxes to lines and `Column` is often `-1`; selecting one word yields the line (or lines) containing it.
 - **Scanned PDFs have no text layer**, so boxing may fail to resolve. Tectonic always emits a text layer, so this does not affect previews produced here.
 - **Cross-page selections** reverse-jump only the current page's part.
-- **A deletion has no text to tint** — only a dashed seam where it was removed, anchored at the foot of the line above. The removed text exists only in the previous revision, which the panel does not display.
+- **A deletion is not re-typeset** — the new PDF has no room left where it was, so the overlay draws a seam plus a `−N` chip and **pops the removed source lines up on hover** (struck through, capped at 8 lines × 200 chars); for removed text in real typesetting use `对比` (latexdiff re-typesets a merged document; requires latexdiff, and Perl for MiKTeX's build on Windows).
 - **The highlight is capped** at 24 hunks / 40 resolved lines per revision; longer blocks are sampled evenly rather than truncated, and the surplus is reported in the button's title.
 - **Auto review spends model calls** and can be wrong. It runs only in that mode, and a timeout (25 s) or a missing model **falls back to manual** — it never approves by default.
 - **Revert and a rejecting reviewer write the source file** (back to the previous revision, then recompile). That is the plugin's only destructive action, which is why the button arms on a second click.
@@ -130,16 +132,19 @@ Redaction (`redact`, off by default) sends "message + line number" only: no sour
 src/
   index.ts                       Host entry; registers the service
   services/
-    latex-preview-service.ts     Typert Remote service (12 @Remote methods)
+    latex-preview-service.ts     Typert Remote service (13 @Remote methods)
     compile.ts                   Tectonic invocation + artifact rollback
     watcher.ts                   chokidar + debounce
     diff.ts                      line-level diff
+    diff-regions.ts              hunks → PDF band/seam coordinates (with removed text)
+    diffdoc.ts                   latexdiff 对比视图 (optional capability)
+    reviewer.ts                  change review (manual / auto / open)
     agent-bridge.ts              prompt assembly + agent.steer delivery
     http-api.ts                  same-origin JSON routes /.latex-preview/api/*
     static-route.ts              /assets static mount
   utils/                         binaries / root / log-parser / synctex / assets
   client/                        panel.tsx / pdf-viewer.ts / api.ts / index.tsx
-viewer/                          the PDF.js viewer page (selection, box, inline bar)
+viewer/                          the PDF.js viewer page (selection, box, inline bar, diff layer)
 ```
 
 Two constraints worth knowing up front:
@@ -147,7 +152,7 @@ Two constraints worth knowing up front:
 - **Callbacks cannot cross the Host↔Client wire.** The client polls `getState()` and reacts to the `version` counter — an unchanged version does nothing: no re-render, no iframe reload.
 - **The panel talks over an HTTP route, which has no Agent driver**, so `currentInitiator()` is always empty there. The panel reads the session id from the sidebar's `data-sidebar-right-session` and the Host resolves it with `agents.get(id)`.
 
-HTTP routes the panel uses (`POST`, except `state` which is `GET`): `state` `configure` `compile` `diff` `diff-regions` `accept` `revert` `jump-to-pdf` `jump-to-source` `send-error` `edit-at` `binaries`.
+HTTP routes the panel uses (`POST`, except `state` which is `GET`): `state` `configure` `compile` `diff` `diff-regions` `diff-doc` `accept` `revert` `jump-to-pdf` `jump-to-source` `send-error` `edit-at` `binaries`.
 
 ## Development
 

@@ -16,7 +16,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { CompileResult, DiffBlock, DiffRegions, PreviewState, ReviewMode, SyncEditHit, SyncViewHit } from '../types.ts'
+import type { CompileResult, DiffBlock, DiffDocResult, DiffRegions, PreviewState, ReviewMode, SyncEditHit, SyncViewHit } from '../types.ts'
 import { ROUTE_PREFIX } from './static-route.ts'
 import type { EditOutcome, EditRequest } from '../types.ts'
 
@@ -40,6 +40,7 @@ export interface PreviewHost {
   compile(): Promise<CompileResult>
   diff(): Promise<readonly DiffBlock[]>
   diffRegions(): Promise<DiffRegions>
+  diffDoc(): Promise<DiffDocResult>
   accept(): PreviewState
   revert(): Promise<PreviewState>
   jumpToPdf(request: { line: number; file?: string }): Promise<readonly SyncViewHit[]>
@@ -56,6 +57,7 @@ const ROUTES: Record<string, 'GET' | 'POST'> = {
   compile: 'POST',
   diff: 'POST',
   'diff-regions': 'POST',
+  'diff-doc': 'POST',
   accept: 'POST',
   revert: 'POST',
   'jump-to-pdf': 'POST',
@@ -116,6 +118,8 @@ async function dispatch(host: PreviewHost, name: string, body: Record<string, un
       return host.diff()
     case 'diff-regions':
       return host.diffRegions()
+    case 'diff-doc':
+      return host.diffDoc()
     case 'accept':
       return host.accept()
     case 'revert':

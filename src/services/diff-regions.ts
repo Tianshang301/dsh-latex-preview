@@ -27,6 +27,8 @@ export interface DiffHunk {
   readonly removed: number
   /** First few characters of the changed text, for the hover title. */
   readonly preview: string
+  /** The removed lines (capped); what the new PDF can no longer show. */
+  readonly text: string
 }
 
 /**
@@ -54,6 +56,9 @@ export function diffHunks(blocks: readonly DiffBlock[]): DiffHunk[] {
         lineEnd: Math.max(lineStart, lineEnd),
         removed: deletedLineCount(deletes),
         preview: previewOf(inserts),
+        // The new lines render under the band; only the removed ones need the
+        // deletion row, and a pure insert has none.
+        text: textOf(deletes),
       })
     } else {
       const lineStart = deletes[0]!.startLine
@@ -63,6 +68,9 @@ export function diffHunks(blocks: readonly DiffBlock[]): DiffHunk[] {
         lineEnd: lineStart,
         removed: deletedLineCount(deletes),
         preview: previewOf(deletes),
+        // The removed lines exist nowhere in the new PDF; this text is the only
+        // copy the viewer can show (see the deletion row in the overlay).
+        text: textOf(deletes),
       })
     }
     inserts = []
@@ -167,4 +175,29 @@ function previewOf(blocks: readonly DiffBlock[]): string {
     }
   }
   return ''
+}
+
+/** How many source lines one deletion row may quote. */
+const MAX_ROW_LINES = 8
+
+/** How many characters of one source line the row may quote. */
+const MAX_ROW_CHARS = 200
+
+/**
+ * The non-empty source lines of a change, for the deletion row.
+ *
+ * Capped: the row is a visual hint, not a diff viewer — eight lines of at most
+ * 200 characters each, then an ellipsis marker. Empty lines carry no signal and
+ * would only stretch the band.
+ */
+function textOf(blocks: readonly DiffBlock[]): string {
+  const lines: string[] = []
+  for (const block of blocks) {
+    for (const line of block.text.split('\n')) {
+      if (line.trim() === '') continue
+      lines.push(line.length > MAX_ROW_CHARS ? `${line.slice(0, MAX_ROW_CHARS)}…` : line)
+      if (lines.length >= MAX_ROW_LINES) return lines.join('\n')
+    }
+  }
+  return lines.join('\n')
 }

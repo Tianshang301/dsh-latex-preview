@@ -72,6 +72,11 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
   const [showDiff, setShowDiff] = useState(true)
   // Reverting writes the source file, so the button arms first and disarms itself.
   const [armRevert, setArmRevert] = useState(false)
+  // Which document the iframe shows: the live PDF, or the latexdiff 对比视图.
+  const [view, setView] = useState<'live' | 'diff'>('live')
+  // Last built diff-doc URL; the Host also mirrors it in `state.diffDocUrl`, but
+  // the swap must not wait for the next poll after the button click.
+  const [diffDocUrl, setDiffDocUrl] = useState<string | null>(null)
 
   const frameRef = useRef<HTMLIFrameElement | null>(null)
   const viewerRef = useRef<PDFViewer | null>(null)
@@ -83,6 +88,8 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
   const diffRef = useRef<DiffRegions | null>(null)
   const showDiffRef = useRef(true)
   showDiffRef.current = showDiff
+  const viewRef = useRef<'live' | 'diff'>('live')
+  viewRef.current = view
 
   /** Lazily create the viewer adapter once the iframe exists. */
   const viewer = useCallback((): PDFViewer | null => {
@@ -148,14 +155,18 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
 
   // Push on every change; `ready` pushes again, because a swapped document starts
   // with a fresh listener that missed everything sent before it existed.
+  // Bands belong to the live PDF; the 对比视图 is a different document, so the
+  // overlay is suppressed while it is on screen.
   useEffect(() => {
     diffRef.current = diff
-    viewer()?.showDiff(diff?.regions ?? [], showDiff)
-  }, [diff, showDiff, viewer])
+    viewer()?.showDiff(diff?.regions ?? [], showDiff && view === 'live')
+  }, [diff, showDiff, view, viewer])
 
   // Our PDF.js page when the assets are built, otherwise the raw PDF so the
   // browser's viewer still shows something. Swap only when the URL changed.
-  const pdfUrl = state?.viewerUrl ?? state?.pdfUrl ?? null
+  // In 对比视图 the iframe shows the latexdiff document instead.
+  const liveUrl = state?.viewerUrl ?? state?.pdfUrl ?? null
+  const pdfUrl = view === 'diff' ? (diffDocUrl ?? liveUrl) : liveUrl
   useEffect(() => {
     if (!pdfUrl || pdfUrl === lastUrl.current) return
     const frame = frameRef.current
@@ -190,7 +201,7 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
       if (!data || data.source !== 'latex-preview-viewer') return
       if (data.type === 'ready') {
         viewer()?.restoreScrollState()
-        viewer()?.showDiff(diffRef.current?.regions ?? [], showDiffRef.current)
+        viewer()?.showDiff(diffRef.current?.regions ?? [], showDiffRef.current && viewRef.current === 'live')
         return
       }
       if (data.type === 'error' && data.message) {
@@ -248,6 +259,17 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
     const timer = window.setTimeout(() => setArmRevert(false), 4000)
     return () => window.clearTimeout(timer)
   }, [armRevert])
+
+  // `state.version` the currently shown diff document was built at.
+  const diffDocAt = useRef(-1)
+  // The Host clears `diffDocUrl` when the revision moves (accept, revert, a
+  // compile with new content); a version at or below the build's cannot have
+  // cleared it, which is what stops this from firing in the gap between the
+  // click and the next poll.
+  useEffect(() => {
+    if (view !== 'diff') return
+    if (state && state.diffDocUrl === null && state.version > diffDocAt.current) setView('live')
+  }, [state, view])
 
   /** Run one action with the busy flag and a single error channel. */
   const run = useCallback(async (action: () => Promise<{ ok: boolean; message?: string }>) => {
@@ -320,6 +342,26 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
       return { ok: true }
     })
   }, [api, run, armRevert])
+
+  /** Enter or leave the latexdiff 对比视图 (deletions visible, struck through). */
+  const onDiffDoc = useCallback(() => {
+    if (view === 'diff') {
+      setView('live')
+      return
+    }
+    void run(async () => {
+      const result = await unwrap(api.buildDiffDoc())
+      if (!result.ok) return { ok: false, message: result.message }
+      const value = result.value
+      if (!value.ok || !value.url) {
+        return { ok: false, message: value.detail ? `${value.message}：${value.detail}` : value.message }
+      }
+      diffDocAt.current = value.version
+      setDiffDocUrl(value.url)
+      setView('diff')
+      return { ok: true }
+    })
+  }, [api, run, view])
 
   const onSelectDiagnostic = useCallback(
     (diagnostic: LatexDiagnostic) => {
@@ -429,6 +471,18 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
           }
         >
           差异 {diffCount}
+        </button>
+        <button
+          style={{ ...styles.button, opacity: view === 'diff' ? 1 : diffCount === 0 ? 0.5 : 0.85 }}
+          disabled={working || (diffCount === 0 && view === 'live')}
+          onClick={onDiffDoc}
+          title={
+            view === 'diff'
+              ? '回到当前 PDF'
+              : '生成并查看 latexdiff 对比版 PDF：删除的文字以红色删除线渲染、新增的文字带颜色；需要一次额外编译'
+          }
+        >
+          {view === 'diff' ? '退出对比' : '对比'}
         </button>
         <label style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
           <input type="checkbox" checked={state.redact} onChange={(event) => onToggleRedact(event.target.checked)} />

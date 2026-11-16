@@ -257,9 +257,21 @@ async function paintDiffPage(pageEl) {
     box.style.width = `${(region.width / viewport.width) * 100}%`
     // A deletion has no text left to tint. It gets a short hatched band instead of
     // a solid one, so it reads as "something was removed here" and not as "this
-    // line changed".
+    // line changed". The chip at the text column's right edge carries the count,
+    // and hovering the band pops the removed lines up, struck through — the
+    // closest a fixed-layout PDF gets to a git diff deletion row.
     box.style.height = region.kind === 'delete' ? '7px' : `${(region.height / viewport.height) * 100}%`
     layer.append(box)
+    if (region.kind === 'delete') {
+      const chip = document.createElement('div')
+      chip.className = 'diffDelChip'
+      chip.textContent = region.removed ? `− ${region.removed} 行` : '−'
+      // At the right end of the text column, straddling the seam: the page's
+      // right margin is the one place a marker covers no text.
+      chip.style.left = `${((region.x + region.width) / viewport.width) * 100}%`
+      chip.style.top = `${(region.y / viewport.height) * 100}%`
+      layer.append(chip)
+    }
     painted.push({ pageEl, region, width: viewport.width, height: viewport.height })
   }
   pageEl.append(layer)
@@ -286,6 +298,50 @@ function diffRegionAt(clientX, clientY) {
   return null
 }
 
+/** Floating deletion row: the removed lines, struck through. */
+let diffRows = null
+
+/** Remove every floating annotation (tooltip and deletion row). */
+function hideDiffFlyout() {
+  diffTip?.remove()
+  diffTip = null
+  diffRows?.remove()
+  diffRows = null
+}
+
+/**
+ * Show the deletion row: the removed source lines, struck through, git-diff style.
+ *
+ * The removed words exist nowhere in the loaded PDF — the typesetter closed the
+ * hole — so this popup (fed from the diff, not from the PDF) is the only place
+ * they can be shown. Falls back to nothing when the region carries no text
+ * (the plain tooltip still explains the region then).
+ * @param {object} region - the deletion region under the cursor.
+ * @param {number} x - viewport x.
+ * @param {number} y - viewport y.
+ */
+function showDiffRows(region, x, y) {
+  hideDiffFlyout()
+  const lines = String(region.text ?? '').split('\n').filter((line) => line.trim() !== '')
+  if (lines.length === 0) return
+  diffRows = document.createElement('div')
+  diffRows.id = 'diffRows'
+  const head = document.createElement('div')
+  head.className = 'head'
+  head.textContent = region.title ?? ''
+  diffRows.append(head)
+  for (const line of lines) {
+    const row = document.createElement('div')
+    row.className = 'row'
+    row.textContent = line
+    diffRows.append(row)
+  }
+  document.body.append(diffRows)
+  const box = diffRows.getBoundingClientRect()
+  diffRows.style.left = `${Math.max(8, Math.min(x + 14, window.innerWidth - box.width - 8))}px`
+  diffRows.style.top = `${Math.max(8, Math.min(y - box.height - 12, window.innerHeight - box.height - 8))}px`
+}
+
 /**
  * Show or move the tooltip.
  * @param {string} text - label, empty hides it.
@@ -293,16 +349,11 @@ function diffRegionAt(clientX, clientY) {
  * @param {number} y - viewport y.
  */
 function showDiffTip(text, x, y) {
-  if (text === '') {
-    diffTip?.remove()
-    diffTip = null
-    return
-  }
-  if (!diffTip) {
-    diffTip = document.createElement('div')
-    diffTip.id = 'diffTip'
-    document.body.append(diffTip)
-  }
+  hideDiffFlyout()
+  if (text === '') return
+  diffTip = document.createElement('div')
+  diffTip.id = 'diffTip'
+  document.body.append(diffTip)
   diffTip.textContent = text
   const width = diffTip.offsetWidth
   diffTip.style.left = `${Math.max(8, Math.min(x + 12, window.innerWidth - width - 8))}px`
@@ -326,14 +377,20 @@ window.addEventListener('message', (event) => {
 
 container.addEventListener('mousemove', (event) => {
   if (drag) {
-    showDiffTip('', 0, 0)
+    hideDiffFlyout()
     return
   }
   const region = diffRegionAt(event.clientX, event.clientY)
+  // A band with removed lines pops them up (struck through); everything else
+  // explains itself through the one-line tooltip.
+  if (region?.text) {
+    showDiffRows(region, event.clientX, event.clientY)
+    return
+  }
   showDiffTip(region?.title ?? '', event.clientX, event.clientY)
 })
 
-container.addEventListener('mouseleave', () => showDiffTip('', 0, 0))
+container.addEventListener('mouseleave', hideDiffFlyout)
 
 // A click on a band jumps to the source line that produced it. Hit-tested rather
 // than bound to the element, because the layer must stay transparent to the mouse.

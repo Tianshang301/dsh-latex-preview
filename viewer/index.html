@@ -26,6 +26,13 @@
       <div id="viewer" class="pdfViewer"></div>
     </div>
     <div id="status" hidden></div>
-    <script type="module" src="viewer.js"></script>
+    <script type="module">
+      // Cache-bust the page script: /assets is served with max-age=3600, and the
+      // page URL already changes per compile (?v=); carrying that onto the
+      // script means a rebuilt viewer is picked up on the next compile, not next
+      // hour. The pdfjs runtime rarely changes and keeps its plain URL.
+      const v = new URLSearchParams(location.search).get('v')
+      import(`./viewer.js${v ? `?v=${encodeURIComponent(v)}` : ''}`)
+    </script>
   </body>
 </html>

@@ -16,6 +16,7 @@
 import type {
   CompileResult,
   DiffBlock,
+  DiffDocResult,
   DiffRegions,
   EditOutcome,
   EditRequest,
@@ -41,6 +42,8 @@ export interface PreviewApi {
   getDiff(signal?: AbortSignal): Promise<RemoteResult<readonly DiffBlock[]>>
   /** Highlight rectangles for the changes since the previous compile. */
   getDiffRegions(signal?: AbortSignal): Promise<RemoteResult<DiffRegions>>
+  /** Build the latexdiff 对比视图 (deletions rendered struck-through). */
+  buildDiffDoc(signal?: AbortSignal): Promise<RemoteResult<DiffDocResult>>
   /** Sign off the change set (manual review only). */
   acceptChanges(signal?: AbortSignal): Promise<RemoteResult<PreviewState>>
   /** Put the source back to the last accepted revision and recompile. */
@@ -122,6 +125,10 @@ export class HttpPreviewApi implements PreviewApi {
 
   getDiffRegions(signal?: AbortSignal): Promise<RemoteResult<DiffRegions>> {
     return this.call('diff-regions', {}, signal)
+  }
+
+  buildDiffDoc(signal?: AbortSignal): Promise<RemoteResult<DiffDocResult>> {
+    return this.call('diff-doc', {}, signal)
   }
 
   acceptChanges(signal?: AbortSignal): Promise<RemoteResult<PreviewState>> {

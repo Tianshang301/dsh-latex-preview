@@ -29,7 +29,8 @@
 - **编译错误一键交给 Agent**：把「文件:行 + 错误 + 源码上下文」组成 prompt，投递到当前会话；Agent 改完 `.tex`，文件监听自动重编。
 - **在 PDF 上指一处让 AI 改**：选中文字或在任意位置拖框 → 原地浮出输入栏 → 写一句要求 → Agent 拿到**源码行范围**去改。
 - **改动审核三档**：`手动审核`（每步都要你点「接受」）、`自动审核`（派一个**独立的 AI** 审这次改动，不通过自动把源码回滚）、`完全放开`（不设闸门）。审核结果与理由显示在状态栏。
-- **PDF 上的差异高亮**：`差异 N` 按钮 + 色带，直接标在这次编译改过的行上——绿=新增、琥珀=修改、红色虚线=删除接缝。悬停看行号与内容，点击钉在状态栏。对比的是**上一次编译**的版本，不是磁盘上的当前文件。
+- **PDF 上的差异高亮（git diff 观感）**：`差异 N` 按钮 + 色带，直接标在这次编译改过的行上——绿=新增、琥珀=修改，色带左边缘是红绿 gutter；删除处画红色斜纹接缝 + `−N 行` 计数标签。**悬停接缝会弹出被删的源码行（红色删除线、等宽字体）**——被删的文字在新 PDF 里已无像素，这是不重排版时唯一能看到它的方式。点击钉在状态栏。对比的是**上一次编译**的版本，不是磁盘上的当前文件。
+- **对比视图（latexdiff，可选）**：`对比` 按钮把「已接受版 + 当前版」交给 `latexdiff` 合成第三份文档再编译——删除的文字以红色删除线**真实排进版面**、新增的文字带颜色，与 git diff 同等可读。需要一次额外编译；要求系统有 `latexdiff`（MiKTeX 发行的 `latexdiff.exe` 在 Windows 上还要求 Perl，如 Strawberry Perl），缺失时按钮给出安装指引、面板不受影响。
 - **脱敏开关**：开启后只发「消息 + 行号」，不带源码、不带选中文字。
 - **诊断可点击**：错误/警告列表点条目即跳转到对应源码位置。
 
@@ -88,7 +89,8 @@ npx dsh web --patch ./latex-preview.yml
 | 点某条诊断 | 跳到对应源码行 |
 | 「发送给 Agent」 | 把本次编译错误投递给当前会话（无错误时按钮禁用并说明原因） |
 | 「差异 N」 | 开关高亮；title 说明共几处、是否有超出上限的未标注 |
-| 悬停色带 | 显示改的是哪一行、改成了什么 |
+| 悬停色带 | 显示改的是哪一行、改成了什么；悬停删除接缝/标签弹出**被删的源码行**（红色删除线） |
+| 「对比」 | 生成并查看 latexdiff 对比版 PDF（删除文字真实排版、带删除线）；再点一次退回当前 PDF；需 `latexdiff`（Windows 的 MiKTeX 版需另装 Perl），缺失时给出指引 |
 | 审核方式（下拉） | 手动 / 自动（独立 AI）/ 完全放开 |
 | 「接受 N」 | 把这次改动记为已接受，清掉标记（仅手动档） |
 | 「撤销」 | 把源码写回上一版并重编；需点两次确认 |
@@ -117,7 +119,7 @@ npx dsh web --patch ./latex-preview.yml
 - **反查精度到行，不到字符。** SyncTeX 返回的是盒子到行的映射，`Column` 常为 `-1`。选一个词得到的是它所在的行（可能多行）。
 - **扫描版 PDF 无文字层**，框选可能定位失败。本插件的 PDF 都是 Tectonic 现编的，一定有文字层。
 - **跨页选区**只按当前页那一段反查。
-- **删除没有内容可染色**，只留一道虚线接缝，锚定在删除位置上方那一行的底部；被删掉的文字只存在于上一版 PDF，面板不显示旧版。
+- **删除的行不重排版**：新 PDF 里那几行已经没有空间，所以叠加层只画接缝 + `−N 行` 标签，**悬停弹出被删的源码行**（红色删除线，最多 8 行、每行截断 200 字）；要看删除文字的**真实排版**，用「对比」（latexdiff 重排一版，需要 latexdiff，Windows 的 MiKTeX 版还要求系统装有 Perl）。
 - **高亮有上限**：每版最多 24 处改动、40 行解析；更长的块用均匀采样而不是截断，超出部分在按钮 title 里说明。
 - **自动审核会消耗模型调用**，且 AI 可能判断错。它只在你开了 `自动审核` 时运行，超时 25 秒或读不到模型时**转手动**，不会默认放行。
 - **撤销 / 审核否决会写源文件**（回滚到上一版并重编），这是插件唯一的破坏性动作，所以按钮需要二次确认。
@@ -130,16 +132,19 @@ npx dsh web --patch ./latex-preview.yml
 src/
   index.ts                       Host 入口，注册服务
   services/
-    latex-preview-service.ts     Typert Remote 服务（12 个 @Remote 方法）
+    latex-preview-service.ts     Typert Remote 服务（13 个 @Remote 方法）
     compile.ts                   Tectonic 调用 + 产物回滚
     watcher.ts                   chokidar + 防抖
     diff.ts                      行级 diff
+    diff-regions.ts              hunks → PDF 色带/接缝坐标（含被删行文本）
+    diffdoc.ts                   latexdiff 对比文档（可选能力）
+    reviewer.ts                  改动审核（manual / auto / open）
     agent-bridge.ts              prompt 组装 + agent.steer 投递
     http-api.ts                  同源 JSON 路由 /.latex-preview/api/*
     static-route.ts              /assets 静态挂载
   utils/                         binaries / root / log-parser / synctex / assets
   client/                        panel.tsx / pdf-viewer.ts / api.ts / index.tsx
-viewer/                          PDF.js 查看器页面（选区、框选、浮条）
+viewer/                          PDF.js 查看器页面（选区、框选、浮条、差异层）
 ```
 
 两条必须知道的约束：
@@ -147,7 +152,7 @@ viewer/                          PDF.js 查看器页面（选区、框选、浮�
 - **Host↔Client 传不了回调**。客户端轮询 `getState()`，靠 `version` 计数器判断是否变化——版本没变就什么都不做，不重渲染、不重载 iframe。
 - **面板走 HTTP 路由，那条链路上没有 Agent driver**，所以 `currentInitiator()` 恒为空。面板改为从侧栏的 `data-sidebar-right-session` 读出会话 id，Host 用 `agents.get(id)` 解析出 live Agent。
 
-面板可用的 HTTP 接口（`POST`，除 `state` 为 `GET`）：`state` `configure` `compile` `diff` `diff-regions` `accept` `revert` `jump-to-pdf` `jump-to-source` `send-error` `edit-at` `binaries`。
+面板可用的 HTTP 接口（`POST`，除 `state` 为 `GET`）：`state` `configure` `compile` `diff` `diff-regions` `diff-doc` `accept` `revert` `jump-to-pdf` `jump-to-source` `send-error` `edit-at` `binaries`。
 
 ## 开发
 

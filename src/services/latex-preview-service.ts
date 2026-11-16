@@ -26,6 +26,7 @@ import { checkBinaries } from '../utils/binaries.ts'
 import { isRootCandidate, listTexFiles, resolveRoot, type RootResolution } from '../utils/root.ts'
 import { synctexEdit, synctexView } from '../utils/synctex.ts'
 import { CompileService, compilePaths } from './compile.ts'
+import { DiffDocService } from './diffdoc.ts'
 import { FileWatcher } from './watcher.ts'
 import { lineDiff } from './diff.ts'
 import { bandsFromHits, diffHunks } from './diff-regions.ts'
@@ -37,6 +38,7 @@ import { assetsRoot, VIEWER_PATH, viewerAvailable } from '../utils/assets.ts'
 import type {
   CompileResult,
   DiffBlock,
+  DiffDocResult,
   DiffRegion,
   DiffRegions,
   EditOutcome,
@@ -89,6 +91,7 @@ const DEFAULT_FIRST_RUN_TIMEOUT_MS = 300_000
 export class LatexPreviewService extends TypertRemoteService {
   private state: PreviewState
   private compiler: CompileService
+  private diffDoc: DiffDocService | null = null
   private watcher: FileWatcher | null = null
   private readonly bridge: AgentBridge
   private agents: AgentRegistryLike | undefined
@@ -172,6 +175,7 @@ export class LatexPreviewService extends TypertRemoteService {
       watching: false,
       redact: this.redact,
       review: this.review,
+      diffDocUrl: null,
       durationMs: null,
       rootCandidates: [],
     }
@@ -283,6 +287,12 @@ export class LatexPreviewService extends TypertRemoteService {
     const outDir = request.outDir ?? this.outDir ?? join(dirname(rootFile), '.latex-preview')
     this.outDir = outDir
     this.compiler = new CompileService({
+      rootFile,
+      outDir,
+      timeoutMs: DEFAULT_TIMEOUT_MS,
+      firstRunTimeoutMs: DEFAULT_FIRST_RUN_TIMEOUT_MS,
+    })
+    this.diffDoc = new DiffDocService({
       rootFile,
       outDir,
       timeoutMs: DEFAULT_TIMEOUT_MS,
@@ -422,11 +432,65 @@ export class LatexPreviewService extends TypertRemoteService {
         // The seam sits at the foot of the line above the hole, which is where the
         // deleted content used to begin.
         const y = hunk.kind === 'delete' ? band.y + band.height : band.y
-        regions.push({ ...band, y, kind: hunk.kind, lineStart: first, lineEnd: last, title })
+        regions.push({
+          ...band,
+          y,
+          kind: hunk.kind,
+          lineStart: first,
+          lineEnd: last,
+          title,
+          // The removed source lines: the new PDF has no pixels for them, the
+          // deletion row in the overlay is the only place they can appear.
+          text: hunk.text,
+          removed: hunk.removed,
+        })
       }
     }
 
     return { version, regions, skipped }
+  }
+
+  /**
+   * Build the latexdiff 对比视图 between the accepted and the current revision.
+   *
+   * This is the answer to "how do deletions show up in a PDF": they cannot, not
+   * on the new PDF, so a third document is compiled in which the removed text
+   * *is* typeset — struck through in red — right where it used to stand, and
+   * added text is blue (see `services/diffdoc.ts`). Costs one extra tectonic run,
+   * which is why it is button-driven instead of riding every compile.
+   * @param signal - client cancellation.
+   * @returns the outcome with a viewer-wrapped URL on success.
+   */
+  @Remote
+  async buildDiffDoc(signal: AbortSignal): Promise<DiffDocResult> {
+    signal.throwIfAborted()
+    return this.applyDiffDoc()
+  }
+
+  /** Shared diff-document body: the Remote method and the HTTP API land here. */
+  private async applyDiffDoc(): Promise<DiffDocResult> {
+    const rootFile = this.state.rootFile
+    const base = this.previousSource
+    const head = this.compiledSource
+    if (!rootFile || !this.diffDoc || base === null || head === null) {
+      return { ok: false, url: this.state.diffDocUrl, message: '尚未配置主文件，无法生成对比视图', version: this.state.version }
+    }
+    if (base === head) {
+      return { ok: false, url: null, message: '没有可对比的改动（当前版与已接受版一致）', version: this.state.version }
+    }
+
+    const build = await this.diffDoc.build(base, head)
+    if (!build.ok || !build.pdfPath) {
+      this.patch({ diffDocUrl: null })
+      return { ok: false, url: null, message: build.message, ...(build.detail ? { detail: build.detail } : {}), version: this.state.version }
+    }
+
+    const route = `${ROUTE_PREFIX}/pdf/${encodeURIComponent(basename(build.pdfPath))}`
+    // Same wrap as the live PDF: our viewer page when the assets exist, the raw
+    // PDF route otherwise (the browser viewer then takes over, losing jumps).
+    const url = viewerAvailable() ? `${ROUTE_PREFIX}${VIEWER_PATH}?file=${encodeURIComponent(route)}&v=${this.state.version + 1}` : route
+    this.patch({ diffDocUrl: url, message: build.message })
+    return { ok: true, url, message: build.message, version: this.state.version }
   }
 
   /**
@@ -450,7 +514,7 @@ export class LatexPreviewService extends TypertRemoteService {
       throw new RemoteError('latex-preview/nothing-to-review', '没有待审核的改动', {})
     }
     this.previousSource = this.compiledSource
-    this.patch({ message: '已接受这次改动' })
+    this.patch({ message: '已接受这次改动', diffDocUrl: null })
     return this.state
   }
 
@@ -493,7 +557,7 @@ export class LatexPreviewService extends TypertRemoteService {
         detail: result.diagnostics[0]?.message ?? 'unknown',
       })
     }
-    this.patch({ message: '已回滚到上一版' })
+    this.patch({ message: '已回滚到上一版', diffDocUrl: null })
     return this.state
   }
 
@@ -524,11 +588,11 @@ export class LatexPreviewService extends TypertRemoteService {
       }
       if (verdict.verdict === 'accept') {
         this.previousSource = target
-        this.patch({ message: `自动审核通过：${verdict.reason}` })
+        this.patch({ message: `自动审核通过：${verdict.reason}`, diffDocUrl: null })
         return
       }
       await this.applyRevert()
-      this.patch({ message: `自动审核未通过，已回滚：${verdict.reason}` })
+      this.patch({ message: `自动审核未通过，已回滚：${verdict.reason}`, diffDocUrl: null })
     } catch (error) {
       this.patch({
         message: `自动审核出错（${error instanceof Error ? error.message : String(error)}），已转手动`,
@@ -878,6 +942,7 @@ export class LatexPreviewService extends TypertRemoteService {
         ? `${ROUTE_PREFIX}${VIEWER_PATH}?file=${encodeURIComponent(pdfRoute)}&v=${version}`
         : null
 
+    let contentChanged = false
     if (result.ok) {
       const compiled = await this.readSource(rootFile)
       // Advance only when the content actually moved. A redundant compile (the
@@ -888,6 +953,7 @@ export class LatexPreviewService extends TypertRemoteService {
         // waits for the reviewer, and moves it itself once the verdict is in.
         if (this.review === 'open') this.previousSource = this.compiledSource ?? compiled
         this.compiledSource = compiled
+        contentChanged = true
         if (this.review === 'auto') void this.queueReview()
       }
     }
@@ -896,6 +962,9 @@ export class LatexPreviewService extends TypertRemoteService {
       status: result.ok ? 'ok' : 'failed',
       pdfUrl: result.pdfPath ? pdfUrl : this.state.pdfUrl,
       viewerUrl: result.pdfPath ? viewerUrl : this.state.viewerUrl,
+      // A new revision makes the built 对比视图 stale; it must be rebuilt on
+      // demand rather than silently shown against the wrong baseline.
+      diffDocUrl: contentChanged ? null : this.state.diffDocUrl,
       compiledAt: result.ok ? new Date().toISOString() : this.state.compiledAt,
       diagnostics: result.diagnostics,
       durationMs: result.durationMs,
@@ -945,6 +1014,7 @@ export class LatexPreviewService extends TypertRemoteService {
       compile: () => this.runCompile(),
       diff: () => this.readDiff(),
       diffRegions: () => this.readDiffRegions(),
+      diffDoc: () => this.applyDiffDoc(),
       accept: () => this.applyAccept(),
       revert: () => this.applyRevert(),
       jumpToPdf: (request) => this.view(request),

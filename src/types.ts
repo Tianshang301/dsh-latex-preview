@@ -51,6 +51,13 @@ export interface PreviewState {
   readonly redact: boolean
   /** How changes are reviewed; mirrors the Host setting (see {@link ReviewMode}). */
   readonly review: ReviewMode
+  /**
+   * Viewer-wrapped URL of the latexdiff document, when one has been built.
+   *
+   * Null until the user asks for the 对比视图 and the build succeeds; cleared
+   * again whenever the underlying revision moves (accept/revert/new compile).
+   */
+  readonly diffDocUrl: string | null
   /** Duration of the last compile in milliseconds. */
   readonly durationMs: number | null
   /** Candidate root files when resolution was ambiguous. */
@@ -137,6 +144,16 @@ export interface DiffRegion {
   readonly lineEnd: number
   /** Hover text: what changed and where. */
   readonly title: string
+  /**
+   * The removed source lines, capped (8 lines × 200 chars).
+   *
+   * A deletion has no pixels left in the new PDF; this is the only copy of the
+   * removed words the viewer can show, as the struck-through deletion row.
+   * Empty for a pure insertion (its lines render under the band).
+   */
+  readonly text?: string
+  /** Lines the deletion removed; 0 (absent) for insert/modify bands. */
+  readonly removed?: number
 }
 
 /** Regions for one compiled revision, plus what the caps left out. */
@@ -146,6 +163,20 @@ export interface DiffRegions {
   readonly regions: readonly DiffRegion[]
   /** Hunks skipped by the caps, so the UI can say so instead of lying. */
   readonly skipped: number
+}
+
+/** Outcome of building the latexdiff 对比视图, as handed back to the client. */
+export interface DiffDocResult {
+  /** Whether a diff PDF exists after this call (freshly built or kept). */
+  readonly ok: boolean
+  /** Viewer-wrapped URL of the diff PDF, or null when none exists. */
+  readonly url: string | null
+  /** One-line outcome for the status bar. */
+  readonly message: string
+  /** First error line when the build failed, for the notice channel. */
+  readonly detail?: string
+  /** `PreviewState.version` this result was computed at. */
+  readonly version: number
 }
 
 /** Outcome of one compile attempt, as handed back to the client. */
