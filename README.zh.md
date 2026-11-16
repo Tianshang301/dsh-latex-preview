@@ -107,10 +107,11 @@ npx dsh web --patch ./latex-preview.yml
 
 ## 隐私边界
 
-编译、渲染、SyncTeX、diff **全在本机**。只有两种情况会把内容送进 Agent 会话：
+编译、渲染、SyncTeX、diff **全在本机**。离开本机只有三种情况：
 
-1. 你点「发送给 Agent」（或触发一次指哪改哪）；
-2. 你显式打开脱敏开关前的每一次发送都会有提示。
+1. 你点「发送给 Agent」（或触发一次指哪改哪）——prompt 进入当前会话；
+2. 同上，但开了脱敏——每次发送都会先说明；
+3. **选了「自动审核」**且有改动编译成功：审核请求会把「已接受版本 ↔ 当前版本」的 diff 发给该会话配置的 provider/model。手动审核与完全放开不发。
 
 脱敏（`redact`，默认关闭）开启后，只发送「消息 + 行号」，不带源码行、不带选中文字。
 
@@ -170,11 +171,12 @@ npm run binaries     # 检查 tectonic / synctex
 
 | 文件 | 内容 |
 |---|---|
-| [`docs/spikes.md`](docs/spikes.md) | 已验证的契约与踩坑记录（B1–B16） |
+| [`docs/spikes.md`](docs/spikes.md) | 已验证的契约与踩坑记录（B1–B18） |
 | [`docs/HANDOFF.md`](docs/HANDOFF.md) | 状态、决策、未决问题 |
 | [`docs/DEVELOPMENT_PLAN.md`](docs/DEVELOPMENT_PLAN.md) | 任务分解、验收门、风险登记 |
 | [`docs/LaTeX Preview — 开发文档.md`](docs/LaTeX%20Preview%20—%20开发文档.md) | 架构与 API 契约规格书 |
 | [`AGENTS.md`](AGENTS.md) | 仓库级不变式速查 |
+| [`CHANGELOG.md`](CHANGELOG.md) | 每个尚未发布的变更改了什么、修了什么 |
 
 ## License
 

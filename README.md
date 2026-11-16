@@ -107,10 +107,11 @@ The top strip holds status and actions (compile state and duration, `编译` / C
 
 ## Privacy boundary
 
-Compiling, rendering, SyncTeX, and diffing stay **local**. Content enters the Agent session only when:
+Compiling, rendering, SyncTeX, and diffing stay **local**. Content leaves the machine in exactly three cases:
 
-1. you press "Send to Agent" (or trigger a point-and-edit), or
-2. you send with redaction on — every send says so first.
+1. you press "Send to Agent" (or trigger a point-and-edit) — the prompt goes to the current session;
+2. the same, with redaction on — every send says so first;
+3. **auto review is selected** and a change compiles: the diff between the accepted and current revision goes to the provider/model that session is configured for. Manual and open review send nothing.
 
 Redaction (`redact`, off by default) sends "message + line number" only: no source lines, no selected text.
 
@@ -170,11 +171,12 @@ Read [`docs/spikes.md`](docs/spikes.md) before changing code — it records the 
 
 | File | Contents |
 |---|---|
-| [`docs/spikes.md`](docs/spikes.md) | Verified contracts and traps (B1–B16) |
+| [`docs/spikes.md`](docs/spikes.md) | Verified contracts and traps (B1–B18) |
 | [`docs/HANDOFF.md`](docs/HANDOFF.md) | Status, decisions, open questions |
 | [`docs/DEVELOPMENT_PLAN.md`](docs/DEVELOPMENT_PLAN.md) | Work breakdown, gates, risk register |
 | [`docs/LaTeX Preview — 开发文档.md`](docs/LaTeX%20Preview%20—%20开发文档.md) | Architecture and API contract spec |
 | [`AGENTS.md`](AGENTS.md) | Repo-level invariants cheat sheet |
+| [`CHANGELOG.md`](CHANGELOG.md) | What each unreleased change added, fixed or changed |
 
 ## License
 
