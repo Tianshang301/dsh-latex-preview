@@ -28,6 +28,7 @@ Compiling, rendering, SyncTeX, and diffing all run **on your machine**. Only the
 - **Two-way SyncTeX** — double-click the PDF to get the source line; go from a source line to the PDF location. Always shells out to the `synctex` CLI; the `.synctex` file is never hand-parsed.
 - **One-click error hand-off** — builds a prompt from "file:line + message + source context" and steers it into the current session. The Agent fixes the `.tex`, the watcher recompiles.
 - **Point at the PDF, change the source** — select text, or drag a box over anything → an inline bar appears → type one sentence → the Agent receives the **source line range** to edit.
+- **Three review modes** — `手动审核` (you accept every change), `自动审核` (a **separate AI** reviews each change and rolls the source back when it says no), `完全放开` (no gate). The verdict and its reason land in the status bar.
 - **Diff highlight on the PDF** — a `差异 N` button and coloured bands over the lines this compile changed: green for added, amber for modified, a red dash for a deletion seam. Hover for the source line and its text; click to pin it in the status bar. Computed against the *previous compiled* revision, not the file on disk.
 - **Redaction switch** — when on, only "message + line number" is sent; no source, no selected text.
 - **Clickable diagnostics** — clicking an error or warning jumps to its source location.
@@ -88,6 +89,9 @@ The top strip holds status and actions (compile state and duration, `编译` / C
 | "Send to Agent" | Hands this compile's errors to the current session (disabled with an explanation when there are none) |
 | "差异 N" / Diff N | Toggles the change highlight; the title says how many hunks and whether the caps left any out |
 | Hover a band | Shows which source line changed and the first sensible characters of it |
+| Review dropdown | Manual / Auto (independent AI) / Fully open |
+| "接受 N" / Accept N | Marks the change set accepted and clears the marks (manual mode only) |
+| "撤销" / Revert | Writes the source back to the previous revision and recompiles; needs a second click |
 
 ### Point at a spot, change the source
 
@@ -115,6 +119,8 @@ Redaction (`redact`, off by default) sends "message + line number" only: no sour
 - **Cross-page selections** reverse-jump only the current page's part.
 - **A deletion has no text to tint** — only a dashed seam where it was removed, anchored at the foot of the line above. The removed text exists only in the previous revision, which the panel does not display.
 - **The highlight is capped** at 24 hunks / 40 resolved lines per revision; longer blocks are sampled evenly rather than truncated, and the surplus is reported in the button's title.
+- **Auto review spends model calls** and can be wrong. It runs only in that mode, and a timeout (25 s) or a missing model **falls back to manual** — it never approves by default.
+- **Revert and a rejecting reviewer write the source file** (back to the previous revision, then recompile). That is the plugin's only destructive action, which is why the button arms on a second click.
 - One point-and-edit quotes at most **12 source lines** (`MAX_EDIT_LINES`), so boxing a whole page cannot dump a whole page into the prompt.
 - The first compile may download TeX packages, so its timeout is 5 minutes (2 minutes afterwards).
 
@@ -124,7 +130,7 @@ Redaction (`redact`, off by default) sends "message + line number" only: no sour
 src/
   index.ts                       Host entry; registers the service
   services/
-    latex-preview-service.ts     Typert Remote service (10 @Remote methods)
+    latex-preview-service.ts     Typert Remote service (12 @Remote methods)
     compile.ts                   Tectonic invocation + artifact rollback
     watcher.ts                   chokidar + debounce
     diff.ts                      line-level diff
@@ -141,7 +147,7 @@ Two constraints worth knowing up front:
 - **Callbacks cannot cross the Host↔Client wire.** The client polls `getState()` and reacts to the `version` counter — an unchanged version does nothing: no re-render, no iframe reload.
 - **The panel talks over an HTTP route, which has no Agent driver**, so `currentInitiator()` is always empty there. The panel reads the session id from the sidebar's `data-sidebar-right-session` and the Host resolves it with `agents.get(id)`.
 
-HTTP routes the panel uses (`POST`, except `state` which is `GET`): `state` `configure` `compile` `diff` `diff-regions` `jump-to-pdf` `jump-to-source` `send-error` `edit-at` `binaries`.
+HTTP routes the panel uses (`POST`, except `state` which is `GET`): `state` `configure` `compile` `diff` `diff-regions` `accept` `revert` `jump-to-pdf` `jump-to-source` `send-error` `edit-at` `binaries`.
 
 ## Development
 

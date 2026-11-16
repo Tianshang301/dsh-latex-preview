@@ -49,6 +49,8 @@ export interface PreviewState {
   readonly watching: boolean
   /** Mirror of the redaction switch, so the UI can render its state. */
   readonly redact: boolean
+  /** How changes are reviewed; mirrors the Host setting (see {@link ReviewMode}). */
+  readonly review: ReviewMode
   /** Duration of the last compile in milliseconds. */
   readonly durationMs: number | null
   /** Candidate root files when resolution was ambiguous. */
@@ -106,6 +108,16 @@ export interface DiffBlock {
   readonly startLine: number
   readonly endLine: number
 }
+
+/**
+ * How much say the user has over a change that already compiled.
+ *
+ * - `manual`: nothing counts until 接受; the reference stays put, so the marks
+ *   accumulate every unaccepted change.
+ * - `auto`: each compile is accepted, but can still be reverted until the next one.
+ * - `open`: accepted, no safety net, no revert offered.
+ */
+export type ReviewMode = 'manual' | 'auto' | 'open'
 
 /** What a changed region means, in diff terms. */
 export type DiffRegionKind = 'insert' | 'delete' | 'modify'

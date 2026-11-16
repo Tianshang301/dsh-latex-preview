@@ -199,12 +199,16 @@ body {
   border: 1px solid rgba(210, 153, 34, 0.6);
 }
 
-/* A deletion has no text left to tint: mark the seam where it was, and nothing
-   else. Tinting the following line would read as "this line changed". */
+/* A deletion has no text left to tint. Hatching keeps it visually distinct from a
+   highlighted line: a solid band would read as "this line changed". */
 .diffRegion.diff-delete {
-  background: none;
+  background: repeating-linear-gradient(
+    135deg,
+    rgba(207, 34, 46, 0.55) 0 3px,
+    rgba(207, 34, 46, 0.1) 3px 6px
+  );
   border: none;
-  border-top: 2px dashed rgba(207, 34, 46, 0.8);
+  border-left: 3px solid rgba(207, 34, 46, 0.85);
   border-radius: 0;
 }
 

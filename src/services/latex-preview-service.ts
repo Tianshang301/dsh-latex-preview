@@ -21,7 +21,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { basename, dirname, join } from 'node:path'
-import { readFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import { checkBinaries } from '../utils/binaries.ts'
 import { isRootCandidate, listTexFiles, resolveRoot, type RootResolution } from '../utils/root.ts'
 import { synctexEdit, synctexView } from '../utils/synctex.ts'
@@ -30,6 +30,7 @@ import { FileWatcher } from './watcher.ts'
 import { lineDiff } from './diff.ts'
 import { bandsFromHits, diffHunks } from './diff-regions.ts'
 import { AgentBridge, buildSelectionPrompt, type AgentLike, type AgentRegistryLike } from './agent-bridge.ts'
+import { renderDiffForReview, reviewDiff, type LlmLike, type ReviewRoute, type ReviewVerdict } from './reviewer.ts'
 import { createApiHandler, type PreviewHost } from './http-api.ts'
 import { mountStaticRoute, ROUTE_PREFIX, type StaticMount, type WebServerLike } from './static-route.ts'
 import { assetsRoot, VIEWER_PATH, viewerAvailable } from '../utils/assets.ts'
@@ -41,6 +42,7 @@ import type {
   EditOutcome,
   EditRequest,
   PreviewState,
+  ReviewMode,
   SyncEditHit,
   SyncViewHit,
 } from '../types.ts'
@@ -63,6 +65,8 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
     'latex-preview/handoff-failed': { readonly reason: string }
     'latex-preview/empty-instruction': Record<string, never>
     'latex-preview/no-source-map': Record<string, never>
+    'latex-preview/nothing-to-review': Record<string, never>
+    'latex-preview/revert-failed': { readonly detail: string }
   }
 }
 
@@ -74,6 +78,9 @@ const MAX_DIFF_HUNKS = 24
 
 /** `synctex view` calls one overlay may spend; each is a process per line. */
 const MAX_DIFF_LINES = 40
+
+/** How long the independent reviewer may take before the gate falls back to manual. */
+const REVIEW_TIMEOUT_MS = 25_000
 
 const DEFAULT_DEBOUNCE_MS = 500
 const DEFAULT_TIMEOUT_MS = 120_000
@@ -88,6 +95,22 @@ export class LatexPreviewService extends TypertRemoteService {
   private webServer: WebServerLike | undefined
   private disposeRoute: (() => void) | null = null
   private redact = false
+  /**
+   * Review gate for changes that already compiled (see {@link ReviewMode}).
+   *
+   * Defaults to `auto` — an independent model call decides — because that is the
+   * only mode where the marks mean something without asking the user to babysit
+   * every keystroke.
+   */
+  private review: ReviewMode = 'auto'
+  /** `ctx.llm`, used only by the reviewer; absent in profiles without a model. */
+  private llm: LlmLike | undefined
+  /** True while a reviewer call is in flight, so two compiles cannot race. */
+  private reviewing = false
+  /** Last Session the panel named; the reviewer reads its model route from it. */
+  private lastSessionId: string | undefined
+  /** Profile default model, used when no Session has published a header yet. */
+  private defaultModel: { currentSelection?(): { provider?: string; model?: string } } | undefined
   /**
    * Source that produced the previous PDF (the `.pdf.prev` artifact).
    *
@@ -118,6 +141,12 @@ export class LatexPreviewService extends TypertRemoteService {
     ctx.inject(['agents'], (agentCtx) => {
       this.agents = agentCtx.get('agents') as unknown as AgentRegistryLike
     })
+    ctx.inject(['llm'], (llmCtx) => {
+      this.llm = llmCtx.get('llm') as unknown as LlmLike
+    })
+    ctx.inject(['agentDefaultModel'], (modelCtx) => {
+      this.defaultModel = modelCtx.get('agentDefaultModel') as unknown as typeof this.defaultModel
+    })
     ctx.inject(['webServer'], (webCtx) => {
       this.webServer = webCtx.get('webServer') as unknown as WebServerLike
       this.mountRoutes()
@@ -142,6 +171,7 @@ export class LatexPreviewService extends TypertRemoteService {
       message: null,
       watching: false,
       redact: this.redact,
+      review: this.review,
       durationMs: null,
       rootCandidates: [],
     }
@@ -149,7 +179,9 @@ export class LatexPreviewService extends TypertRemoteService {
 
   /** Replace state and bump the version pollers watch. */
   private patch(next: Partial<PreviewState>): void {
-    this.state = { ...this.state, ...next, version: this.state.version + 1 }
+    // The two switches live on the instance; mirror them into every snapshot so
+    // the panel never renders a stale control.
+    this.state = { ...this.state, redact: this.redact, review: this.review, ...next, version: this.state.version + 1 }
   }
 
   // ── Remote surface ────────────────────────────────────────────────────────
@@ -177,7 +209,7 @@ export class LatexPreviewService extends TypertRemoteService {
    */
   @Remote
   async configure(
-    request: { file?: string; rootFile?: string; outDir?: string; redact?: boolean; debounceMs?: number },
+    request: { file?: string; rootFile?: string; outDir?: string; redact?: boolean; review?: ReviewMode; debounceMs?: number },
     signal: AbortSignal,
   ): Promise<PreviewState> {
     signal.throwIfAborted()
@@ -190,9 +222,13 @@ export class LatexPreviewService extends TypertRemoteService {
     rootFile?: string
     outDir?: string
     redact?: boolean
+    review?: ReviewMode
     debounceMs?: number
   }): Promise<PreviewState> {
     if (typeof request.redact === 'boolean') this.redact = request.redact
+    if (request.review === 'manual' || request.review === 'auto' || request.review === 'open') {
+      this.review = request.review
+    }
     if (typeof request.debounceMs === 'number' && request.debounceMs >= 0) {
       this.debounceMs = Math.min(5000, Math.max(0, request.debounceMs))
     }
@@ -394,6 +430,183 @@ export class LatexPreviewService extends TypertRemoteService {
   }
 
   /**
+   * Sign off the changes compiled so far.
+   *
+   * Only meaningful in `manual` review: the reference used by the diff moves up to
+   * the current PDF, which clears the marks. In `auto` the reference already moved
+   * and this is a no-op with an error, so the panel does not offer it there.
+   * @param signal - client cancellation.
+   * @returns the state after acceptance.
+   */
+  @Remote
+  async acceptChanges(signal: AbortSignal): Promise<PreviewState> {
+    signal.throwIfAborted()
+    return this.applyAccept()
+  }
+
+  /** Shared acceptance body. */
+  private applyAccept(): PreviewState {
+    if (!this.hasPendingChanges()) {
+      throw new RemoteError('latex-preview/nothing-to-review', '没有待审核的改动', {})
+    }
+    this.previousSource = this.compiledSource
+    this.patch({ message: '已接受这次改动' })
+    return this.state
+  }
+
+  /**
+   * Put the source back to the last accepted revision and recompile.
+   *
+   * This writes the root file — the one destructive action in the plugin — so the
+   * panel arms the button with a second click rather than firing on one.
+   * @param signal - client cancellation.
+   * @returns the state after the recompile.
+   */
+  @Remote
+  async revertChanges(signal: AbortSignal): Promise<PreviewState> {
+    signal.throwIfAborted()
+    return this.applyRevert()
+  }
+
+  /** Shared revert body. */
+  private async applyRevert(): Promise<PreviewState> {
+    const rootFile = this.state.rootFile
+    const target = this.previousSource
+    if (!rootFile || target === null || !this.hasPendingChanges()) {
+      throw new RemoteError('latex-preview/nothing-to-review', '没有可撤回的改动', {})
+    }
+
+    await writeFile(rootFile, target, 'utf8')
+    // Line both snapshots up *before* compiling: otherwise the compile sees the
+    // reverted file as a brand-new change and paints the rollback as a diff.
+    this.compiledSource = target
+    let result: CompileResult
+    try {
+      result = await this.runCompile()
+    } catch (error) {
+      throw new RemoteError('latex-preview/revert-failed', '源码已回滚，但重新编译没有启动', {
+        detail: error instanceof Error ? error.message : String(error),
+      })
+    }
+    if (!result.ok) {
+      throw new RemoteError('latex-preview/revert-failed', '源码已回滚，但重新编译失败；PDF 仍是回滚前那一版', {
+        detail: result.diagnostics[0]?.message ?? 'unknown',
+      })
+    }
+    this.patch({ message: '已回滚到上一版' })
+    return this.state
+  }
+
+  /**
+   * Send the change just compiled to an independent reviewer.
+   *
+   * Runs detached: compiling must not wait on a model call. The reviewer's verdict
+   * decides — accept moves the reference, reject rolls the source back — and a
+   * failed or unreadable review deliberately degrades to manual rather than
+   * passing the change through.
+   */
+  private async queueReview(): Promise<void> {
+    const target = this.compiledSource
+    const base = this.previousSource
+    if (this.reviewing || target === null || base === null || target === base) return
+
+    this.reviewing = true
+    this.patch({ message: '自动审核中：正在请独立 AI 审这次改动…' })
+    try {
+      const verdict = await this.runReview(base, target)
+      // Another compile landed while the reviewer was thinking; that change gets
+      // its own review, and applying this verdict to it would be wrong.
+      if (this.compiledSource !== target) return
+
+      if (verdict.verdict === 'unavailable') {
+        this.patch({ message: `自动审核不可用（${verdict.reason}），已转手动：请点「接受」或「撤销」` })
+        return
+      }
+      if (verdict.verdict === 'accept') {
+        this.previousSource = target
+        this.patch({ message: `自动审核通过：${verdict.reason}` })
+        return
+      }
+      await this.applyRevert()
+      this.patch({ message: `自动审核未通过，已回滚：${verdict.reason}` })
+    } catch (error) {
+      this.patch({
+        message: `自动审核出错（${error instanceof Error ? error.message : String(error)}），已转手动`,
+      })
+    } finally {
+      this.reviewing = false
+    }
+  }
+
+  /**
+   * Run one reviewer call on the diff between two revisions.
+   * @param base - last accepted content.
+   * @param target - content currently shown.
+   * @returns the verdict; `unavailable` when no model or route is reachable.
+   */
+  private async runReview(base: string, target: string): Promise<ReviewVerdict> {
+    if (!this.llm) return { verdict: 'unavailable', reason: '当前 profile 没有可用的模型服务' }
+    const route = this.reviewRoute()
+    if (!route) return { verdict: 'unavailable', reason: '读不到当前会话的模型路由' }
+    const diff = renderDiffForReview(lineDiff(base, target))
+    if (diff.trim() === '') return { verdict: 'accept', reason: '没有实际改动' }
+    // A stalled provider must not leave the panel saying "审核中" indefinitely.
+    return Promise.race([
+      reviewDiff(this.llm, route, diff),
+      new Promise<ReviewVerdict>((resolve) => {
+        setTimeout(() => resolve({ verdict: 'unavailable', reason: '审核超时（25s）' }), REVIEW_TIMEOUT_MS).unref?.()
+      }),
+    ])
+  }
+
+  /**
+   * Provider and model the reviewer should use.
+   *
+   * Taken from the Session's request header — the same source the first-party
+   * auto-review layer reads — because the plugin owns no model configuration of
+   * its own. Tried in order: the Session the panel last named, the initiator
+   * boundary, then any live Agent.
+   * @returns the route, or null when no Agent publishes one.
+   */
+  private reviewRoute(): ReviewRoute | null {
+    const candidates: AgentLike[] = []
+    const named = this.agentFor(this.lastSessionId)
+    if (named) candidates.push(named)
+    const initiator = this.agents?.currentInitiator?.()
+    if (initiator) candidates.push(initiator)
+    for (const agent of this.agents?.list?.() ?? []) candidates.push(agent)
+
+    for (const agent of candidates) {
+      const config = agent.session?.requestHeader?.()?.config
+      const provider = config?.provider
+      const model = config?.model
+      if (typeof provider === 'string' && provider !== '' && typeof model === 'string' && model !== '') {
+        return { provider, model }
+      }
+    }
+
+    // A fresh Session has no request header until its first turn, and the panel's
+    // compile can happen before that; the profile default is the same model the
+    // next turn would use.
+    try {
+      const selection = this.defaultModel?.currentSelection?.()
+      const provider = selection?.provider
+      const model = selection?.model
+      if (typeof provider === 'string' && provider !== '' && typeof model === 'string' && model !== '') {
+        return { provider, model }
+      }
+    } catch {
+      // A profile without a default model is a miss, not a failure.
+    }
+    return null
+  }
+
+  /** Whether the PDF differs from the last accepted revision. */
+  private hasPendingChanges(): boolean {
+    return this.compiledSource !== null && this.previousSource !== null && this.compiledSource !== this.previousSource
+  }
+
+  /**
    * Forward jump: source line → PDF position.
    * @param request - line number; `file` defaults to the root file.
    * @param signal - client cancellation.
@@ -450,6 +663,7 @@ export class LatexPreviewService extends TypertRemoteService {
 
   /** Shared body of the Remote method and the HTTP API. */
   private async applyEdit(request: EditRequest): Promise<EditOutcome> {
+    this.lastSessionId = request.sessionId ?? this.lastSessionId
     const pdf = this.requirePdf()
     const instruction = (request.instruction ?? '').trim()
     if (instruction === '') {
@@ -562,6 +776,7 @@ export class LatexPreviewService extends TypertRemoteService {
 
   /** Error hand-off body shared by the Remote method and the HTTP API. */
   private async handOff(request: { redact?: boolean; sessionId?: string }): Promise<{ ok: boolean; detail?: string }> {
+    this.lastSessionId = request.sessionId ?? this.lastSessionId
     const outcome = this.bridge.send(
       this.state.diagnostics,
       { redact: request.redact ?? this.redact },
@@ -642,7 +857,17 @@ export class LatexPreviewService extends TypertRemoteService {
     }
 
     this.patch({ status: 'compiling', message: '正在编译…' })
-    const result = await this.compiler.run()
+    let result: CompileResult
+    try {
+      result = await this.compiler.run()
+    } catch (error) {
+      // Without this the state stays 'compiling' forever and the panel looks hung.
+      this.patch({
+        status: 'failed',
+        message: `编译没有启动：${error instanceof Error ? error.message : String(error)}`,
+      })
+      throw error
+    }
     const version = this.state.version + 1
     const pdfRoute = result.pdfPath ? `${ROUTE_PREFIX}/pdf/${encodeURIComponent(basename(result.pdfPath))}` : null
     const pdfUrl = pdfRoute ? `${pdfRoute}?v=${version}` : null
@@ -659,8 +884,11 @@ export class LatexPreviewService extends TypertRemoteService {
       // user pressing 编译 twice) must not erase the marks they are looking at,
       // and a failed compile keeps the old PDF, so its baseline stays.
       if (compiled !== this.compiledSource) {
-        this.previousSource = this.compiledSource ?? compiled
+        // Only `open` advances the reference here. `manual` waits for 接受; `auto`
+        // waits for the reviewer, and moves it itself once the verdict is in.
+        if (this.review === 'open') this.previousSource = this.compiledSource ?? compiled
         this.compiledSource = compiled
+        if (this.review === 'auto') void this.queueReview()
       }
     }
 
@@ -717,6 +945,8 @@ export class LatexPreviewService extends TypertRemoteService {
       compile: () => this.runCompile(),
       diff: () => this.readDiff(),
       diffRegions: () => this.readDiffRegions(),
+      accept: () => this.applyAccept(),
+      revert: () => this.applyRevert(),
       jumpToPdf: (request) => this.view(request),
       jumpToSource: (request) => this.edit(request),
       sendError: (request) => this.handOff(request),

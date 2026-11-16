@@ -18,9 +18,20 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { basename } from 'node:path'
 import type { LatexDiagnostic } from '../types.ts'
 
+/**
+ * Request header of a Session: which provider and model it is talking to.
+ *
+ * The reviewer needs the same route the user already chose, and this is the only
+ * documented place it is published (docs/spikes.md §B18).
+ */
+export interface SessionHeaderLike {
+  requestHeader?(): { config?: { provider?: string; model?: string } } | undefined
+}
+
 /** Structural view of an Agent; the real one lives in `@deepseek-ai/dsh-agent`. */
 export interface AgentLike {
   steer(message: unknown): void
+  session?: SessionHeaderLike
 }
 
 /** Structural view of `ctx.agents` (AgentRegistry). */
@@ -29,6 +40,8 @@ export interface AgentRegistryLike {
   requireInitiator?(): AgentLike
   /** Look up the live agent for a Session id; the only reliable path outside a driver. */
   get?(id: string): AgentLike | undefined
+  /** Every live agent; last resort for reading a model route. */
+  list?(): AgentLike[]
 }
 
 /** Why a send did not happen. */

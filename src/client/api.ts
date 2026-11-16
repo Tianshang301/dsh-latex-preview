@@ -20,6 +20,7 @@ import type {
   EditOutcome,
   EditRequest,
   PreviewState,
+  ReviewMode,
   SyncEditHit,
   SyncViewHit,
 } from '../types.ts'
@@ -33,13 +34,17 @@ export type RemoteResult<T> =
 export interface PreviewApi {
   getState(signal?: AbortSignal): Promise<RemoteResult<PreviewState>>
   configure(
-    request: { file?: string; rootFile?: string; outDir?: string; redact?: boolean; debounceMs?: number },
+    request: { file?: string; rootFile?: string; outDir?: string; redact?: boolean; review?: ReviewMode; debounceMs?: number },
     signal?: AbortSignal,
   ): Promise<RemoteResult<PreviewState>>
   compileNow(signal?: AbortSignal): Promise<RemoteResult<CompileResult>>
   getDiff(signal?: AbortSignal): Promise<RemoteResult<readonly DiffBlock[]>>
   /** Highlight rectangles for the changes since the previous compile. */
   getDiffRegions(signal?: AbortSignal): Promise<RemoteResult<DiffRegions>>
+  /** Sign off the change set (manual review only). */
+  acceptChanges(signal?: AbortSignal): Promise<RemoteResult<PreviewState>>
+  /** Put the source back to the last accepted revision and recompile. */
+  revertChanges(signal?: AbortSignal): Promise<RemoteResult<PreviewState>>
   jumpToPdf(request: { line: number; file?: string }, signal?: AbortSignal): Promise<RemoteResult<readonly SyncViewHit[]>>
   jumpToSource(request: { page: number; x: number; y: number }, signal?: AbortSignal): Promise<RemoteResult<readonly SyncEditHit[]>>
   sendErrorToAgent(request: { redact?: boolean; sessionId?: string }, signal?: AbortSignal): Promise<RemoteResult<{ ok: boolean; detail?: string }>>
@@ -101,7 +106,7 @@ export class HttpPreviewApi implements PreviewApi {
   }
 
   configure(
-    request: { file?: string; rootFile?: string; outDir?: string; redact?: boolean; debounceMs?: number },
+    request: { file?: string; rootFile?: string; outDir?: string; redact?: boolean; review?: ReviewMode; debounceMs?: number },
     signal?: AbortSignal,
   ): Promise<RemoteResult<PreviewState>> {
     return this.call('configure', request, signal)
@@ -117,6 +122,14 @@ export class HttpPreviewApi implements PreviewApi {
 
   getDiffRegions(signal?: AbortSignal): Promise<RemoteResult<DiffRegions>> {
     return this.call('diff-regions', {}, signal)
+  }
+
+  acceptChanges(signal?: AbortSignal): Promise<RemoteResult<PreviewState>> {
+    return this.call('accept', {}, signal)
+  }
+
+  revertChanges(signal?: AbortSignal): Promise<RemoteResult<PreviewState>> {
+    return this.call('revert', {}, signal)
   }
 
   jumpToPdf(request: { line: number; file?: string }, signal?: AbortSignal): Promise<RemoteResult<readonly SyncViewHit[]>> {

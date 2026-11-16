@@ -16,7 +16,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { CompileResult, DiffBlock, DiffRegions, PreviewState, SyncEditHit, SyncViewHit } from '../types.ts'
+import type { CompileResult, DiffBlock, DiffRegions, PreviewState, ReviewMode, SyncEditHit, SyncViewHit } from '../types.ts'
 import { ROUTE_PREFIX } from './static-route.ts'
 import type { EditOutcome, EditRequest } from '../types.ts'
 
@@ -29,10 +29,19 @@ const MAX_BODY_BYTES = 64 * 1024
 /** The Host operations the panel calls. */
 export interface PreviewHost {
   state(): PreviewState
-  configure(request: { file?: string; rootFile?: string; outDir?: string; redact?: boolean; debounceMs?: number }): Promise<PreviewState>
+  configure(request: {
+    file?: string
+    rootFile?: string
+    outDir?: string
+    redact?: boolean
+    review?: ReviewMode
+    debounceMs?: number
+  }): Promise<PreviewState>
   compile(): Promise<CompileResult>
   diff(): Promise<readonly DiffBlock[]>
   diffRegions(): Promise<DiffRegions>
+  accept(): PreviewState
+  revert(): Promise<PreviewState>
   jumpToPdf(request: { line: number; file?: string }): Promise<readonly SyncViewHit[]>
   jumpToSource(request: { page: number; x: number; y: number }): Promise<readonly SyncEditHit[]>
   sendError(request: { redact?: boolean; sessionId?: string }): Promise<{ ok: boolean; detail?: string }>
@@ -47,6 +56,8 @@ const ROUTES: Record<string, 'GET' | 'POST'> = {
   compile: 'POST',
   diff: 'POST',
   'diff-regions': 'POST',
+  accept: 'POST',
+  revert: 'POST',
   'jump-to-pdf': 'POST',
   'jump-to-source': 'POST',
   'send-error': 'POST',
@@ -105,6 +116,10 @@ async function dispatch(host: PreviewHost, name: string, body: Record<string, un
       return host.diff()
     case 'diff-regions':
       return host.diffRegions()
+    case 'accept':
+      return host.accept()
+    case 'revert':
+      return host.revert()
     case 'jump-to-pdf':
       return host.jumpToPdf(body as Parameters<PreviewHost['jumpToPdf']>[0])
     case 'jump-to-source':

@@ -255,9 +255,10 @@ async function paintDiffPage(pageEl) {
     box.style.left = `${(region.x / viewport.width) * 100}%`
     box.style.top = `${(region.y / viewport.height) * 100}%`
     box.style.width = `${(region.width / viewport.width) * 100}%`
-    // A deletion has no text left to tint: draw a 2 px seam instead of a band, so
-    // it cannot be mistaken for "this line changed".
-    box.style.height = region.kind === 'delete' ? '2px' : `${(region.height / viewport.height) * 100}%`
+    // A deletion has no text left to tint. It gets a short hatched band instead of
+    // a solid one, so it reads as "something was removed here" and not as "this
+    // line changed".
+    box.style.height = region.kind === 'delete' ? '7px' : `${(region.height / viewport.height) * 100}%`
     layer.append(box)
     painted.push({ pageEl, region, width: viewport.width, height: viewport.height })
   }

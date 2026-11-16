@@ -15,7 +15,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { POLL_INTERVAL_MS, unwrap, type PreviewApi } from './api.ts'
 import { PDFViewer, PDFViewerAdapter } from './pdf-viewer.ts'
-import type { DiffRegions, LatexDiagnostic, PreviewState } from '../types.ts'
+import type { DiffRegions, LatexDiagnostic, PreviewState, ReviewMode } from '../types.ts'
 
 /** Everything the panel needs from the shell. */
 export interface PanelProps {
@@ -70,6 +70,8 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
   const [hits, setHits] = useState<string | null>(null)
   const [diff, setDiff] = useState<DiffRegions | null>(null)
   const [showDiff, setShowDiff] = useState(true)
+  // Reverting writes the source file, so the button arms first and disarms itself.
+  const [armRevert, setArmRevert] = useState(false)
 
   const frameRef = useRef<HTMLIFrameElement | null>(null)
   const viewerRef = useRef<PDFViewer | null>(null)
@@ -241,6 +243,12 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
     return () => window.removeEventListener('message', onMessage)
   }, [api, viewer])
 
+  useEffect(() => {
+    if (!armRevert) return
+    const timer = window.setTimeout(() => setArmRevert(false), 4000)
+    return () => window.clearTimeout(timer)
+  }, [armRevert])
+
   /** Run one action with the busy flag and a single error channel. */
   const run = useCallback(async (action: () => Promise<{ ok: boolean; message?: string }>) => {
     setWorking(true)
@@ -278,6 +286,40 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
     },
     [api, run],
   )
+
+  const onSetReview = useCallback(
+    (review: ReviewMode) => {
+      void run(async () => {
+        const result = await unwrap(api.configure({ review }))
+        return result.ok ? { ok: true } : { ok: false, message: result.message }
+      })
+    },
+    [api, run],
+  )
+
+  const onAccept = useCallback(() => {
+    void run(async () => {
+      const result = await unwrap(api.acceptChanges())
+      if (!result.ok) return { ok: false, message: result.message }
+      setNotice('已接受这次改动')
+      return { ok: true }
+    })
+  }, [api, run])
+
+  const onRevert = useCallback(() => {
+    if (!armRevert) {
+      setArmRevert(true)
+      setNotice('再点一次「确认撤销」：源码会写回上一版并重新编译')
+      return
+    }
+    setArmRevert(false)
+    void run(async () => {
+      const result = await unwrap(api.revertChanges())
+      if (!result.ok) return { ok: false, message: result.message }
+      setNotice('已回滚到上一版')
+      return { ok: true }
+    })
+  }, [api, run, armRevert])
 
   const onSelectDiagnostic = useCallback(
     (diagnostic: LatexDiagnostic) => {
@@ -331,6 +373,17 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
         <button style={styles.button} disabled={working} onClick={onCompile}>
           {state.status === 'compiling' ? '编译中…' : '编译'}
         </button>
+        <select
+          style={{ ...styles.button, paddingRight: 2 }}
+          value={state.review}
+          disabled={working}
+          onChange={(event) => onSetReview(event.target.value as ReviewMode)}
+          title="改动审核方式：手动=每一步都要你接受；自动=派一个独立 AI 审，不通过自动回滚；完全放开=不设闸门"
+        >
+          <option value="manual">手动审核</option>
+          <option value="auto">自动审核（独立 AI）</option>
+          <option value="open">完全放开</option>
+        </select>
         <button
           style={styles.button}
           disabled={working || errors.length === 0}
@@ -343,6 +396,26 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
         >
           发送给 Agent
         </button>
+        {diffCount > 0 && state.review === 'manual' && (
+          <button
+            style={{ ...styles.button, borderColor: '#1a7f37', color: '#1a7f37' }}
+            disabled={working}
+            onClick={onAccept}
+            title="把这次改动记为已接受，清掉标记"
+          >
+            接受 {diffCount}
+          </button>
+        )}
+        {diffCount > 0 && state.review !== 'open' && (
+          <button
+            style={{ ...styles.button, ...(armRevert ? { borderColor: '#cf222e', color: '#cf222e' } : {}) }}
+            disabled={working}
+            onClick={onRevert}
+            title="把源码写回上一版已接受的版本，并重新编译"
+          >
+            {armRevert ? '确认撤销' : '撤销'}
+          </button>
+        )}
         <button
           style={{ ...styles.button, opacity: diffCount === 0 ? 0.5 : showDiff ? 1 : 0.65 }}
           disabled={diffCount === 0}
