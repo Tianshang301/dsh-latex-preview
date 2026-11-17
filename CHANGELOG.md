@@ -52,6 +52,12 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 - Reviewer route comes from `agent.session.requestHeader().config` — the same source the first-party auto-review layer reads — falling back to `agentDefaultModel.currentSelection()` because a fresh Session publishes no header until its first turn.
 - A missing route, an unparsable verdict, a failed call or a 25 s timeout degrades to **manual**, never to approval.
 
+**Previous-revision artefacts**
+
+- Every compile keeps the PDF **and** its `.synctex.gz` of the revision that preceded it, as one pair (`main.prev.pdf` ↔ `main.prev.synctex.gz`; the names must match because `synctex view -o` finds the map by name).
+- The pair becomes a *baseline* only when the baseline actually moves: 接受, auto approval or revert copy the artefacts on screen; a pending manual change deletes the pair instead of leaving a snapshot that would map old line numbers onto the wrong document.
+- State publishes `basePdfUrl`, `baseViewerUrl` and `baseRevisionId` (a digest of the baseline source) so the UI can show a previous revision — and refuse to when the pairing is not provable. Nothing draws it yet; this is the groundwork for viewing deleted content in its original typesetting.
+
 **Client and integration**
 
 - Keyed right-sidebar tab, declared through `sidebarRightTabs.register` plus the `sidebar.right.pane.tab` / `.title` slots; slot-only registration renders nothing.
@@ -73,6 +79,7 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 - **A deletion seam could land in the footer.** `synctex view` answers for `\end{document}` with the *page-number* box, so anchoring at the line after the hole put the marker at the bottom of the sheet. It now anchors at the foot of the line **above** the hole, and counts the hunk as skipped when nothing near it maps.
 - **`发送给 Agent` failed on the HTTP route** even with real errors: `agents.currentInitiator()` only resolves inside a driver's async boundary, so it is always empty for a request. The panel now reads `data-sidebar-right-session` from its pane and the Host resolves `agents.get(id)` (both key spellings), falling back to the initiator chain.
 - **A compile that could not start left the panel stuck on `正在编译`.** `compiler.run()` throwing (not failing) had no terminal state; it is now patched to `failed` before rethrowing.
+- **A failed compile left the PDF and its sync map out of step.** Only the PDF was backed up and restored, so `.synctex.gz` kept whatever the failed run wrote — the screen showed the old document while reverse lookup used the new map, landing on the wrong line without any error. Both files are now copied aside and restored together; verified byte-identical before and after an induced failure.
 - **`scrollPageIntoView` received a string page number.** PDF.js only warns on that, so scroll restoration was failing silently.
 - **The diff overlay could paint a stale layer over a fresh one.** `paintDiffPage` awaits `getPage()`, and `pagerendered` fires again on every zoom and scroll, so two paints of one page could interleave — a slow older one would append its band after the newer one, leaving two `.diffLayer`s and hit-test entries for a layer that no longer existed. Painting now carries a generation and a per-page ticket and discards its own result when either moved; the new layer is swapped in before the old one is removed. Verified with 40 rapid zoom changes: one layer per page, no orphans.
 - **Band colours depended on what was underneath.** `mix-blend-mode: multiply` tinted every band with the page content, so the same amber was pale over text and nearly invisible over a dark formula. Bands now composite normally (alpha only), with the left gutter carrying the kind.

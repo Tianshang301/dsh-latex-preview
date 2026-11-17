@@ -9,9 +9,12 @@
  * 2. **Timeout** — the first compile downloads the bundle and can take minutes,
  *    so first-run and steady-state budgets differ. A killed process counts as
  *    failure and triggers rollback.
- * 3. **Rollback** — the PDF is copied to `.pdf.prev` before compiling. On
- *    failure that copy is restored, so a broken edit never blanks the preview.
- *    On success the `.prev` is removed.
+ * 3. **Rollback** — the PDF *and its `.synctex.gz`* are copied aside before
+ *    compiling. On failure both are restored, so a broken edit neither blanks
+ *    the preview nor leaves a new sync map pointing at an old PDF. On success
+ *    the copies are promoted into the `prev` pair, which is the only thing a
+ *    later step may use to look up lines in the previous revision (their names
+ *    must pair: `main.prev.pdf` ↔ `main.prev.synctex.gz`).
  *
  * @module dsh-latex-preview/services/compile
  */
@@ -42,6 +45,18 @@ export interface CompilePaths {
   readonly prev: string
   readonly log: string
   readonly synctex: string
+  /** Transient copy of `synctex`, restored with `prev` on failure. */
+  readonly prevSynctex: string
+  /** Persisted PDF of the revision that preceded the current one. */
+  readonly basePdf: string
+  /**
+   * Persisted sync map for {@link basePdf}.
+   *
+   * The basename must pair with `basePdf`: `synctex view -o main.prev.pdf` looks
+   * for `main.prev.synctex.gz` and would silently find `main.synctex.gz`
+   * otherwise, mapping old lines onto the new document.
+   */
+  readonly baseSynctex: string
 }
 
 /** Number of stdout/stderr lines kept for the UI. */
@@ -60,6 +75,9 @@ export function compilePaths(rootFile: string, outDir: string): CompilePaths {
     prev: join(outDir, `${stem}.pdf.prev`),
     log: join(outDir, `${stem}.log`),
     synctex: join(outDir, `${stem}.synctex.gz`),
+    prevSynctex: join(outDir, `${stem}.synctex.gz.prev`),
+    basePdf: join(outDir, `${stem}.prev.pdf`),
+    baseSynctex: join(outDir, `${stem}.prev.synctex.gz`),
   }
 }
 
@@ -148,7 +166,13 @@ export class CompileService {
     await mkdir(dirname(this.opts.rootFile), { recursive: true }).catch(() => undefined)
 
     const hadPdf = await exists(paths.pdf)
+    const hadSynctex = await exists(paths.synctex)
     if (hadPdf) await copyFile(paths.pdf, paths.prev).catch(() => undefined)
+    // The sync map is part of the artefact pair: restoring only the PDF after a
+    // failure would leave the new map describing a document that is no longer
+    // on screen, and every reverse jump would land on the wrong line.
+    if (hadSynctex) await copyFile(paths.synctex, paths.prevSynctex).catch(() => undefined)
+    else await removeQuietly(paths.prevSynctex)
     // A stale log would otherwise be parsed as if it belonged to this run.
     await removeQuietly(paths.log)
 
@@ -166,9 +190,17 @@ export class CompileService {
     let rolledBack = false
 
     if (ok) {
-      await removeQuietly(paths.prev)
+      // Promote the pre-compile copies into the previous-revision pair. A rename
+      // keeps this free; the copy fallback only exists for cross-device mounts.
+      await this.promote(paths.prev, paths.basePdf)
+      if (hadSynctex) await this.promote(paths.prevSynctex, paths.baseSynctex)
+      // No map for this revision means no honest answer for old line numbers:
+      // drop any leftover rather than pairing an older map with a newer PDF.
+      else await removeQuietly(paths.baseSynctex)
     } else if (hadPdf) {
       rolledBack = await this.restore(paths.prev, paths.pdf)
+      if (hadSynctex) await this.restore(paths.prevSynctex, paths.synctex)
+      else await removeQuietly(paths.synctex)
     }
 
     if (!ok && diagnostics.length === 0) {
@@ -195,6 +227,20 @@ export class CompileService {
       stdoutTail: tail(stdout),
       stderrTail: tail(stderr),
       rolledBack,
+    }
+  }
+
+  /**
+   * Move a backup into place, falling back to copy-then-delete.
+   * @param from - the backup path.
+   * @param to - destination (overwritten).
+   */
+  private async promote(from: string, to: string): Promise<void> {
+    try {
+      await rename(from, to)
+    } catch {
+      await copyFile(from, to).catch(() => undefined)
+      await removeQuietly(from)
     }
   }
 

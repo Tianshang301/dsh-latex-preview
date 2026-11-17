@@ -41,7 +41,7 @@ export interface PreviewHost {
   diff(): Promise<readonly DiffBlock[]>
   diffRegions(): Promise<DiffRegions>
   diffDoc(): Promise<DiffDocResult>
-  accept(): PreviewState
+  accept(): Promise<PreviewState>
   revert(): Promise<PreviewState>
   jumpToPdf(request: { line: number; file?: string }): Promise<readonly SyncViewHit[]>
   jumpToSource(request: { page: number; x: number; y: number }): Promise<readonly SyncEditHit[]>

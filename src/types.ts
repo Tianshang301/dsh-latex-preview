@@ -58,6 +58,19 @@ export interface PreviewState {
    * again whenever the underlying revision moves (accept/revert/new compile).
    */
   readonly diffDocUrl: string | null
+  /**
+   * Same-origin URL of the PDF that produced the diff baseline, when its
+   * artefacts are still paired with a matching `.synctex.gz`.
+   *
+   * Null on the first compile, after a revert, and whenever the baseline is a
+   * revision this process did not compile — the UI must then say "旧版定位数据
+   * 不可用" instead of drawing deleted hunks at guessed coordinates.
+   */
+  readonly basePdfUrl: string | null
+  /** Viewer-wrapped {@link basePdfUrl}; null when the assets are not built. */
+  readonly baseViewerUrl: string | null
+  /** Short digest of the baseline source, to prove a snapshot belongs to it. */
+  readonly baseRevisionId: string | null
   /** Duration of the last compile in milliseconds. */
   readonly durationMs: number | null
   /** Candidate root files when resolution was ambiguous. */

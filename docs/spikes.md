@@ -26,6 +26,7 @@
 | **B17** | PDF 上的 diff 高亮 | 源码 hunk → `synctex view` → 每行色带（百分比定位）；顶边是 `v - H` 不是 `y`；删除只画接缝，锚定前一行底部 | 已实现并真机验证（覆盖率 0.82–0.88，删除接缝位置正确） |
 | **B18** | 改动审核三档 | 手动=等接受；自动=派独立一次性模型调用审，否决即回滚；放开=不设闸门。路由取自 `requestHeader`，缺失时回落默认模型 | 已实现并真机验证（真实调用通过一次、否决并回滚一次） |
 | **B19** | 覆盖层渲染三坑 | 绘制要代次+每页令牌+原子替换；`multiply` 混合模式会随底图变色，删；接缝按行高缩放；CSS 也要 `?v=` | 已修并真机验证（40 次快速缩放后每页仍只有 1 层） |
+| **B20** | 旧版产物成对与基线 | 旧 PDF + 旧 SyncTeX 必须同名配对（CLI 按 basename 找）；失败要成对回滚；只在基线推进时采纳，否则丢弃 | 已实现并真机验证（失败前后 sha 与反查结果一致） |
 
 ---
 
@@ -686,6 +687,70 @@ seamPx  = clamp(2, 8, linePx * 0.55)
 - **`annotationMode: 0` 保持不变**：注释层是有意关闭的，预览是只读的。若将来「批注消失」被当成渲染 bug，先看这里。
 - **旋转页面没有处理**：`getViewport()` 会应用 `/Rotate`，而 SyncTeX 的盒子是未旋转的 PDF 坐标，两者在非零旋转下不能直接按宽高比换算。LaTeX 常规输出不旋转页面，所以先记为边界而不是盲改——要支持必须用真实旋转 fixture 验证。
 - **没有加 `test/visual/` 视觉回归**：外部评审建议了一套浏览器 × DPR × 页面尺寸矩阵，这里暂不引入——它需要真实的 Chromium 矩阵和像素基线，维护成本高于当前的收益。真机手工验证记录在上一节。
+
+---
+
+## B20 · 旧版产物必须与「基线」成对，而不是与「上一次编译」成对
+
+**目标**：为「在旧版 PDF 上显示被删除内容」准备可信的地基——一对**同源**的旧 PDF + 旧 SyncTeX，且必须属于 diff 真正使用的基线。
+
+**先证明配对规则**：`synctex view -o <pdf>` 是按 **basename** 找同名 `.synctex.gz` 的，不会去别处凑。实测把当前的 `main.synctex.gz` 暂时藏起来后，`synctex view -o main.prev.pdf` 仍然命中 `Page:1`——它读的是 `main.prev.synctex.gz`。所以旧版必须成对命名：
+
+```
+main.pdf                main.prev.pdf
+main.synctex.gz         main.prev.synctex.gz
+```
+
+名字不配（`main.prev.pdf` + `main.synctex.gz`）不会报错，只会把旧行号映射到新文档上。
+
+### 两类副本，职责不同
+
+| 文件 | 用途 | 生命周期 |
+|---|---|---|
+| `main.pdf.prev` / `main.synctex.gz.prev` | 编译失败时回滚 | 瞬态：失败即被 restore 消费，成功则提升 |
+| `main.prev.pdf` / `main.prev.synctex.gz` | 基线的旧版产物，供旧版视图定位 | 持久：直到基线换了主人 |
+
+### 失败必须成对回滚（这是修掉的现存 bug）
+
+原来只备份/还原 PDF，`.synctex.gz` 每次被 tectonic 覆盖：编译失败后屏幕上是旧 PDF，定位表却可能是新一次编译的，于是**双击反查会落到错误行且不报错**。现在两份一起备份、一起还原。
+
+实测（真实 tectonic）：故意写 `\undefinedmacro` 触发失败，失败前后 `main.pdf` 与 `main.synctex.gz` 的 sha256 完全一致，且 `synctex view -i 5:0` 的返回值（`Page:1 x:165.268341`）不变。
+
+### 采纳/丢弃：不能在编译层决定
+
+「上一版」是哪一版取决于审核模式：手动模式下编译成功但没点接受，基线**不该**动。所以 `compile.ts` 只负责产出候选对，由服务决定它算不算基线：
+
+```ts
+// runCompile: before = 本次编译前屏幕上那一版
+await this.adoptBaseArtifacts(before)
+// adopt: previousSource === before 才认，否则删除这对文件
+```
+
+基线追上来时（接受 / 自动审核通过 / 回滚）直接**从当前产物复制**，不必二次编译：
+
+```ts
+previousSource = compiledSource
+await this.snapshotBaseFromCurrent()
+```
+
+`baseRevisionId` 是基线源码的 sha1 前 12 位，写在状态里；任何用到旧行号的地方都应先比对它，而不是相信磁盘上恰好有个 `prev` 文件。
+
+### 验证矩阵（真机，open / manual 两种模式）
+
+| 场景 | 期望 | 实测 |
+|---|---|---|
+| 全新 outDir 首次编译 | 无旧版产物，`baseRevisionId` 为 null | null ✔ |
+| open 模式连续两次成功编译 | 旧版对描述第一版 | `baseRevisionId` 有值，`main.prev.pdf` 仅比 `main.pdf` 早一次编译 ✔ |
+| manual 模式：编译后待审 | 旧版对 = 基线（未含待审改动） | 采纳，`previousSource` 与产物同源 ✔ |
+| manual 模式：连续三次编译仍待审 | 基线落后于候选对 → 丢弃 | 第二次起 `baseRevisionId` 变 null ✔ |
+| 点「接受」 | 基线 = 当前，产物从磁盘复制 | `baseRevisionId` 变为当前内容摘要 ✔ |
+| 编译失败 | PDF 与 synctex 一起回滚，基线不动 | sha 与反查结果均不变，`baseRevisionId` 不变 ✔ |
+
+### 已知边界
+
+- `configure()` 会重建 compile/watcher 并把 `previousSource`/`compiledSource` 重置为当前文件内容——也就是说**切换审核模式会顺手把当前内容认成基线**。这是既有行为，本轮未改；首次切换后看到「旧版对突然对上了」不是 bug。
+- 基线只在内存里。进程重启后 `previousSource` 为 null，下一次编译会把磁盘上的孤儿对删掉（`adopt(null)`），因此不会出现「配上了但没有基线」的假象。
+- 旧版视图（下一步）必须只读：旧行号属于旧源码，拿去 `edit-at` 会改错行。
 
 ---
 
