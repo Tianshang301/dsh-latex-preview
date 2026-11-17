@@ -21,12 +21,22 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { basename, dirname, join } from 'node:path'
-import { copyFile, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { checkBinaries } from '../utils/binaries.ts'
 import { isRootCandidate, listTexFiles, resolveRoot, type RootResolution } from '../utils/root.ts'
 import { synctexEdit, synctexView } from '../utils/synctex.ts'
-import { CompileService, compilePaths } from './compile.ts'
+import { CompileService, compilePaths, type CompilePaths } from './compile.ts'
+import { ArtifactStore } from './artifacts.ts'
+import {
+  acceptCurrent,
+  advanceRevisions,
+  diffBaseFor,
+  hasPendingChanges,
+  parseDiffSide,
+  initialRevisions,
+  type Revisions,
+} from './revisions.ts'
 import { DiffDocService } from './diffdoc.ts'
 import { FileWatcher } from './watcher.ts'
 import { lineDiff, normalizeLatexLine } from './diff.ts'
@@ -118,24 +128,30 @@ export class LatexPreviewService extends TypertRemoteService {
   /** Profile default model, used when no Session has published a header yet. */
   private defaultModel: { currentSelection?(): { provider?: string; model?: string } } | undefined
   /**
-   * Source of the last **accepted** revision — the left-hand side of every diff.
+   * **Accepted** revision — the left-hand side of the review diff (path A).
    *
-   * Not the same thing as the PDF on disk previously: which revision counts as a
-   * baseline depends on the review mode. `manual` leaves it in place until 接受,
-   * `auto` moves it when the reviewer says yes, `open` moves it on every compile.
-   * So it can lag the `prev` artefact pair by several compiles, and anything that
-   * maps old line numbers must check {@link baseRevisionId} before trusting it.
+   * Moves on 接受, on an approving reviewer, and on every compile while the mode is
+   * `open`. In `manual` it can lag the current revision by several compiles, which
+   * is the point: every change not yet accepted keeps its marks. Its artefacts live
+   * in the `prev` pair, published only when this field moved to them.
    */
-  private previousSource: string | null = null
-  /** Source that produced the PDF currently on screen. */
-  private compiledSource: string | null = null
+  private acceptedSource: string | null = null
   /**
-   * Digest of the source whose artefacts the `prev` pair holds.
+   * Source that produced the **previous successful compile** — the left-hand side of
+   * the change-since-last-save diff (path B).
    *
-   * The pair is written before every compile, but it only becomes a *baseline*
-   * when the baseline moves to that revision. Keeping the digest lets the rest of
-   * the service (and later the base view) refuse to pair a sync map with a
-   * document that did not produce it.
+   * Moves on every compile whose content actually changed, whatever the review mode,
+   * so it is null until a second revision has been compiled. Its artefacts live in
+   * the `recent` pair and are republished on every successful compile.
+   */
+  private previousCompileSource: string | null = null
+  /** **Current** revision: the source the PDF on screen was compiled from. */
+  private currentSource: string | null = null
+  /**
+   * Digest of the source the accepted pair claims to describe.
+   *
+   * Mirrors `manifest.revisionId` of the `prev` pair. Everything that maps old line
+   * numbers checks it before trusting the pair (docs/spikes.md §B23).
    */
   private baseRevisionId: string | null = null
   private outDir: string
@@ -192,6 +208,9 @@ export class LatexPreviewService extends TypertRemoteService {
       basePdfUrl: null,
       baseViewerUrl: null,
       baseRevisionId: null,
+      recentPdfUrl: null,
+      recentViewerUrl: null,
+      recentRevisionId: null,
       durationMs: null,
       rootCandidates: [],
     }
@@ -315,11 +334,14 @@ export class LatexPreviewService extends TypertRemoteService {
       firstRunTimeoutMs: DEFAULT_FIRST_RUN_TIMEOUT_MS,
     })
     const initial = await this.readSource(rootFile)
-    this.previousSource = initial
-    this.compiledSource = initial
-    // A different root (or outDir) means any `prev` pair belongs to another
-    // document; keeping it would let a sync map outlive the file it described.
-    this.baseRevisionId = null
+    // A fresh configure starts from "what is on disk is the accepted revision and
+    // the current one"; the previous-compile revision is unknown until we compile.
+    this.acceptedSource = initial
+    this.currentSource = initial
+    this.previousCompileSource = null
+    // A different root (or outDir) means any pair belongs to another document;
+    // restoreArtifacts() keeps a pair only when its manifest names this source.
+    await this.restoreArtifacts()
 
     await this.stopWatching()
     this.watcher = new FileWatcher({
@@ -342,6 +364,9 @@ export class LatexPreviewService extends TypertRemoteService {
       basePdfUrl: null,
       baseViewerUrl: null,
       baseRevisionId: null,
+      recentPdfUrl: null,
+      recentViewerUrl: null,
+      recentRevisionId: null,
     })
 
     // First view of a workspace has no PDF yet; without this the panel stays
@@ -377,19 +402,26 @@ export class LatexPreviewService extends TypertRemoteService {
 
   /** Diff body shared by the Remote method and the HTTP API. */
   private async readDiff(): Promise<readonly DiffBlock[]> {
-    const head = this.compiledSource
-    if (this.previousSource === null || head === null) return []
-    return lineDiff(this.previousSource, head)
+    const head = this.currentSource
+    const base = diffBaseFor(this.revisions(), 'new')
+    if (base === null || head === null) return []
+    return lineDiff(base, head)
   }
 
   /**
-   * Rectangles for the changes since the previous compile.
+   * Rectangles for one side of a change.
    *
-   * Two sides, because a change has two halves and only one of them is on screen
-   * at a time: `new` marks the live PDF (deletions can only be a seam there),
-   * `base` marks the previous revision, where the deleted text *is* typeset and
-   * therefore gets a real box out of the old `.synctex.gz`. The panel fetches
-   * whichever one it is showing.
+   * Three sides, because the plugin keeps three revisions and two of them can be
+   * shown next to what is on screen:
+   *
+   * | side      | left-hand side      | document drawn on        | answers                     |
+   * |-----------|---------------------|--------------------------|-----------------------------|
+   * | `new`     | accepted            | the live PDF             | what needs accepting        |
+   * | `base`    | accepted            | the accepted pair        | where the removed text was  |
+   * | `compile` | previous compile    | the recent pair          | what the last save changed  |
+   *
+   * `new` and `base` are the same comparison drawn on two documents (path A); a
+   * deletion can only be a seam on the first and a real band on the second.
    * @param request.side - which revision to describe; defaults to `new`.
    * @param signal - client cancellation.
    * @returns regions tagged with the state version they were computed for.
@@ -397,35 +429,51 @@ export class LatexPreviewService extends TypertRemoteService {
   @Remote
   async getDiffRegions(request: { side?: DiffSide }, signal: AbortSignal): Promise<DiffRegions> {
     signal.throwIfAborted()
-    return this.readDiffRegions(request?.side === 'base' ? 'base' : 'new')
+    return this.readDiffRegions(parseDiffSide(request?.side))
   }
 
-  /** Body shared by the Remote method and the HTTP API. */
+  /**
+   * Body shared by the Remote method and the HTTP API.
+   * @param side - which document to describe.
+   * @returns regions, with a message instead of bands when that side cannot be shown.
+   */
   private async readDiffRegions(side: DiffSide = 'new'): Promise<DiffRegions> {
     const version = this.state.version
     const empty: DiffRegions = { version, side, regions: [], skipped: 0 }
     const rootFile = this.state.rootFile
-    const base = this.previousSource
-    const head = this.compiledSource
-    if (!rootFile || base === null || head === null) return empty
+    const head = this.currentSource
+    if (!rootFile || head === null) return empty
+    const stores = this.artifactPathsNow()
+    if (!stores) return empty
 
-    const hunks = diffHunks(lineDiff(base, head))
+    // Path B compares against the previous compile, path A against the accepted
+    // revision; everything else (documents, manifests) follows from that choice.
+    const left = diffBaseFor(this.revisions(), side)
+    if (left === null) {
+      return side === 'new' ? empty : { ...empty, message: '还没有上一版可供对照' }
+    }
+    const hunks = diffHunks(lineDiff(left, head))
     if (hunks.length === 0) {
-      return side === 'base' ? { ...empty, message: '两版内容一致，旧版没有可标的地方' } : empty
-    }
-    const paths = compilePaths(rootFile, this.outDir)
-
-    if (side === 'base') {
-      // The pair is only usable as a map of the *baseline*: check the digest
-      // rather than trust that the files on disk still describe `previousSource`.
-      if (this.baseRevisionId === null || !this.state.basePdfUrl || this.baseRevisionId !== this.digestOf(base)) {
-        return { ...empty, message: '旧版 PDF 与其 SyncTeX 未成对，无法定位被删除的内容' }
-      }
-      return this.baseRegions(version, rootFile, paths.basePdf, hunks, base)
+      return side === 'new' ? empty : { ...empty, message: '两版内容一致，没有可标的地方' }
     }
 
-    if (!this.state.pdfUrl) return empty
-    return this.newRegions(version, rootFile, paths.pdf, hunks, head)
+    if (side === 'new') {
+      if (!this.state.pdfUrl) return empty
+      return this.newRegions(version, rootFile, stores.paths.pdf, hunks, head)
+    }
+
+    // Both other sides need a *verified* pair: the manifest must exist, both files
+    // must still hash to what it records, and it must name the revision we just
+    // diffed against. Anything less and the line numbers would point at a document
+    // that is not on screen (docs/spikes.md §B23).
+    const store = side === 'base' ? stores.accepted : stores.recent
+    const pdf = side === 'base' ? stores.paths.basePdf : stores.paths.recentPdf
+    const manifest = await store.verify()
+    if (!manifest || manifest.revisionId !== this.digestOf(left)) {
+      await (side === 'base' ? this.dropBaseArtifacts() : this.dropRecentArtifacts())
+      return { ...empty, message: '旧版 PDF 与其 SyncTeX 未能成对校验，无法定位被删除的内容' }
+    }
+    return this.baseRegions(version, rootFile, pdf, hunks, left)
   }
 
   /**
@@ -627,8 +675,8 @@ export class LatexPreviewService extends TypertRemoteService {
   /** Shared diff-document body: the Remote method and the HTTP API land here. */
   private async applyDiffDoc(): Promise<DiffDocResult> {
     const rootFile = this.state.rootFile
-    const base = this.previousSource
-    const head = this.compiledSource
+    const base = this.acceptedSource
+    const head = this.currentSource
     if (!rootFile || !this.diffDoc || base === null || head === null) {
       return { ok: false, url: this.state.diffDocUrl, message: '尚未配置主文件，无法生成对比视图', version: this.state.version }
     }
@@ -667,10 +715,10 @@ export class LatexPreviewService extends TypertRemoteService {
 
   /** Shared acceptance body. */
   private async applyAccept(): Promise<PreviewState> {
-    if (!this.hasPendingChanges()) {
+    if (!hasPendingChanges(this.revisions())) {
       throw new RemoteError('latex-preview/nothing-to-review', '没有待审核的改动', {})
     }
-    this.previousSource = this.compiledSource
+    this.acceptedSource = this.currentSource
     // The revision being accepted is the one on screen, so its artifacts can be
     // copied straight from disk — no second compile, and the pair now belongs to
     // the baseline the diff will use.
@@ -696,15 +744,15 @@ export class LatexPreviewService extends TypertRemoteService {
   /** Shared revert body. */
   private async applyRevert(): Promise<PreviewState> {
     const rootFile = this.state.rootFile
-    const target = this.previousSource
-    if (!rootFile || target === null || !this.hasPendingChanges()) {
+    const target = this.acceptedSource
+    if (!rootFile || target === null || !hasPendingChanges(this.revisions())) {
       throw new RemoteError('latex-preview/nothing-to-review', '没有可撤回的改动', {})
     }
 
     await writeFile(rootFile, target, 'utf8')
     // Line both snapshots up *before* compiling: otherwise the compile sees the
     // reverted file as a brand-new change and paints the rollback as a diff.
-    this.compiledSource = target
+    this.currentSource = target
     let result: CompileResult
     try {
       result = await this.runCompile()
@@ -734,8 +782,8 @@ export class LatexPreviewService extends TypertRemoteService {
    * passing the change through.
    */
   private async queueReview(): Promise<void> {
-    const target = this.compiledSource
-    const base = this.previousSource
+    const target = this.currentSource
+    const base = this.acceptedSource
     if (this.reviewing || target === null || base === null || target === base) return
 
     this.reviewing = true
@@ -744,14 +792,14 @@ export class LatexPreviewService extends TypertRemoteService {
       const verdict = await this.runReview(base, target)
       // Another compile landed while the reviewer was thinking; that change gets
       // its own review, and applying this verdict to it would be wrong.
-      if (this.compiledSource !== target) return
+      if (this.currentSource !== target) return
 
       if (verdict.verdict === 'unavailable') {
         this.patch({ message: `自动审核不可用（${verdict.reason}），已转手动：请点「接受」或「撤销」` })
         return
       }
       if (verdict.verdict === 'accept') {
-        this.previousSource = target
+        this.acceptedSource = target
         // Same reason as 接受: the approved revision is the one on screen.
         await this.snapshotBaseFromCurrent()
         this.patch({ message: `自动审核通过：${verdict.reason}`, diffDocUrl: null })
@@ -831,6 +879,18 @@ export class LatexPreviewService extends TypertRemoteService {
     return null
   }
 
+  /** The three snapshots as one value, for the pure revision rules. */
+  private revisions(): Revisions {
+    return { accepted: this.acceptedSource, previousCompile: this.previousCompileSource, current: this.currentSource }
+  }
+
+  /** Adopt a revision set produced by `revisions.ts`. */
+  private applyRevisions(next: Revisions): void {
+    this.acceptedSource = next.accepted
+    this.previousCompileSource = next.previousCompile
+    this.currentSource = next.current
+  }
+
   /**
    * Short digest identifying a source revision.
    * @param source - full source text.
@@ -840,95 +900,183 @@ export class LatexPreviewService extends TypertRemoteService {
     return createHash('sha1').update(source).digest('hex').slice(0, 12)
   }
 
-  /** Whether a path exists, without throwing. */
-  private async fileExists(path: string): Promise<boolean> {
-    try {
-      await stat(path)
-      return true
-    } catch {
-      return false
+  /**
+   * Paths of both revision pairs, or null before a root file is known.
+   * @returns `{ accepted, recent }` stores plus the live compile paths.
+   */
+  private artifactPathsNow(): { paths: CompilePaths; accepted: ArtifactStore; recent: ArtifactStore } | null {
+    const rootFile = this.state.rootFile
+    if (!rootFile) return null
+    const paths = compilePaths(rootFile, this.outDir)
+    return {
+      paths,
+      accepted: new ArtifactStore({ pdf: paths.basePdf, synctex: paths.baseSynctex, manifest: paths.baseManifest }),
+      recent: new ArtifactStore({ pdf: paths.recentPdf, synctex: paths.recentSynctex, manifest: paths.recentManifest }),
     }
   }
 
   /**
-   * Decide what the `prev` artefact pair means after a successful compile.
+   * Publish the pair that describes the **previous compile** (diff path B).
    *
-   * The pair was written before this compile, so it describes `expected` — the
-   * revision that was on screen. It is a usable baseline only when the baseline
-   * actually moved to it (`open`, or a redundant compile); in `manual`/`auto`
-   * pending review it describes a revision the baseline does not point at, and
-   * keeping it would pair deleted line numbers with the wrong document.
-   * @param expected - source that produced the artefacts in the pair.
+   * Every successful compile overwrites the pre-compile copies, so this runs on
+   * every successful run and always describes `before` — the revision that was on
+   * screen a moment ago. It is not gated by the review mode: "what did this save
+   * change" is a question about the compiler, not about approval.
+   * @param before - source that produced the artefacts now sitting in `prev`.
+   */
+  private async publishCompileArtifacts(before: string | null): Promise<void> {
+    const stores = this.artifactPathsNow()
+    if (!stores) return
+    if (before === null) {
+      await this.dropRecentArtifacts()
+      return
+    }
+    const id = this.digestOf(before)
+    const ok = await stores.recent.publish({
+      revisionId: id,
+      pdf: stores.paths.prev,
+      synctex: stores.paths.prevSynctex,
+    })
+    if (!ok) {
+      await this.dropRecentArtifacts()
+      return
+    }
+    this.publishRecentUrls(id)
+  }
+
+  /**
+   * Keep the accepted pair honest after a compile (diff path A).
+   *
+   * Two cases, and they are not the same question:
+   *
+   * - The accepted revision **moved to** what this compile replaced (`open`, or a
+   *   redundant compile): publish those bytes as the new pair.
+   * - It did not (`manual`/`auto` with a pending change): the pair already on disk
+   *   still describes the accepted revision, because compiles no longer overwrite
+   *   it. Keep it — dropping it would take away the one document where the removed
+   *   text is still typeset, which is the whole point of the base view.
+   *
+   * The pair is dropped only when it can no longer prove what it claims.
+   * @param expected - source that produced the artefacts in the `prev` copies.
    */
   private async adoptBaseArtifacts(expected: string | null): Promise<void> {
-    const rootFile = this.state.rootFile
-    if (!rootFile) return
-    const paths = compilePaths(rootFile, this.outDir)
-    const paired = (await this.fileExists(paths.basePdf)) && (await this.fileExists(paths.baseSynctex))
-    if (!paired || expected === null || this.previousSource !== expected) {
+    const stores = this.artifactPathsNow()
+    const accepted = this.acceptedSource
+    if (!stores || accepted === null) {
       await this.dropBaseArtifacts()
       return
     }
-    this.baseRevisionId = this.digestOf(expected)
-    this.publishBaseUrls()
+    const id = this.digestOf(accepted)
+
+    if (expected !== null && accepted === expected) {
+      const ok = await stores.accepted.publish({
+        revisionId: id,
+        pdf: stores.paths.prev,
+        synctex: stores.paths.prevSynctex,
+      })
+      if (!ok) {
+        await this.dropBaseArtifacts()
+        return
+      }
+      this.publishBaseUrls(id)
+      return
+    }
+
+    const manifest = await stores.accepted.verify()
+    if (manifest && manifest.revisionId === id) this.publishBaseUrls(id)
+    else await this.dropBaseArtifacts()
   }
 
   /**
-   * Replace the pair with the artefacts currently on screen.
+   * Replace the accepted pair with the artefacts currently on screen.
    *
    * Used when the baseline catches up with what is displayed (接受, auto approval,
-   * revert): at that moment the current PDF *is* the baseline, so it can be
-   * copied without a second compile.
+   * revert): at that moment the current PDF *is* the baseline, so it can be copied
+   * without a second compile — and committed with a manifest, so a later reader can
+   * prove the pair still belongs to it.
    */
   private async snapshotBaseFromCurrent(): Promise<void> {
-    const rootFile = this.state.rootFile
-    const source = this.previousSource
-    if (!rootFile || source === null) {
+    const stores = this.artifactPathsNow()
+    const source = this.acceptedSource
+    if (!stores || source === null) {
       await this.dropBaseArtifacts()
       return
     }
-    const paths = compilePaths(rootFile, this.outDir)
-    if (!(await this.fileExists(paths.pdf)) || !(await this.fileExists(paths.synctex))) {
+    const id = this.digestOf(source)
+    const ok = await stores.accepted.publish({ revisionId: id, pdf: stores.paths.pdf, synctex: stores.paths.synctex })
+    if (!ok) {
       await this.dropBaseArtifacts()
       return
     }
-    await copyFile(paths.pdf, paths.basePdf).catch(() => undefined)
-    await copyFile(paths.synctex, paths.baseSynctex).catch(() => undefined)
-    this.baseRevisionId = this.digestOf(source)
-    this.publishBaseUrls()
+    this.publishBaseUrls(id)
   }
 
-  /** Forget the pair: its revision can no longer be mapped honestly. */
+  /** Forget the accepted pair: its revision can no longer be mapped honestly. */
   private async dropBaseArtifacts(): Promise<void> {
-    const rootFile = this.state.rootFile
-    if (rootFile) {
-      const paths = compilePaths(rootFile, this.outDir)
-      await rm(paths.basePdf, { force: true }).catch(() => undefined)
-      await rm(paths.baseSynctex, { force: true }).catch(() => undefined)
-    }
-    this.baseRevisionId = null
+    const stores = this.artifactPathsNow()
+    if (stores) await stores.accepted.drop()
     this.patch({ basePdfUrl: null, baseViewerUrl: null, baseRevisionId: null })
   }
 
-  /** Mirror the current pair into the state as URLs the panel can use. */
-  private publishBaseUrls(): void {
-    const rootFile = this.state.rootFile
-    const id = this.baseRevisionId
-    if (!rootFile || id === null) return
-    const name = basename(compilePaths(rootFile, this.outDir).basePdf)
-    const route = `${ROUTE_PREFIX}/pdf/${encodeURIComponent(name)}`
-    this.patch({
-      basePdfUrl: `${route}?v=${id}`,
-      baseViewerUrl: viewerAvailable()
-        ? `${ROUTE_PREFIX}${VIEWER_PATH}?file=${encodeURIComponent(route)}&v=${id}`
-        : null,
-      baseRevisionId: id,
-    })
+  /** Forget the previous-compile pair. */
+  private async dropRecentArtifacts(): Promise<void> {
+    const stores = this.artifactPathsNow()
+    if (stores) await stores.recent.drop()
+    this.patch({ recentPdfUrl: null, recentViewerUrl: null, recentRevisionId: null })
   }
 
-  /** Whether the PDF differs from the last accepted revision. */
-  private hasPendingChanges(): boolean {
-    return this.compiledSource !== null && this.previousSource !== null && this.compiledSource !== this.previousSource
+  /** Mirror a published pair into the state as URLs the panel can use. */
+  private publishBaseUrls(id: string): void {
+    this.patch(this.urlsFor(id, 'base'))
+  }
+
+  /** Mirror the previous-compile pair into the state. */
+  private publishRecentUrls(id: string): void {
+    this.patch(this.urlsFor(id, 'recent'))
+  }
+
+  /**
+   * Build the state patch for one published pair.
+   * @param id - revision digest, used as the cache-busting version.
+   * @param tag - which pair; selects the field names and the file name.
+   * @returns the fields to patch.
+   */
+  private urlsFor(id: string, tag: 'base' | 'recent'): Partial<PreviewState> {
+    const stores = this.artifactPathsNow()
+    const file = tag === 'base' ? stores?.paths.basePdf : stores?.paths.recentPdf
+    if (!file) return {}
+    const route = `${ROUTE_PREFIX}/pdf/${encodeURIComponent(basename(file))}`
+    const viewer = viewerAvailable()
+      ? `${ROUTE_PREFIX}${VIEWER_PATH}?file=${encodeURIComponent(route)}&v=${id}`
+      : null
+    return tag === 'base'
+      ? { basePdfUrl: `${route}?v=${id}`, baseViewerUrl: viewer, baseRevisionId: id }
+      : { recentPdfUrl: `${route}?v=${id}`, recentViewerUrl: viewer, recentRevisionId: id }
+  }
+
+  /**
+   * Re-establish what the artefacts on disk are allowed to claim, at configure time.
+   *
+   * A manifest survives a restart, so a pair can be picked up again — but only when
+   * its recorded `revisionId` is the digest of the source we just adopted. Anything
+   * else is dropped rather than shown against line numbers it does not describe.
+   */
+  private async restoreArtifacts(): Promise<void> {
+    const stores = this.artifactPathsNow()
+    const source = this.acceptedSource
+    if (!stores || source === null) {
+      await this.dropBaseArtifacts()
+      await this.dropRecentArtifacts()
+      return
+    }
+    const digest = this.digestOf(source)
+    const accepted = await stores.accepted.verify()
+    if (accepted && accepted.revisionId === digest) this.publishBaseUrls(digest)
+    else await this.dropBaseArtifacts()
+
+    // A previous-compile pair cannot be re-adopted: which revision it holds is only
+    // known in memory, and guessing would be exactly the pairing error this guards.
+    await this.dropRecentArtifacts()
   }
 
   /**
@@ -1188,7 +1336,7 @@ export class LatexPreviewService extends TypertRemoteService {
     }
 
     // What the artifacts on disk describe *before* this compile overwrites them.
-    const before = this.compiledSource
+    const before = this.currentSource
     this.patch({ status: 'compiling', message: '正在编译…' })
     let result: CompileResult
     try {
@@ -1217,19 +1365,28 @@ export class LatexPreviewService extends TypertRemoteService {
       // Advance only when the content actually moved. A redundant compile (the
       // user pressing 编译 twice) must not erase the marks they are looking at,
       // and a failed compile keeps the old PDF, so its baseline stays.
-      if (compiled !== this.compiledSource) {
-        // Only `open` advances the reference here. `manual` waits for 接受; `auto`
-        // waits for the reviewer, and moves it itself once the verdict is in.
-        if (this.review === 'open') this.previousSource = this.compiledSource ?? compiled
-        this.compiledSource = compiled
+      // One pure rule decides what moves: the accepted revision only where the mode
+      // allows it, the previous compile always (services/revisions.ts).
+      const advanced = compiled === null ? null : advanceRevisions(this.revisions(), compiled, this.review)
+      if (advanced?.changed) {
+        this.applyRevisions(advanced.revisions)
         contentChanged = true
         if (this.review === 'auto') void this.queueReview()
       }
     }
 
-    // A failed compile leaves the pair untouched: the baseline did not move, so
-    // whatever was valid before is still valid.
-    if (result.ok) await this.adoptBaseArtifacts(before)
+    // A failed compile leaves both pairs untouched: nothing moved, so whatever was
+    // valid before is still valid. On success the two pairs are published from the
+    // pre-compile copies, each gated by which revision it actually describes.
+    if (result.ok) {
+      await this.publishCompileArtifacts(before)
+      await this.adoptBaseArtifacts(before)
+    } else if (result.rollbackIncomplete) {
+      // The PDF on screen and the sync map behind it may now disagree, so neither
+      // old-revision view can be trusted for this state.
+      await this.dropBaseArtifacts()
+      await this.dropRecentArtifacts()
+    }
 
     this.patch({
       status: result.ok ? 'ok' : 'failed',
@@ -1286,7 +1443,7 @@ export class LatexPreviewService extends TypertRemoteService {
       configure: (request) => this.applyConfigure(request),
       compile: () => this.runCompile(),
       diff: () => this.readDiff(),
-      diffRegions: (request) => this.readDiffRegions(request.side === 'base' ? 'base' : 'new'),
+      diffRegions: (request) => this.readDiffRegions(parseDiffSide(request.side)),
       diffDoc: () => this.applyDiffDoc(),
       accept: () => this.applyAccept(),
       revert: () => this.applyRevert(),

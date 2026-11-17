@@ -11,10 +11,14 @@
  *    failure and triggers rollback.
  * 3. **Rollback** — the PDF *and its `.synctex.gz`* are copied aside before
  *    compiling. On failure both are restored, so a broken edit neither blanks
- *    the preview nor leaves a new sync map pointing at an old PDF. On success
- *    the copies are promoted into the `prev` pair, which is the only thing a
- *    later step may use to look up lines in the previous revision (their names
- *    must pair: `main.prev.pdf` ↔ `main.prev.synctex.gz`).
+ *    the preview nor leaves a new sync map pointing at an old PDF; when only one
+ *    half can be restored the result says so (`rollbackIncomplete`) instead of
+ *    reporting a clean rollback. A first compile that fails has nothing to
+ *    restore to, so its partial output is removed rather than shown.
+ *
+ * The pre-compile copies are left in place on success: publishing them as a
+ * revision is the service's call, because only it knows which revision they
+ * describe and may therefore commit a manifest (see `artifacts.ts`).
  *
  * @module dsh-latex-preview/services/compile
  */
@@ -24,6 +28,7 @@ import { copyFile, mkdir, readFile, rename, stat, unlink } from 'node:fs/promise
 import { basename, dirname, join } from 'node:path'
 import type { CompileResult, LatexDiagnostic } from '../types.ts'
 import { parseLatexLog } from '../utils/log-parser.ts'
+import { artifactPaths } from './artifacts.ts'
 
 /** Everything a run needs; the service owns the mutable copy. */
 export interface CompileOptions {
@@ -37,6 +42,22 @@ export interface CompileOptions {
   readonly firstRunTimeoutMs: number
   /** Executable name or absolute path. */
   readonly tectonic?: string
+  /**
+   * Replacement for the real process, used by the rollback tests.
+   *
+   * Injecting the *outcome* (instead of a fake binary) is what lets a test reproduce
+   * a compile that exits non-zero while leaving a partial PDF behind, or one that
+   * deletes its own backup — neither of which a real Tectonic run will do on cue.
+   */
+  readonly run?: (timeoutMs: number) => Promise<CompileRun>
+}
+
+/** What one process run reports back, regardless of who produced it. */
+export interface CompileRun {
+  readonly code: number | null
+  readonly stdout: string
+  readonly stderr: string
+  readonly timedOut: boolean
 }
 
 /** Where a compile's output lives, derived from options. */
@@ -47,6 +68,14 @@ export interface CompilePaths {
   readonly synctex: string
   /** Transient copy of `synctex`, restored with `prev` on failure. */
   readonly prevSynctex: string
+  /** Manifest that commits {@link basePdf} + {@link baseSynctex} as one pair. */
+  readonly baseManifest: string
+  /** Persisted PDF of the **previous compile** (every successful run moves it). */
+  readonly recentPdf: string
+  /** Sync map for {@link recentPdf}; same basename pairing rule as the base pair. */
+  readonly recentSynctex: string
+  /** Manifest that commits {@link recentPdf} + {@link recentSynctex}. */
+  readonly recentManifest: string
   /** Persisted PDF of the revision that preceded the current one. */
   readonly basePdf: string
   /**
@@ -70,14 +99,20 @@ const TAIL_LINES = 20
  */
 export function compilePaths(rootFile: string, outDir: string): CompilePaths {
   const stem = basename(rootFile, '.tex')
+  const accepted = artifactPaths(outDir, stem, 'prev')
+  const recent = artifactPaths(outDir, stem, 'recent')
   return {
     pdf: join(outDir, `${stem}.pdf`),
     prev: join(outDir, `${stem}.pdf.prev`),
     log: join(outDir, `${stem}.log`),
     synctex: join(outDir, `${stem}.synctex.gz`),
     prevSynctex: join(outDir, `${stem}.synctex.gz.prev`),
-    basePdf: join(outDir, `${stem}.prev.pdf`),
-    baseSynctex: join(outDir, `${stem}.prev.synctex.gz`),
+    basePdf: accepted.pdf,
+    baseSynctex: accepted.synctex,
+    baseManifest: accepted.manifest,
+    recentPdf: recent.pdf,
+    recentSynctex: recent.synctex,
+    recentManifest: recent.manifest,
   }
 }
 
@@ -177,7 +212,8 @@ export class CompileService {
     await removeQuietly(paths.log)
 
     const timeout = this.firstRunDone ? this.opts.timeoutMs : this.opts.firstRunTimeoutMs
-    const { code, stdout, stderr, timedOut } = await this.spawnTectonic(timeout)
+    const runner = this.opts.run
+    const { code, stdout, stderr, timedOut } = await (runner ? runner(timeout) : this.spawnTectonic(timeout))
     this.firstRunDone = true
 
     let diagnostics: LatexDiagnostic[] = []
@@ -188,19 +224,27 @@ export class CompileService {
 
     const ok = code === 0 && !timedOut && (await exists(paths.pdf))
     let rolledBack = false
+    let rollbackIncomplete = false
 
     if (ok) {
-      // Promote the pre-compile copies into the previous-revision pair. A rename
-      // keeps this free; the copy fallback only exists for cross-device mounts.
-      await this.promote(paths.prev, paths.basePdf)
-      if (hadSynctex) await this.promote(paths.prevSynctex, paths.baseSynctex)
-      // No map for this revision means no honest answer for old line numbers:
-      // drop any leftover rather than pairing an older map with a newer PDF.
-      else await removeQuietly(paths.baseSynctex)
+      // The pre-compile copies stay where they are: publishing them as a revision
+      // is the service's decision, because only it knows which revision they
+      // describe and whether the manifest may claim them (artifacts.ts).
     } else if (hadPdf) {
-      rolledBack = await this.restore(paths.prev, paths.pdf)
-      if (hadSynctex) await this.restore(paths.prevSynctex, paths.synctex)
+      // Both halves or neither. A restored PDF next to an unrestored (new) sync map
+      // is the exact failure the pair exists to prevent, so a half-done rollback is
+      // reported instead of being rounded up to "rolled back".
+      const pdfRestored = await this.restore(paths.prev, paths.pdf)
+      let syncRestored = true
+      if (hadSynctex) syncRestored = await this.restore(paths.prevSynctex, paths.synctex)
       else await removeQuietly(paths.synctex)
+      rolledBack = pdfRestored && syncRestored
+      rollbackIncomplete = !rolledBack
+    } else {
+      // Nothing to restore to. Whatever the failed run left behind describes a
+      // document that never compiled, so it must not become "the PDF on screen".
+      await removeQuietly(paths.pdf)
+      await removeQuietly(paths.synctex)
     }
 
     if (!ok && diagnostics.length === 0) {
@@ -227,20 +271,7 @@ export class CompileService {
       stdoutTail: tail(stdout),
       stderrTail: tail(stderr),
       rolledBack,
-    }
-  }
-
-  /**
-   * Move a backup into place, falling back to copy-then-delete.
-   * @param from - the backup path.
-   * @param to - destination (overwritten).
-   */
-  private async promote(from: string, to: string): Promise<void> {
-    try {
-      await rename(from, to)
-    } catch {
-      await copyFile(from, to).catch(() => undefined)
-      await removeQuietly(from)
+      rollbackIncomplete,
     }
   }
 

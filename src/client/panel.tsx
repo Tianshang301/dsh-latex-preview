@@ -68,15 +68,17 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
   const [notice, setNotice] = useState<string | null>(null)
   const [working, setWorking] = useState(false)
   const [hits, setHits] = useState<string | null>(null)
-  // Regions for both sides of the change, keyed by which document they describe.
-  // Only the side on screen is fetched: each one costs a `synctex view` sweep.
-  const [diffs, setDiffs] = useState<Record<DiffSide, DiffRegions | null>>({ new: null, base: null })
+  // Regions for every side of the change, keyed by which document they describe.
+  // `new` is always fetched (it drives 接受/撤销 and the count); the other two only
+  // when they are on screen, because each costs a `synctex view` sweep.
+  const [diffs, setDiffs] = useState<Record<DiffSide, DiffRegions | null>>({ new: null, base: null, compile: null })
   const [showDiff, setShowDiff] = useState(true)
   // Reverting writes the source file, so the button arms first and disarms itself.
   const [armRevert, setArmRevert] = useState(false)
-  // Which document the iframe shows: the live PDF, the previous revision (where
-  // deleted text is still typeset), or the latexdiff 对比视图.
-  const [view, setView] = useState<'live' | 'base' | 'diff'>('live')
+  // Which document the iframe shows: the live PDF, the accepted revision, the
+  // previous compile, or the latexdiff 对比视图. The two revision views differ in
+  // *what they are compared against*: accepted (path A) vs previous compile (B).
+  const [view, setView] = useState<'live' | 'base' | 'compile' | 'diff'>('live')
   // Last built diff-doc URL; the Host also mirrors it in `state.diffDocUrl`, but
   // the swap must not wait for the next poll after the button click.
   const [diffDocUrl, setDiffDocUrl] = useState<string | null>(null)
@@ -91,7 +93,7 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
   const diffRef = useRef<DiffRegions | null>(null)
   const showDiffRef = useRef(true)
   showDiffRef.current = showDiff
-  const viewRef = useRef<'live' | 'base' | 'diff'>('live')
+  const viewRef = useRef<'live' | 'base' | 'compile' | 'diff'>('live')
   viewRef.current = view
 
   /** Lazily create the viewer adapter once the iframe exists. */
@@ -139,34 +141,42 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
   // screen whenever either moves, and drop the others immediately — showing last
   // revision's bands on a new PDF is worse than showing nothing.
   useEffect(() => {
-    setDiffs({ new: null, base: null })
+    setDiffs({ new: null, base: null, compile: null })
     diffRef.current = null
   }, [state?.version])
 
+  /** The side of the change the iframe is currently showing. */
+  const activeSide: DiffSide = view === 'base' ? 'base' : view === 'compile' ? 'compile' : 'new'
+
+  // One fetch per side that is worth having: always `new` (review count), plus the
+  // revision view on screen. Both are version-stamped, so a late answer is dropped.
   useEffect(() => {
     const version = state?.version
     if (version === undefined) return
-    const side: DiffSide = view === 'base' ? 'base' : 'new'
+    const sides: DiffSide[] = activeSide === 'new' ? ['new'] : ['new', activeSide]
     let alive = true
     void (async () => {
-      const result = await unwrap(api.getDiffRegions({ side }))
-      if (!alive || !result.ok) return
-      if (result.value.version !== lastVersion.current) return
-      setDiffs((previous) => ({ ...previous, [side]: result.value }))
-      if (side === 'base' && result.value.message) setNotice(result.value.message)
+      for (const side of sides) {
+        const result = await unwrap(api.getDiffRegions({ side }))
+        if (!alive || !result.ok) return
+        if (result.value.version !== lastVersion.current) return
+        setDiffs((previous) => ({ ...previous, [side]: result.value }))
+        if (side !== 'new' && side === activeSide && result.value.message) setNotice(result.value.message)
+      }
     })()
     return () => {
       alive = false
     }
-  }, [api, state?.version, state?.baseRevisionId, view])
+  }, [api, state?.version, state?.baseRevisionId, state?.recentRevisionId, activeSide])
 
   /**
    * The regions of the document on screen.
    *
-   * The 对比视图 is a third document with no overlay; the previous revision gets
-   * its own set, computed from the old line numbers against the old sync map.
+   * The 对比视图 is another document again and carries no overlay; each revision
+   * view owns its own set, computed from that revision's line numbers against that
+   * revision's sync map.
    */
-  const activeDiff = diffs[view === 'base' ? 'base' : 'new']
+  const activeDiff = diffs[activeSide]
 
   // Push on every change; `ready` pushes again, because a swapped document starts
   // with a fresh listener that missed everything sent before it existed.
@@ -176,14 +186,23 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
   useEffect(() => {
     diffRef.current = activeDiff
     viewer()?.showDiff(activeDiff?.regions ?? [], showDiff && view !== 'diff')
-    viewer()?.setReadOnly(view === 'base')
+    // Both revision views are read-only: their pixels belong to an older source.
+    viewer()?.setReadOnly(view === 'base' || view === 'compile')
   }, [activeDiff, showDiff, view, viewer])
 
   // Our PDF.js page when the assets are built, otherwise the raw PDF so the
   // browser's viewer still shows something. Swap only when the URL changed.
   const liveUrl = state?.viewerUrl ?? state?.pdfUrl ?? null
   const baseUrl = state?.baseViewerUrl ?? state?.basePdfUrl ?? null
-  const pdfUrl = view === 'diff' ? (diffDocUrl ?? liveUrl) : view === 'base' ? (baseUrl ?? liveUrl) : liveUrl
+  const recentUrl = state?.recentViewerUrl ?? state?.recentPdfUrl ?? null
+  const pdfUrl =
+    view === 'diff'
+      ? (diffDocUrl ?? liveUrl)
+      : view === 'base'
+        ? (baseUrl ?? liveUrl)
+        : view === 'compile'
+          ? (recentUrl ?? liveUrl)
+          : liveUrl
   useEffect(() => {
     if (!pdfUrl || pdfUrl === lastUrl.current) return
     const frame = frameRef.current
@@ -219,7 +238,7 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
       if (data.type === 'ready') {
         viewer()?.restoreScrollState()
         viewer()?.showDiff(diffRef.current?.regions ?? [], showDiffRef.current && viewRef.current !== 'diff')
-        viewer()?.setReadOnly(viewRef.current === 'base')
+        viewer()?.setReadOnly(viewRef.current === 'base' || viewRef.current === 'compile')
         return
       }
       if (data.type === 'error' && data.message) {
@@ -293,10 +312,14 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
   // a pending change that made the pair stale. Leaving the iframe on a document
   // the Host no longer publishes would 404 into a blank page.
   useEffect(() => {
-    if (view !== 'base') return
-    if (state && state.baseRevisionId === null) {
+    if (!state) return
+    if (view === 'base' && state.baseRevisionId === null) {
       setView('live')
-      setNotice('旧版不可用（基线已移动或与 SyncTeX 不再成对），已切回当前 PDF')
+      setNotice('已接受版不可用（基线已移动，或产物对未通过校验），已切回当前 PDF')
+    }
+    if (view === 'compile' && state.recentRevisionId === null) {
+      setView('live')
+      setNotice('上次编译版不可用（产物对未通过校验），已切回当前 PDF')
     }
   }, [state, view])
 
@@ -410,14 +433,18 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
     [api, run, viewer],
   )
 
-  // One hunk paints several bands, so count distinct hunks, not rectangles.
-  // Either side counts the same hunks — the base just numbers them in old lines.
+  // One hunk paints several bands, so count distinct hunks, not rectangles. The
+  // count always describes the **review** diff (accepted → current), which is what
+  // 接受/撤销 act on — a revision view has its own regions and its own meaning.
+  const reviewDiff = diffs.new
   const diffCount = useMemo(
-    () => new Set((activeDiff?.regions ?? []).map((region) => `${region.kind}:${region.lineStart}`)).size,
-    [activeDiff],
+    () => new Set((reviewDiff?.regions ?? []).map((region) => `${region.kind}:${region.lineStart}`)).size,
+    [reviewDiff],
   )
   const baseReady =
     state !== null && state.baseRevisionId !== null && (state.baseViewerUrl !== null || state.basePdfUrl !== null)
+  const compileReady =
+    state !== null && state.recentRevisionId !== null && (state.recentViewerUrl !== null || state.recentPdfUrl !== null)
 
   const errors = useMemo(() => state?.diagnostics.filter((d) => d.severity === 'error') ?? [], [state])
   const warnings = useMemo(() => state?.diagnostics.filter((d) => d.severity === 'warning') ?? [], [state])
@@ -498,25 +525,41 @@ export function LatexPreviewPanel({ api, file }: PanelProps): ReactNode {
             diffCount === 0
               ? '与上一次编译相比没有变化'
               : `${showDiff ? '隐藏' : '显示'}高亮：${diffCount} 处改动${
-                  activeDiff && activeDiff.skipped > 0 ? `（另有 ${activeDiff.skipped} 处超出标注上限）` : ''
+                  reviewDiff && reviewDiff.skipped > 0 ? `（另有 ${reviewDiff.skipped} 处超出标注上限）` : ''
                 }`
           }
         >
           差异 {diffCount}
         </button>
+        {(diffCount > 0 || view === 'base') && (
+          <button
+            style={{ ...styles.button, opacity: view === 'base' ? 1 : 0.85 }}
+            disabled={working || (!baseReady && view !== 'base')}
+            onClick={() => setView((current) => (current === 'base' ? 'live' : 'base'))}
+            title={
+              view === 'base'
+                ? '回到当前 PDF'
+                : baseReady
+                  ? '看「已接受版」的 PDF：待接受的改动在那份文档里仍按原样排版，被删的字用红色删除线和色带标出（只读）'
+                  : '已接受版还没有可校验的产物对（需要一次接受、回滚，或 open 模式下的一次编译）'
+            }
+          >
+            {view === 'base' ? '回到当前' : '已接受版'}
+          </button>
+        )}
         <button
-          style={{ ...styles.button, opacity: view === 'base' ? 1 : 0.85 }}
-          disabled={working || (!baseReady && view !== 'base')}
-          onClick={() => setView((current) => (current === 'base' ? 'live' : 'base'))}
+          style={{ ...styles.button, opacity: view === 'compile' ? 1 : 0.85 }}
+          disabled={working || (!compileReady && view !== 'compile')}
+          onClick={() => setView((current) => (current === 'compile' ? 'live' : 'compile'))}
           title={
-            view === 'base'
+            view === 'compile'
               ? '回到当前 PDF'
-              : baseReady
-                ? '查看上一次编译的 PDF：被删除的文字在那里仍是排版好的，用红色带删除线标出（只读）'
-                : '旧版 PDF 还没和它的 SyncTeX 成对：需要一次基线推进（「接受」或回滚）后才能定位被删的内容'
+              : compileReady
+                ? '看「上次编译」的 PDF：和它比，就是这次保存到底改了什么，与审核状态无关（只读）'
+                : '还没有上一版：需要先有两次内容不同的成功编译'
           }
         >
-          {view === 'base' ? '回到当前' : '上次编译版'}
+          {view === 'compile' ? '回到当前' : '上次编译版'}
         </button>
         <button
           style={{ ...styles.button, opacity: view === 'diff' ? 1 : diffCount === 0 ? 0.5 : 0.85 }}

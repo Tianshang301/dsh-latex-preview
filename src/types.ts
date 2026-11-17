@@ -71,6 +71,18 @@ export interface PreviewState {
   readonly baseViewerUrl: string | null
   /** Short digest of the baseline source, to prove a snapshot belongs to it. */
   readonly baseRevisionId: string | null
+  /**
+   * Same-origin URL of the PDF produced by the **previous successful compile**.
+   *
+   * Distinct from {@link basePdfUrl}: that one describes the accepted revision,
+   * this one always describes the revision just before the one on screen. Null on
+   * the first compile and whenever its manifest does not verify.
+   */
+  readonly recentPdfUrl: string | null
+  /** Viewer-wrapped {@link recentPdfUrl}; null when the assets are not built. */
+  readonly recentViewerUrl: string | null
+  /** Digest of the previous compile's source, proving the pair still belongs to it. */
+  readonly recentRevisionId: string | null
   /** Duration of the last compile in milliseconds. */
   readonly durationMs: number | null
   /** Candidate root files when resolution was ambiguous. */
@@ -151,8 +163,16 @@ export interface DiffBlock {
  */
 export type ReviewMode = 'manual' | 'auto' | 'open'
 
-/** Which document a set of regions describes. */
-export type DiffSide = 'new' | 'base'
+/**
+ * Which document a set of regions describes — and therefore which diff path it is.
+ *
+ * - `new`    — the live PDF, against the **accepted** revision (review diff).
+ * - `base`   — the accepted revision's PDF, same comparison, so deletions get real
+ *              boxes from the `prev` pair.
+ * - `compile`— the **previous compile**'s PDF, against it, so deletions get real
+ *              boxes from the `recent` pair.
+ */
+export type DiffSide = 'new' | 'base' | 'compile'
 
 /** What a changed region means, in diff terms. */
 export type DiffRegionKind = 'insert' | 'delete' | 'modify' | 'removed'
@@ -256,6 +276,14 @@ export interface CompileResult {
   readonly stderrTail: string
   /** True when a failed compile restored the previous PDF. */
   readonly rolledBack: boolean
+  /**
+   * True when a failed compile could restore only one half of the pair.
+   *
+   * The PDF and its `.synctex.gz` describe the same document or they are useless;
+   * a half-done restore means reverse jumps and old-revision lookups may be reading
+   * a map that no longer matches the page, so the UI must stop offering them.
+   */
+  readonly rollbackIncomplete: boolean
 }
 
 /** Tunables the client may push down; every field has a host-side default. */

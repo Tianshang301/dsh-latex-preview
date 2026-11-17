@@ -72,19 +72,30 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 - 13 `@Remote` methods mirror the routes for in-process callers.
 - `发送给 Agent` hands the current compile failure to the session, with a redaction switch.
 
+**Revision model and artefact integrity**
+
+- Three source snapshots with distinct jobs, encoded once in `services/revisions.ts` and tested there: **accepted** (moves on 接受 / approving reviewer / every `open` compile), **previous compile** (moves on every successful compile whose content changed), **current** (what the PDF on screen was built from). `manual` makes the first two diverge at the first unaccepted change and keeps them apart, which is the entire reason for having both.
+- Two diff paths, each with its own left-hand side and its own document: `new` = accepted → current drawn on the live PDF; `base` = the same comparison drawn on the accepted revision's PDF; `compile` = previous compile → current drawn on the previous compile's PDF. Sides are parsed by one function (`parseDiffSide`) so the Remote method and the HTTP route cannot disagree.
+- `上次编译版` now means the previous compile (path B, "what did this save change") and `已接受版` is a separate button for path A ("where did the unaccepted deletion go"), each shown only when its pair verifies.
+- **Artefacts are published as a transaction** (`services/artifacts.ts`): a PDF + `.synctex.gz` pair is installed under a manifest that records both files' sha256 and the source revision it describes. `verify()` trusts the pair only when the manifest exists and both hashes still match; publishing removes the manifest first, installs both files, and writes the manifest last, so a crash at any point leaves nothing trustworthy behind. Both revision views refuse to draw from an unverified pair and say so.
+- `main.prev.*` (accepted) and `main.recent.*` (previous compile) are separate pairs; compiles no longer overwrite the accepted pair, so it survives several pending compiles instead of being discarded.
+
 **Tests**
 
 - `npm test` runs `tsx --test test/unit/*.test.ts` — `node:test`, no new dependency. The first suite pins the previous-revision insertion anchor: above the first line, between two lines, after the last line, in front of a closing tag, and the clamps at both ends. It also asserts the diff really emits a *pure* insertion (0 old lines) for each, so the anchor rule cannot silently start applying to a `modify`.
 
 ### Changed
 
-- `getDiffRegions` takes `{ side: 'new' | 'base' }` and every region says which document it describes; the panel fetches only the side on screen (each one costs a `synctex view` sweep).
+- `getDiffRegions` takes `{ side: 'new' | 'base' | 'compile' }` and every region says which document it describes; the panel fetches only the side on screen (each one costs a `synctex view` sweep).
 - Diff bands are now positioned by the document's own line numbering on both sides: the source diff carries `oldStart`/`oldLines` alongside the new ones, which is what makes an old-revision lookup possible at all.
 - Deletion rendering went from a 2 px dashed seam to a 7 px red hatched band to a chip plus struck-through hover flyout, because a seam cannot say *what* was removed and a filled band reads as "this line changed".
 - `viewer/index.html` imports `viewer.js?v=<page version>`; `/assets` is served with `max-age=3600`, so a rebuilt viewer used to land an hour late.
 - README split into an English main page and `README.zh.md`; both link to each other and are edited in the same commit.
 
 ### Fixed
+
+- **A failed compile could report a clean rollback after restoring only the PDF.** `rolledBack` came from the PDF's restore alone, so a sync map that could not be put back left the state claiming "rolled back" while reverse jumps read a map for a document that was no longer on screen. Both halves are now restored and reported together (`rollbackIncomplete`), and both revision pairs are dropped when they could not be.
+- **A first compile that failed left its partial output behind.** With no previous PDF to restore, the failed run's half-written `main.pdf` stayed on disk and could be served as if it had compiled; it is now removed, along with its sync map.
 
 - **Every diff line number was one too high, which put bands on the wrong line.** `diff_cleanupSemantic` was being run *after* `diff_charsToLines_`, so it moved fragment boundaries to character-level semantic edges — a fragment then began with a newline that actually terminated the previous line, and each block's line count gained one. A paragraph split in three painted the line after the change. Normalisation now runs while the text is still one character per line, so fragments stay line-aligned and the counts are exact.
 - **A blank line inside a change painted an unchanged line.** `synctex view` has no box for an empty line and answers with the *next* rendered line's box, so a deleted paragraph whose range included the blank line after it produced two bands, the second over text nobody had touched. Blank lines are dropped from the resolved range on both sides.

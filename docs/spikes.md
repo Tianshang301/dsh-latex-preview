@@ -794,6 +794,47 @@ await this.snapshotBaseFromCurrent()
 
 ---
 
+## B23 · 产物事务：清单是唯一的信任根，三条版本线各有其位
+
+**问题**：`main.prev.pdf` 与 `main.prev.synctex.gz` 只要"文件存在"就被当作一对。但文件存在证明不了任何事——崩溃可能只写了一半、rename 失败可能留下上一次的旧文件、手动拷贝可能把 A 的 PDF 配 B 的同步表。这类错误的表现是**色带画在看似合理但错误的位置**，且没有任何报错。
+
+**清单**（`services/artifacts.ts`）：每对产物带一个 `main.prev.manifest.json` / `main.recent.manifest.json`，记录
+
+```json
+{ "version": 1, "revisionId": "<源码摘要>",
+  "pdf": { "file": "main.prev.pdf", "sha256": "…", "bytes": 11889 },
+  "synctex": { "file": "main.prev.synctex.gz", "sha256": "…", "bytes": 734 },
+  "createdAt": "2026-11-18T…" }
+```
+
+发布顺序是**失败即关闭**的：先删清单 → 拷两个文件 → 最后写清单（临时文件 + rename）。任何一步崩溃都留下"没有清单"或"清单对不上"，`verify()` 一律返回 null。读取侧每次都重新算两个 sha256——体积只有几百 KB，而替代方案是信任一个可能被截断的文件。
+
+**三条版本线与两条 diff 路径**（`services/revisions.ts`，纯函数 + 单测）：
+
+| 字段 | 何时推进 | 谁在用 |
+|---|---|---|
+| `accepted` | 接受 / 审核通过 / `open` 模式每次编译 | 路径 A（审核）：`new` 与 `base` |
+| `previousCompile` | 每次内容真的变了的成功编译 | 路径 B（本次保存）：`compile` |
+| `current` | 每次成功编译 | 屏幕上那份 PDF |
+
+`manual` 下第一次未接受的改动之后两者就分开：A 累积"待审债务"，B 永远只回溯一次编译。`open` 下两者恒等——所以只用 `open` 测不出混淆它们的 bug，这也是它被单测钉住的原因。
+
+**踩到的坑**：`getDiffRegions` 的 `side` 规范化曾在两处各写一遍（Remote 方法 + HTTP 路由），加第三个值 `compile` 时只改了一处——HTTP 请求里的 `compile` 被静默降级成 `new`，响应里 `side: "new"`、色带画在当前 PDF 上，看起来完全正常。现在只有 `parseDiffSide` 一处。
+
+**真机验证**（DSH 0.2.2-rc.1，manual 模式，A→B→C 三次编译）：
+
+| 场景 | 期望 | 实测 |
+|---|---|---|
+| 编到 C 时 A 与 B 是否分开 | `base` 指向 A、`recent` 指向 B | `83eb917a16cb` / `44586c8c10dc` ✔ |
+| 三条路径同时取区域 | 各自成对 | `new`/`base`/`compile` 均返回 1 处 `modify` ✔ |
+| 「已接受版」 | 打开 `main.prev.pdf` | ✔ 1 条 `diff-modify` |
+| 「上次编译版」 | 打开 `main.recent.pdf` | ✔ 1 条 `diff-modify` |
+| 手动改坏 `main.recent.pdf` 字节 | 拒绝出图、状态撤下 URL | `message` 为"未能成对校验"，`regions: 0`，`recentRevisionId: null` ✔ |
+
+回滚与清单校验另有 17 个 `node:test` 用例（`test/unit/compile-rollback.test.ts`、`test/unit/artifacts.test.ts`），含"只回滚了 PDF"和"首次编译失败留下半成品"两条故障注入。
+
+---
+
 ## B22 · 旧版视图：被删除的文字回到它原来的位置
 
 **目标**：新版 PDF 上，删除只能是一道接缝——排好的字没了就是没了。让用户看到"删掉了什么、原来在哪"的唯一办法，是把**上一版 PDF**拿出来，在它上面按**旧行号 + 旧 SyncTeX** 标出那些行（产物成对规则见 §B20）。
