@@ -74,6 +74,10 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 - **`发送给 Agent` failed on the HTTP route** even with real errors: `agents.currentInitiator()` only resolves inside a driver's async boundary, so it is always empty for a request. The panel now reads `data-sidebar-right-session` from its pane and the Host resolves `agents.get(id)` (both key spellings), falling back to the initiator chain.
 - **A compile that could not start left the panel stuck on `正在编译`.** `compiler.run()` throwing (not failing) had no terminal state; it is now patched to `failed` before rethrowing.
 - **`scrollPageIntoView` received a string page number.** PDF.js only warns on that, so scroll restoration was failing silently.
+- **The diff overlay could paint a stale layer over a fresh one.** `paintDiffPage` awaits `getPage()`, and `pagerendered` fires again on every zoom and scroll, so two paints of one page could interleave — a slow older one would append its band after the newer one, leaving two `.diffLayer`s and hit-test entries for a layer that no longer existed. Painting now carries a generation and a per-page ticket and discards its own result when either moved; the new layer is swapped in before the old one is removed. Verified with 40 rapid zoom changes: one layer per page, no orphans.
+- **Band colours depended on what was underneath.** `mix-blend-mode: multiply` tinted every band with the page content, so the same amber was pale over text and nearly invisible over a dark formula. Bands now composite normally (alpha only), with the left gutter carrying the kind.
+- **The deletion seam was a fixed 7 px**, i.e. thicker than the text at 50 % zoom and a hairline at 200 %. It now follows the line height, clamped to 2–8 px.
+- **`viewer.css` was cached for an hour** while `viewer.js` was already versioned, so a style fix looked like it had no effect. Both now carry the page's `?v=`.
 - Hand-off prompt source is `{ kind: 'user' }` — `dsh-llm@0.2.2-rc.1` removed the `plugin` kind the design doc assumed.
 
 ### Docs

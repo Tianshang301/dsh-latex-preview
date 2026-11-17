@@ -9,17 +9,24 @@
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%230b6'/%3E%3Ctext x='8' y='12' font-size='10' text-anchor='middle' fill='white'%3EL%3C/text%3E%3C/svg%3E"
     />
-    <!-- Inline icon: avoids a 404 for /favicon.ico on every panel load. -->
-    <link
-      rel="icon"
-      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%230b6'/%3E%3Ctext x='8' y='12' font-size='10' text-anchor='middle' fill='white'%3EL%3C/text%3E%3C/svg%3E"
-    />
     <!--
-      Layout only. `pdf_viewer.css` comes from pdfjs-dist and defines `.page`,
-      `.pdfViewer` and the layer stacking this page relies on.
+      `pdf_viewer.css` comes from pdfjs-dist and defines `.page`, `.pdfViewer` and
+      the layer stacking this page relies on. It changes only with a dependency
+      bump, so it keeps a plain URL.
     -->
     <link rel="stylesheet" href="../pdfjs/pdf_viewer.css" />
-    <link rel="stylesheet" href="viewer.css" />
+    <script>
+      // Our own stylesheet is cache-busted with the page's ?v=: /assets is served
+      // with max-age=3600, and without this a CSS fix would wait an hour while the
+      // script beside it updated on the next compile.
+      ;(() => {
+        const v = new URLSearchParams(location.search).get('v')
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = `viewer.css${v ? `?v=${encodeURIComponent(v)}` : ''}`
+        document.head.append(link)
+      })()
+    </script>
   </head>
   <body>
     <div id="viewerContainer" tabindex="0">
@@ -27,10 +34,8 @@
     </div>
     <div id="status" hidden></div>
     <script type="module">
-      // Cache-bust the page script: /assets is served with max-age=3600, and the
-      // page URL already changes per compile (?v=); carrying that onto the
-      // script means a rebuilt viewer is picked up on the next compile, not next
-      // hour. The pdfjs runtime rarely changes and keeps its plain URL.
+      // Cache-bust the page script too, for the same reason: a rebuilt viewer is
+      // picked up on the next compile, not next hour.
       const v = new URLSearchParams(location.search).get('v')
       import(`./viewer.js${v ? `?v=${encodeURIComponent(v)}` : ''}`)
     </script>

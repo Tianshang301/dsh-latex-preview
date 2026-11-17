@@ -25,6 +25,7 @@
 | **B16** | 框选 PDF 让 AI 改源码 | 文字层选区或拖框 → `synctex edit` 反查行范围 → 带源码行的 prompt → Agent 改 `.tex` → 自动重编 | 已实现并真机跑通（选中第 3 行准确命中） |
 | **B17** | PDF 上的 diff 高亮 | 源码 hunk → `synctex view` → 每行色带（百分比定位）；顶边是 `v - H` 不是 `y`；删除只画接缝，锚定前一行底部 | 已实现并真机验证（覆盖率 0.82–0.88，删除接缝位置正确） |
 | **B18** | 改动审核三档 | 手动=等接受；自动=派独立一次性模型调用审，否决即回滚；放开=不设闸门。路由取自 `requestHeader`，缺失时回落默认模型 | 已实现并真机验证（真实调用通过一次、否决并回滚一次） |
+| **B19** | 覆盖层渲染三坑 | 绘制要代次+每页令牌+原子替换；`multiply` 混合模式会随底图变色，删；接缝按行高缩放；CSS 也要 `?v=` | 已修并真机验证（40 次快速缩放后每页仍只有 1 层） |
 
 ---
 
@@ -621,7 +622,70 @@ y 扫描（x=120，单位点，origin 左上）：
 
 ### 删除改成红色斜纹
 
-纯删除没有内容可染色，之前只画 2px 虚线，太弱。现在画 7px 高的**红色斜纹带**（`repeating-linear-gradient`）+ 左侧实心红边：读起来是「这里少了一块」，而不是「这一行被改了」。
+纯删除没有内容可染色，之前只画 2px 虚线，太弱。现在画**红色斜纹带**（`repeating-linear-gradient`）+ 左侧实心红边：读起来是「这里少了一块」，而不是「这一行被改了」。带高最初固定 7px，现已改成按行高缩放（§B19）。
+
+---
+
+## B19 · 覆盖层的三个渲染陷阱：异步竞争、混合模式、缓存
+
+**起因**：外部评审提出「覆盖层可能被旧绘制覆盖」，并怀疑 `mix-blend-mode` 让颜色失真。逐条对着代码核对后：前两条成立，第三条（自建 Canvas + devicePixelRatio）不适用——这个页面用的是 `PDFViewer` 组件，从不自己 `page.render()`。
+
+### 一、`paintDiffPage()` 真的有竞争
+
+原实现是「先删旧层 → `await getPage()` → 建新层 → append」，中间没有代次检查。而 `pagerendered` 在缩放、滚动、重排版时都会再触发一次，`diff` 消息也会。于是：
+
+```
+A: 收到旧 regions → 删层 → await getPage()
+B: 收到新 regions → 删层 → await getPage()
+B: 先恢复 → append 新层
+A: 后恢复 → append 旧层   ← 旧标记盖新标记，且同页两个 .diffLayer
+```
+
+实测在连续缩放时会短暂出现两个 `.diffLayer`（`painted` 里也残留被移除页面的条目）。
+
+**修法**（`viewer/viewer.js`）：
+
+1. **代次**：每条 `diff` 消息 `diffGeneration += 1`；绘制开始时记下代次，提交前比对，不等就丢弃。
+2. **每页令牌**：`pagePaintTokens`（`WeakMap`）给每次绘制一个递增 ticket，同一页后发起的绘制会作废先前的。
+3. **原子替换**：新层先 append、再移除旧层，页面不会在重绘中间失去标记。
+4. **提交前检查**：`pdfDocument` 是否换了、`pageEl.isConnected` 是否为 false（PDF.js 已销毁该页）。
+5. `painted` 只在成功提交后整体替换该页的条目，不再在 await 期间 push。
+
+`pagerendered` 也改成优先用 `event.source.div`（刚渲染完的那个页面元素），按页码重查可能命中重建后的另一个实例。
+
+**验证**（真机，40 次连续快速改 `currentScale`，60ms 间隔）：每页 `.diffLayer` 恒为 1，无孤儿层，40 次后仍能命中删除接缝并弹出被删源码行。
+
+### 二、`mix-blend-mode: multiply` 该删
+
+它把色带与 PDF 底图相乘：同一块琥珀色压在白底上是浅黄，压在深色公式或图片上会变暗甚至看不见；不同浏览器的合成结果也不一致。
+
+改成普通 alpha 合成，颜色略降（绿 0.22→0.16、琥珀 0.26→0.18），左侧 gutter 实心边继续承担「这是哪类改动」。实测 `getComputedStyle(band).mixBlendMode === 'normal'`，`backgroundColor` 为 `rgba(46, 160, 67, 0.16)`。
+
+### 三、接缝高度不该固定成 7px
+
+固定 CSS 像素意味着 50% 缩放下那条缝比行还粗、200% 下细成一条线。改为按行高算：
+
+```
+linePx  = (region.height / viewport.height) * pageEl.clientHeight
+seamPx  = clamp(2, 8, linePx * 0.55)
+```
+
+实测 `seam` 高度 0.5×→3.7px、1×→7.5px、2×→8px（上限截断）。命中测试用同一个 `seamPx`，并以 8px 为下限，否则低缩放下这条缝无法 hover。
+
+### 四、坐标换算要共用一个函数
+
+绘制原本按 `region / viewport * 100%` 算，命中测试按 `region / entry.width * box.width` 另算一遍。数学上等价，但两处各改一次就会「看得见、点不着」。现在统一为 `regionPercent()`（绘制）与 `regionClientRect()`（命中），后者只把百分比换回 client 坐标。
+
+### 五、`viewer.css` 也要带版本号
+
+`viewer.js` 早就用 `?v=` 了，但两张 CSS 仍是固定 URL，而 `/assets` 的 `max-age=3600` 会缓存它们——改样式要等一小时，改脚本却下次编译就生效，很容易误判成「样式没生效」。现在 `index.html` 用一小段内联脚本把同一个 `?v=` 拼到 `viewer.css` 上（`pdf_viewer.css` 属依赖，保持固定 URL）。实测 `<link href="viewer.css?v=10">`。
+
+### 没改的部分，以及理由
+
+- **不自建 Canvas、不手动乘 devicePixelRatio**：页面用 `PDFViewer` 组件，底层 Canvas 由它管理；自己再画一层只会引入两套缩放基准。
+- **`annotationMode: 0` 保持不变**：注释层是有意关闭的，预览是只读的。若将来「批注消失」被当成渲染 bug，先看这里。
+- **旋转页面没有处理**：`getViewport()` 会应用 `/Rotate`，而 SyncTeX 的盒子是未旋转的 PDF 坐标，两者在非零旋转下不能直接按宽高比换算。LaTeX 常规输出不旋转页面，所以先记为边界而不是盲改——要支持必须用真实旋转 fixture 验证。
+- **没有加 `test/visual/` 视觉回归**：外部评审建议了一套浏览器 × DPR × 页面尺寸矩阵，这里暂不引入——它需要真实的 Chromium 矩阵和像素基线，维护成本高于当前的收益。真机手工验证记录在上一节。
 
 ---
 

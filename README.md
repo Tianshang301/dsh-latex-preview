@@ -184,7 +184,7 @@ Read [`docs/spikes.md`](docs/spikes.md) before changing code — it records the 
 
 | File | Contents |
 |---|---|
-| [`docs/spikes.md`](docs/spikes.md) | Verified contracts and traps (B1–B18) |
+| [`docs/spikes.md`](docs/spikes.md) | Verified contracts and traps (B1–B19) |
 | [`docs/HANDOFF.md`](docs/HANDOFF.md) | Status, decisions, open questions |
 | [`docs/DEVELOPMENT_PLAN.md`](docs/DEVELOPMENT_PLAN.md) | Work breakdown, gates, risk register |
 | [`docs/LaTeX Preview — 开发文档.md`](docs/LaTeX%20Preview%20—%20开发文档.md) | Architecture and API contract spec |

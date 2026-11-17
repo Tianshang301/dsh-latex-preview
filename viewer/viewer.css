@@ -185,19 +185,23 @@ body {
 
 .diffRegion {
   position: absolute;
+  /* No blend mode: `multiply` mixed the band with whatever was underneath, so the
+     same amber read olive over a figure and near-invisible over a dark formula,
+     and browsers disagreed on the result. Plain alpha composites the same way
+     everywhere; the left gutter border carries the kind. */
+  box-sizing: border-box;
   border-radius: 2px;
-  mix-blend-mode: multiply;
 }
 
 .diffRegion.diff-insert {
-  background: rgba(46, 160, 67, 0.22);
+  background: rgba(46, 160, 67, 0.16);
   border: 1px solid rgba(46, 160, 67, 0.55);
   /* The left edge is the git-diff gutter: a solid strip in the change's colour. */
   border-left: 4px solid rgba(46, 160, 67, 0.85);
 }
 
 .diffRegion.diff-modify {
-  background: rgba(210, 153, 34, 0.26);
+  background: rgba(210, 153, 34, 0.18);
   border: 1px solid rgba(210, 153, 34, 0.6);
   border-left: 4px solid rgba(210, 153, 34, 0.85);
 }
@@ -207,8 +211,8 @@ body {
 .diffRegion.diff-delete {
   background: repeating-linear-gradient(
     135deg,
-    rgba(207, 34, 46, 0.55) 0 3px,
-    rgba(207, 34, 46, 0.1) 3px 6px
+    rgba(207, 34, 46, 0.48) 0 3px,
+    rgba(207, 34, 46, 0.08) 3px 6px
   );
   border: none;
   border-left: 3px solid rgba(207, 34, 46, 0.85);

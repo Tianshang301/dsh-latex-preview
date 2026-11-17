@@ -220,6 +220,21 @@ const PANEL_SOURCE = 'latex-preview-panel'
 let diffRegions = []
 let diffVisible = true
 
+/**
+ * Bumped on every incoming `diff` message. A paint started under an older
+ * generation must not commit: it was computed from regions that no longer apply.
+ */
+let diffGeneration = 0
+
+/**
+ * Per-page paint ticket, so two paints of the same page cannot interleave.
+ *
+ * `paintDiffPage` awaits `getPage()`, and `pagerendered` fires again during zoom
+ * or scroll; without a ticket, an older await can resume *after* a newer one and
+ * append a stale layer (or a second `.diffLayer` to the same page).
+ */
+const pagePaintTokens = new WeakMap()
+
 /** Painted rectangles, kept for hit-testing (the layer itself ignores the mouse). */
 let painted = []
 
@@ -229,39 +244,101 @@ let diffTip = null
 /** Set when a rubber-band ended, so the trailing click is not read as a jump. */
 let suppressClickUntil = 0
 
+/** Thinnest hoverable band, in CSS px; a drawn seam can be thinner than this. */
+const HIT_MIN = 8
+
+/** Seam thickness, in CSS px: proportional to the line, clamped to stay visible. */
+const SEAM_MIN = 2
+const SEAM_MAX = 8
+
+/**
+ * A region as percentages of its page.
+ *
+ * One conversion for both painting and hit-testing: they used to compute the same
+ * ratios separately, so a change to one silently desynced the other from the
+ * pixels on screen.
+ * @param {{x:number,y:number,width:number,height:number}} region - in PDF points.
+ * @param {{width:number,height:number}} viewport - the page viewport at scale 1.
+ * @returns {{left:number,top:number,width:number,height:number}} percentages.
+ */
+function regionPercent(region, viewport) {
+  return {
+    left: (region.x / viewport.width) * 100,
+    top: (region.y / viewport.height) * 100,
+    width: (region.width / viewport.width) * 100,
+    height: (region.height / viewport.height) * 100,
+  }
+}
+
+/**
+ * Remove every overlay layer from one page and forget its hit-test entries.
+ * @param {HTMLElement} pageEl - the `.page` element.
+ */
+function clearPageDiff(pageEl) {
+  for (const layer of pageEl.querySelectorAll(':scope > .diffLayer')) layer.remove()
+  painted = painted.filter((entry) => entry.pageEl !== pageEl)
+}
+
 /**
  * Paint (or clear) the overlay for one page.
+ *
+ * Commits atomically: the new layer is appended before the old one is dropped, so
+ * a page is never left without its marks mid-repaint. Anything that finishes out
+ * of order is discarded rather than drawn — see {@link pagePaintTokens}.
  * @param {HTMLElement} pageEl - the `.page` element.
  */
 async function paintDiffPage(pageEl) {
-  pageEl.querySelector('.diffLayer')?.remove()
-  painted = painted.filter((entry) => entry.pageEl !== pageEl)
-  if (!pdfDocument) return
+  const token = (pagePaintTokens.get(pageEl) ?? 0) + 1
+  pagePaintTokens.set(pageEl, token)
 
+  const generation = diffGeneration
+  const documentAtStart = pdfDocument
   const pageNumber = Number(pageEl.dataset.pageNumber)
   const list = diffVisible ? diffRegions.filter((region) => region.page === pageNumber) : []
-  if (list.length === 0) return
 
-  const page = await pdfDocument.getPage(pageNumber)
+  if (!documentAtStart || !Number.isFinite(pageNumber) || list.length === 0) {
+    clearPageDiff(pageEl)
+    return
+  }
+
+  const page = await documentAtStart.getPage(pageNumber)
+
+  // Anything that changed while awaiting means this result is already stale:
+  // newer regions, a newer paint of this page, a different document, or a page
+  // that PDF.js has since torn down.
+  if (
+    generation !== diffGeneration ||
+    pagePaintTokens.get(pageEl) !== token ||
+    documentAtStart !== pdfDocument ||
+    !pageEl.isConnected
+  ) {
+    return
+  }
+
   // `getViewport({scale:1})` is in PDF points (§B15). Positioning in percent keeps
   // the bands glued to the text through zoom and re-layout, with no resize hook.
   const viewport = page.getViewport({ scale: 1 })
+  const pageHeightPx = pageEl.clientHeight
   const layer = document.createElement('div')
   layer.className = 'diffLayer'
+  const nextPainted = []
 
   for (const region of list) {
+    const pct = regionPercent(region, viewport)
     const box = document.createElement('div')
     box.className = `diffRegion diff-${region.kind}`
-    box.style.left = `${(region.x / viewport.width) * 100}%`
-    box.style.top = `${(region.y / viewport.height) * 100}%`
-    box.style.width = `${(region.width / viewport.width) * 100}%`
+    box.style.left = `${pct.left}%`
+    box.style.top = `${pct.top}%`
+    box.style.width = `${pct.width}%`
     // A deletion has no text left to tint. It gets a short hatched band instead of
     // a solid one, so it reads as "something was removed here" and not as "this
-    // line changed". The chip at the text column's right edge carries the count,
-    // and hovering the band pops the removed lines up, struck through — the
-    // closest a fixed-layout PDF gets to a git diff deletion row.
-    box.style.height = region.kind === 'delete' ? '7px' : `${(region.height / viewport.height) * 100}%`
+    // line changed". Its thickness follows the line so it scales with zoom instead
+    // of staying 7 screen pixels at every magnification.
+    const linePx = pageHeightPx > 0 ? (region.height / viewport.height) * pageHeightPx : 0
+    const seamPx = Math.min(SEAM_MAX, Math.max(SEAM_MIN, linePx * 0.55))
+    box.style.height = region.kind === 'delete' ? `${seamPx}px` : `${pct.height}%`
     layer.append(box)
+
     if (region.kind === 'delete') {
       const chip = document.createElement('div')
       chip.className = 'diffDelChip'
@@ -269,12 +346,17 @@ async function paintDiffPage(pageEl) {
       // At the right end of the text column, straddling the seam: the page's
       // right margin is the one place a marker covers no text.
       chip.style.left = `${((region.x + region.width) / viewport.width) * 100}%`
-      chip.style.top = `${(region.y / viewport.height) * 100}%`
+      chip.style.top = `${pct.top}%`
       layer.append(chip)
     }
-    painted.push({ pageEl, region, width: viewport.width, height: viewport.height })
+    nextPainted.push({ pageEl, region, width: viewport.width, height: viewport.height, seamPx })
   }
+
+  // Swap in one step: the old layer stays until the new one is in the DOM.
+  const previous = pageEl.querySelectorAll(':scope > .diffLayer')
   pageEl.append(layer)
+  for (const old of previous) old.remove()
+  painted = [...painted.filter((entry) => entry.pageEl !== pageEl), ...nextPainted]
 }
 
 /** Repaint every page that exists right now. */
@@ -283,17 +365,37 @@ async function paintDiff() {
   for (const pageEl of pages) await paintDiffPage(pageEl)
 }
 
+/**
+ * Client-space rectangle of one painted region.
+ *
+ * Uses the same ratios as the paint, and widens a thin seam to {@link HIT_MIN} so
+ * a 2 px line is still hoverable — otherwise the deletion row would be
+ * unreachable at low zoom.
+ * @param {{pageEl:HTMLElement,region:object,width:number,height:number,seamPx:number}} entry - painted entry.
+ * @returns {{left:number,right:number,top:number,bottom:number}|null} client rect.
+ */
+function regionClientRect(entry) {
+  if (!entry.pageEl.isConnected) return null
+  const box = entry.pageEl.getBoundingClientRect()
+  if (box.width <= 0 || box.height <= 0) return null
+  const left = box.left + (entry.region.x / entry.width) * box.width
+  const right = left + (entry.region.width / entry.width) * box.width
+  const top = box.top + (entry.region.y / entry.height) * box.height
+  // Match what is actually drawn: a seam has its own thickness, a band has the
+  // line height. Both fall back to HIT_MIN so a hairline is still reachable.
+  const drawn =
+    entry.region.kind === 'delete' ? entry.seamPx : (entry.region.height / entry.height) * box.height
+  return { left, right, top, bottom: top + Math.max(drawn || 0, HIT_MIN) }
+}
+
 /** Region under a viewport point, or null. */
 function diffRegionAt(clientX, clientY) {
   for (const entry of painted) {
-    const box = entry.pageEl.getBoundingClientRect()
-    if (box.width <= 0 || box.height <= 0) continue
-    const left = box.left + (entry.region.x / entry.width) * box.width
-    const top = box.top + (entry.region.y / entry.height) * box.height
-    const right = left + (entry.region.width / entry.width) * box.width
-    // A 2 px seam is unhittable; widen it vertically for hover and click.
-    const bottom = top + Math.max((entry.region.height / entry.height) * box.height, 8)
-    if (clientX >= left && clientX <= right && clientY >= top && clientY <= bottom) return entry.region
+    const rect = regionClientRect(entry)
+    if (!rect) continue
+    if (clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom) {
+      return entry.region
+    }
   }
   return null
 }
@@ -363,13 +465,18 @@ function showDiffTip(text, x, y) {
 // Pages render on demand (the viewer only keeps a window of them), so a repaint
 // triggered by a message would miss pages that mount later.
 eventBus.on('pagerendered', (event) => {
-  const pageEl = viewerEl.querySelector(`.page[data-page-number="${event.pageNumber}"]`)
+  // `event.source.div` is the element that just rendered; re-querying by page
+  // number can hit a different instance if the page was rebuilt.
+  const pageEl =
+    event.source?.div ?? viewerEl.querySelector(`.page[data-page-number="${event.pageNumber}"]`)
   if (pageEl) void paintDiffPage(pageEl)
 })
 
 window.addEventListener('message', (event) => {
   const data = event.data
   if (!data || data.source !== PANEL_SOURCE || data.type !== 'diff') return
+  // Any paint already in flight is now working from regions that no longer apply.
+  diffGeneration += 1
   diffRegions = Array.isArray(data.regions) ? data.regions : []
   diffVisible = data.visible !== false
   void paintDiff()

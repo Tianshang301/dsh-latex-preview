@@ -184,7 +184,7 @@ npm run binaries     # 检查 tectonic / synctex
 
 | 文件 | 内容 |
 |---|---|
-| [`docs/spikes.md`](docs/spikes.md) | 已验证的契约与踩坑记录（B1–B18） |
+| [`docs/spikes.md`](docs/spikes.md) | 已验证的契约与踩坑记录（B1–B19） |
 | [`docs/HANDOFF.md`](docs/HANDOFF.md) | 状态、决策、未决问题 |
 | [`docs/DEVELOPMENT_PLAN.md`](docs/DEVELOPMENT_PLAN.md) | 任务分解、验收门、风险登记 |
 | [`docs/LaTeX Preview — 开发文档.md`](docs/LaTeX%20Preview%20—%20开发文档.md) | 架构与 API 契约规格书 |
