@@ -16,7 +16,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { CompileResult, DiffBlock, DiffDocResult, DiffRegions, PreviewState, ReviewMode, SyncEditHit, SyncViewHit } from '../types.ts'
+import type { CompileResult, DiffBlock, DiffDocResult, DiffRegions, DiffSide, PreviewState, ReviewMode, SyncEditHit, SyncViewHit } from '../types.ts'
 import { ROUTE_PREFIX } from './static-route.ts'
 import type { EditOutcome, EditRequest } from '../types.ts'
 
@@ -39,7 +39,7 @@ export interface PreviewHost {
   }): Promise<PreviewState>
   compile(): Promise<CompileResult>
   diff(): Promise<readonly DiffBlock[]>
-  diffRegions(): Promise<DiffRegions>
+  diffRegions(request: { side?: DiffSide }): Promise<DiffRegions>
   diffDoc(): Promise<DiffDocResult>
   accept(): Promise<PreviewState>
   revert(): Promise<PreviewState>
@@ -117,7 +117,7 @@ async function dispatch(host: PreviewHost, name: string, body: Record<string, un
     case 'diff':
       return host.diff()
     case 'diff-regions':
-      return host.diffRegions()
+      return host.diffRegions(body as { side?: DiffSide })
     case 'diff-doc':
       return host.diffDoc()
     case 'accept':

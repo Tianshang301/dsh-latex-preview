@@ -35,6 +35,13 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 - The reference is the **previous compiled revision**, not the file on disk — see the baseline fix below.
 - Caps: 24 hunks and 40 resolved lines per revision. Longer blocks are **sampled evenly** rather than truncated (highlighting only the top would imply the change ends there); the surplus is reported in the button's title instead of being silently dropped.
 
+**Previous-revision view**
+
+- `上次编译版` shows the PDF of the revision the diff is measured against, with the lines that have since been **deleted** painted as ordinary red bands with a midline strikethrough — the one place that text is still typeset, in its original position. The live PDF can only ever show a seam there.
+- The old bands come from the *old* line numbers looked up in the *old* SyncTeX (`.prev.pdf` ↔ `.prev.synctex.gz`), so a deletion is placed by measurement rather than by guessing the seam above the hole. Verified round-trip: old line 7 resolves to the deleted paragraph's box and reads back as line 7, while a line that exists only in the old revision resolves there and not in the new document.
+- That view is **read-only**: selection, double-click and band clicks resolve against old line numbers, so they are suppressed rather than answered wrongly. Text stays selectable/copyable.
+- Pure insertions keep the seam treatment there (the old page has nothing to tint), pointing at the line the new text was inserted after. A base view that cannot be proven to pair with the baseline says so instead of drawing nothing.
+
 **Deletions, two layers**
 
 - The overlay carries the removed source lines (`DiffRegion.text`, 8 lines × 200 chars), draws a `−N 行` chip at the text column's right edge, and pops the removed lines up struck through on hover in a monospace flyout.
@@ -56,7 +63,7 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 
 - Every compile keeps the PDF **and** its `.synctex.gz` of the revision that preceded it, as one pair (`main.prev.pdf` ↔ `main.prev.synctex.gz`; the names must match because `synctex view -o` finds the map by name).
 - The pair becomes a *baseline* only when the baseline actually moves: 接受, auto approval or revert copy the artefacts on screen; a pending manual change deletes the pair instead of leaving a snapshot that would map old line numbers onto the wrong document.
-- State publishes `basePdfUrl`, `baseViewerUrl` and `baseRevisionId` (a digest of the baseline source) so the UI can show a previous revision — and refuse to when the pairing is not provable. Nothing draws it yet; this is the groundwork for viewing deleted content in its original typesetting.
+- State publishes `basePdfUrl`, `baseViewerUrl` and `baseRevisionId` (a digest of the baseline source) so the UI can show a previous revision — and refuse to when the pairing is not provable. The `上次编译版` view is what consumes it.
 
 **Client and integration**
 
@@ -67,12 +74,16 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 
 ### Changed
 
+- `getDiffRegions` takes `{ side: 'new' | 'base' }` and every region says which document it describes; the panel fetches only the side on screen (each one costs a `synctex view` sweep).
+- Diff bands are now positioned by the document's own line numbering on both sides: the source diff carries `oldStart`/`oldLines` alongside the new ones, which is what makes an old-revision lookup possible at all.
 - Deletion rendering went from a 2 px dashed seam to a 7 px red hatched band to a chip plus struck-through hover flyout, because a seam cannot say *what* was removed and a filled band reads as "this line changed".
 - `viewer/index.html` imports `viewer.js?v=<page version>`; `/assets` is served with `max-age=3600`, so a rebuilt viewer used to land an hour late.
 - README split into an English main page and `README.zh.md`; both link to each other and are edited in the same commit.
 
 ### Fixed
 
+- **Every diff line number was one too high, which put bands on the wrong line.** `diff_cleanupSemantic` was being run *after* `diff_charsToLines_`, so it moved fragment boundaries to character-level semantic edges — a fragment then began with a newline that actually terminated the previous line, and each block's line count gained one. A paragraph split in three painted the line after the change. Normalisation now runs while the text is still one character per line, so fragments stay line-aligned and the counts are exact.
+- **A blank line inside a change painted an unchanged line.** `synctex view` has no box for an empty line and answers with the *next* rendered line's box, so a deleted paragraph whose range included the blank line after it produced two bands, the second over text nobody had touched. Blank lines are dropped from the resolved range on both sides.
 - **PDF coordinates were scaled twice.** `page.getViewport({ scale: 1 })` already returns points (Letter → 612×792), but the click-to-point path also applied `72/96`, shrinking y to 0.75 and landing every lookup a few lines high — sometimes off the page.
 - **`synctex view`'s `y` is not the box top.** Comparing candidate rectangles against the text layer's spans showed `v - H` coincides with the line (full vertical overlap) while `y` sits below it, so every diff band was drawn a line low.
 - **`getDiff` always returned empty.** `previousSource` was overwritten with the current file after every successful compile, i.e. `diff(x, x)`. It now holds the previous *compiled* revision, alongside `compiledSource` for the current PDF, and only advances when the content actually changed — so pressing 编译 twice no longer erases the marks.
@@ -103,6 +114,8 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 ### Known limits
 
 - Reverse lookup and the highlight are **line-accurate, not character-accurate**; `Column` from SyncTeX is often `-1`.
+- The previous-revision view only exists while the baseline's artefacts are still paired with it. A pending change that the baseline has not moved to, a revert, or a fresh process deletes the pair, and the view then says so.
+- That view is read-only by construction: its line numbers belong to the old source.
 - Scanned PDFs have no text layer, so boxing may fail to resolve.
 - Cross-page selections reverse-jump only the part on the current page.
 - Deletions are shown as a chip plus hover text, not re-typeset, unless `对比` is used — and MiKTeX's `latexdiff.exe` needs a system Perl, absent on some Windows machines; the probe degrades to an install hint rather than throwing.

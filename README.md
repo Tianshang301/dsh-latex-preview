@@ -31,6 +31,7 @@ Compiling, rendering, SyncTeX, and diffing all run **on your machine**. Only wha
 - **Three review modes** — `手动审核` (you accept every change), `自动审核` (a **separate AI** reviews each change and rolls the source back when it says no), `完全放开` (no gate). The verdict and its reason land in the status bar.
 - **Diff highlight on the PDF (git-diff look)** — a `差异 N` button and coloured bands over the lines this compile changed: green for added, amber for modified, with a red/green **gutter strip** on each band's left edge; a deletion draws a red hatched seam plus a `−N 行` count chip. **Hovering a seam pops the removed source lines up — struck through, monospace, red** — the deleted words have no pixels left in the new PDF, and this is the only way to show them without re-typesetting. Click to pin in the status bar. Computed against the *previous compiled* revision, not the file on disk.
 - **对比视图 (latexdiff view, optional)** — the `对比` button hands the accepted and current revisions to `latexdiff`, which merges them into a third document that is then compiled: removed text is **typeset struck through in red**, added text is coloured — as readable as a git diff. Costs one extra compile and requires `latexdiff` (MiKTeX's `latexdiff.exe` additionally needs Perl on Windows, e.g. Strawberry Perl); when it is missing the button explains instead of failing.
+- **Previous revision (`上次编译版`)** — swaps the viewer to the PDF the diff is measured against, i.e. the revision where the lines that have since been **deleted** are still typeset. There they get a normal red band with a midline strikethrough, placed by looking the *old* line numbers up in the *old* SyncTeX instead of guessing from the seam above the hole; modified lines are amber, and a pure insertion keeps the seam. The view is **read-only** — its pixels belong to the old source, so selection, double-click and band clicks are suppressed rather than answered wrongly (text stays selectable and copyable).
 - **Redaction switch** — when on, only "message + line number" is sent; no source, no selected text.
 - **Clickable diagnostics** — clicking an error or warning scrolls the PDF to where that source line landed, printing the page and coordinates in the status line (the reverse direction, source → PDF).
 
@@ -81,7 +82,7 @@ A LaTeX preview tab shows up in the right sidebar. `main.tex` in the workspace r
 
 ### The panel
 
-The top strip is one row: `编译` / Compile, a **review-mode** dropdown, `发送给 Agent` / Send to Agent, then the controls that only exist when they mean something — `接受 N` (manual review, changes pending), `撤销` / Revert (any mode but open, changes pending), `差异 N` (disabled when this compile changed nothing), `对比` / Diff view, and the `脱敏` / Redaction checkbox, ending with a status line (compile result and duration, or the last message). The middle is the PDF, the bottom is the diagnostics list. If `tectonic` is missing the whole panel is replaced by an install hint and a `重新检测` / Re-check button.
+The top strip is one row: `编译` / Compile, a **review-mode** dropdown, `发送给 Agent` / Send to Agent, then the controls that only exist when they mean something — `接受 N` (manual review, changes pending), `撤销` / Revert (any mode but open, changes pending), `差异 N` (disabled when this compile changed nothing), `上次编译版` / Previous revision (disabled until the baseline's PDF and sync map are paired), `对比` / Diff view, and the `脱敏` / Redaction checkbox, ending with a status line (compile result and duration, or the last message). The middle is the PDF, the bottom is the diagnostics list. If `tectonic` is missing the whole panel is replaced by an install hint and a `重新检测` / Re-check button.
 
 | Action | Result |
 |---|---|
@@ -92,6 +93,7 @@ The top strip is one row: `编译` / Compile, a **review-mode** dropdown, `发�
 | "差异 N" / Diff N | Toggles the change highlight; the title says how many hunks and whether the caps left any out |
 | Hover a band | Shows which source line changed and the first sensible characters of it; hovering a deletion seam/chip pops up **the removed lines**, struck through |
 | "对比" / Diff view | Builds and shows the latexdiff document (removed text typeset struck through); click again to return to the live PDF; needs `latexdiff` (plus Perl for MiKTeX on Windows), with guidance when missing |
+| "上次编译版" / Previous revision | Shows the PDF the diff is measured against, with the deleted lines banded in red where they used to be; read-only, and disabled until a baseline's artefacts are paired |
 | Review dropdown | Manual / Auto (independent AI) / Fully open |
 | "接受 N" / Accept N | Marks the change set accepted and clears the marks (manual mode only) |
 | "撤销" / Revert | Writes the source back to the previous revision and recompiles; needs a second click |
@@ -133,7 +135,8 @@ Redaction (`redact`, off by default) sends "message + line number" only: no sour
 - **Reverse lookup is line-accurate, not character-accurate.** SyncTeX maps boxes to lines and `Column` is often `-1`; selecting one word yields the line (or lines) containing it.
 - **Scanned PDFs have no text layer**, so boxing may fail to resolve. Tectonic always emits a text layer, so this does not affect previews produced here.
 - **Cross-page selections** reverse-jump only the current page's part.
-- **A deletion is not re-typeset** — the new PDF has no room left where it was, so the overlay draws a seam plus a `−N` chip and **pops the removed source lines up on hover** (struck through, capped at 8 lines × 200 chars); for removed text in real typesetting use `对比` (latexdiff re-typesets a merged document; requires latexdiff, and Perl for MiKTeX's build on Windows).
+- **A deletion is not re-typeset** — the new PDF has no room left where it was, so the overlay draws a seam plus a `−N` chip and **pops the removed source lines up on hover** (struck through, capped at 8 lines × 200 chars); `上次编译版` shows the same lines still typeset on the previous PDF, and `对比` re-typesets a merged document (latexdiff, plus Perl for MiKTeX's build on Windows).
+- **The previous revision is only available while its artefacts are paired with it** — a pending change the baseline has not moved to, a revert, or a fresh process deletes that pair, and the button then explains instead of showing a document whose sync map no longer describes it.
 - **The highlight is capped** at 24 hunks / 40 resolved lines per revision; longer blocks are sampled evenly rather than truncated, and the surplus is reported in the button's title.
 - **Auto review spends model calls** and can be wrong. It runs only in that mode, and a timeout (25 s) or a missing model **falls back to manual** — it never approves by default.
 - **Revert and a rejecting reviewer write the source file** (back to the previous revision, then recompile). That is the plugin's only destructive action, which is why the button arms on a second click.
@@ -150,7 +153,7 @@ src/
     compile.ts                   Tectonic invocation + artifact rollback
     watcher.ts                   chokidar + debounce
     diff.ts                      line-level diff
-    diff-regions.ts              hunks → PDF band/seam coordinates (with removed text)
+    diff-regions.ts              hunks → PDF band/seam coordinates, both revisions' line numbers
     diffdoc.ts                   latexdiff 对比视图 (optional capability)
     reviewer.ts                  the independent reviewer (one-shot model call)
     agent-bridge.ts              prompt assembly + agent.steer delivery
@@ -158,7 +161,7 @@ src/
     static-route.ts              /assets static mount
   utils/                         binaries / root / log-parser / synctex / assets
   client/                        panel.tsx / pdf-viewer.ts / api.ts / index.tsx
-viewer/                          PDF.js viewer page (selection, box, inline bar, diff layer, removed-text flyout)
+viewer/                          PDF.js viewer page (selection, box, inline bar, diff layer, removed-text flyout, read-only mode)
 ```
 
 Two constraints worth knowing up front:

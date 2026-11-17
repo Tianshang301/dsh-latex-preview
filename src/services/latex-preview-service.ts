@@ -30,7 +30,7 @@ import { CompileService, compilePaths } from './compile.ts'
 import { DiffDocService } from './diffdoc.ts'
 import { FileWatcher } from './watcher.ts'
 import { lineDiff } from './diff.ts'
-import { bandsFromHits, diffHunks } from './diff-regions.ts'
+import { bandsFromHits, diffHunks, type DiffHunk } from './diff-regions.ts'
 import { AgentBridge, buildSelectionPrompt, type AgentLike, type AgentRegistryLike } from './agent-bridge.ts'
 import { renderDiffForReview, reviewDiff, type LlmLike, type ReviewRoute, type ReviewVerdict } from './reviewer.ts'
 import { createApiHandler, type PreviewHost } from './http-api.ts'
@@ -41,7 +41,9 @@ import type {
   DiffBlock,
   DiffDocResult,
   DiffRegion,
+  DiffRegionKind,
   DiffRegions,
+  DiffSide,
   EditOutcome,
   EditRequest,
   PreviewState,
@@ -383,29 +385,64 @@ export class LatexPreviewService extends TypertRemoteService {
   /**
    * Rectangles for the changes since the previous compile.
    *
-   * Deletions have no lines in the current PDF, so they are anchored where they
-   * were removed and drawn as a marker — the removed text itself is only
-   * visible in the previous revision, which the panel does not show.
+   * Two sides, because a change has two halves and only one of them is on screen
+   * at a time: `new` marks the live PDF (deletions can only be a seam there),
+   * `base` marks the previous revision, where the deleted text *is* typeset and
+   * therefore gets a real box out of the old `.synctex.gz`. The panel fetches
+   * whichever one it is showing.
+   * @param request.side - which revision to describe; defaults to `new`.
    * @param signal - client cancellation.
    * @returns regions tagged with the state version they were computed for.
    */
   @Remote
-  async getDiffRegions(signal: AbortSignal): Promise<DiffRegions> {
+  async getDiffRegions(request: { side?: DiffSide }, signal: AbortSignal): Promise<DiffRegions> {
     signal.throwIfAborted()
-    return this.readDiffRegions()
+    return this.readDiffRegions(request?.side === 'base' ? 'base' : 'new')
   }
 
   /** Body shared by the Remote method and the HTTP API. */
-  private async readDiffRegions(): Promise<DiffRegions> {
+  private async readDiffRegions(side: DiffSide = 'new'): Promise<DiffRegions> {
     const version = this.state.version
-    const empty: DiffRegions = { version, regions: [], skipped: 0 }
+    const empty: DiffRegions = { version, side, regions: [], skipped: 0 }
     const rootFile = this.state.rootFile
+    const base = this.previousSource
     const head = this.compiledSource
-    if (!rootFile || this.previousSource === null || head === null || !this.state.pdfUrl) return empty
+    if (!rootFile || base === null || head === null) return empty
 
-    const hunks = diffHunks(lineDiff(this.previousSource, head))
-    const totalLines = Math.max(1, head.split(/\r?\n/).length)
-    const pdf = compilePaths(rootFile, this.outDir).pdf
+    const hunks = diffHunks(lineDiff(base, head))
+    if (hunks.length === 0) {
+      return side === 'base' ? { ...empty, message: '两版内容一致，旧版没有可标的地方' } : empty
+    }
+    const paths = compilePaths(rootFile, this.outDir)
+
+    if (side === 'base') {
+      // The pair is only usable as a map of the *baseline*: check the digest
+      // rather than trust that the files on disk still describe `previousSource`.
+      if (this.baseRevisionId === null || !this.state.basePdfUrl || this.baseRevisionId !== this.digestOf(base)) {
+        return { ...empty, message: '旧版 PDF 与其 SyncTeX 未成对，无法定位被删除的内容' }
+      }
+      return this.baseRegions(version, rootFile, paths.basePdf, hunks, base)
+    }
+
+    if (!this.state.pdfUrl) return empty
+    return this.newRegions(version, rootFile, paths.pdf, hunks, head)
+  }
+
+  /**
+   * Bands on the **live** PDF.
+   *
+   * A deletion has no lines here, so it becomes a seam at the foot of the line
+   * above the hole — see {@link readDiffRegions} for the other half.
+   */
+  private async newRegions(
+    version: number,
+    rootFile: string,
+    pdf: string,
+    hunks: readonly DiffHunk[],
+    head: string,
+  ): Promise<DiffRegions> {
+    const sourceLines = head.split(/\r?\n/)
+    const totalLines = Math.max(1, sourceLines.length)
     const regions: DiffRegion[] = []
     let budget = MAX_DIFF_LINES
     let skipped = Math.max(0, hunks.length - MAX_DIFF_HUNKS)
@@ -432,8 +469,14 @@ export class LatexPreviewService extends TypertRemoteService {
         }
         hits.push(...anchor)
       } else {
-        const lines = sampleLines(first, last, budget)
+        const lines = typesetLines(sampleLines(first, last, budget), sourceLines)
         budget -= lines.length
+        // A range that is only blank lines renders nowhere: counting it as skipped
+        // is honest, marking a neighbour would not be.
+        if (lines.length === 0) {
+          skipped += 1
+          continue
+        }
         for (const line of lines) {
           hits.push(...(await synctexView(rootFile, line, pdf, { cwd: this.outDir })))
         }
@@ -451,11 +494,12 @@ export class LatexPreviewService extends TypertRemoteService {
       for (const band of bandsFromHits(hits)) {
         // The seam sits at the foot of the line above the hole, which is where the
         // deleted content used to begin.
-        const y = hunk.kind === 'delete' ? band.y + band.height : band.y
+        const seam = hunk.kind === 'delete'
         regions.push({
           ...band,
-          y,
+          y: seam ? band.y + band.height : band.y,
           kind: hunk.kind,
+          ...(seam ? { seam: true } : {}),
           lineStart: first,
           lineEnd: last,
           title,
@@ -467,7 +511,85 @@ export class LatexPreviewService extends TypertRemoteService {
       }
     }
 
-    return { version, regions, skipped }
+    return { version, side: 'new', regions, skipped }
+  }
+
+  /**
+   * Bands on the **previous** revision's PDF.
+   *
+   * This is the view where a deletion is finally a first-class citizen: the lines
+   * still exist on that page, so `synctex view -o main.prev.pdf` returns their
+   * real boxes and they are painted as ordinary bands. A pure insertion has
+   * nothing to highlight here, so it keeps the seam treatment — pointing at the
+   * line after which the new text appeared.
+   */
+  private async baseRegions(
+    version: number,
+    rootFile: string,
+    basePdf: string,
+    hunks: readonly DiffHunk[],
+    base: string,
+  ): Promise<DiffRegions> {
+    // The *old* source is what the old line numbers index; using the new one
+    // here would decide which lines are blank against the wrong document.
+    const sourceLines = base.split(/\r?\n/)
+    const totalLines = Math.max(1, sourceLines.length)
+    const regions: DiffRegion[] = []
+    let budget = MAX_DIFF_LINES
+    let skipped = Math.max(0, hunks.length - MAX_DIFF_HUNKS)
+
+    for (const hunk of hunks.slice(0, MAX_DIFF_HUNKS)) {
+      if (budget <= 0) {
+        skipped += 1
+        continue
+      }
+
+      if (hunk.oldLines === 0) {
+        // Insertion: nothing on the old page to tint. Mark where it landed.
+        budget -= 1
+        const anchorLine = Math.min(Math.max(1, hunk.oldStart), totalLines)
+        const anchor = await this.mappedLine(rootFile, basePdf, totalLines, anchorLine, 'before')
+        if (anchor === null) {
+          skipped += 1
+          continue
+        }
+        const title = `旧版第 ${anchorLine} 行之后新增了内容（旧版 PDF 里没有这段）`
+        for (const band of bandsFromHits(anchor)) {
+          regions.push({
+            ...band,
+            y: band.y + band.height,
+            kind: 'insert',
+            seam: true,
+            lineStart: anchorLine,
+            lineEnd: anchorLine,
+            title,
+          })
+        }
+        continue
+      }
+
+      const first = Math.min(Math.max(1, hunk.oldStart), totalLines)
+      const last = Math.min(Math.max(first, hunk.oldStart + hunk.oldLines - 1), totalLines)
+      const lines = typesetLines(sampleLines(first, last, budget), sourceLines)
+      budget -= lines.length
+      if (lines.length === 0) {
+        skipped += 1
+        continue
+      }
+      const hits: SyncViewHit[] = []
+      for (const line of lines) {
+        hits.push(...(await synctexView(rootFile, line, basePdf, { cwd: this.outDir })))
+      }
+      const kind: DiffRegionKind = hunk.kind === 'delete' ? 'removed' : 'modify'
+      const where = first === last ? `第 ${first} 行` : `第 ${first}-${last} 行`
+      const what = kind === 'removed' ? `这 ${hunk.removed} 行已被删除` : '这一处已被改写'
+      const title = hunk.preview === '' ? `旧版${where}：${what}` : `旧版${where}：${what}（${hunk.preview}）`
+      for (const band of bandsFromHits(hits)) {
+        regions.push({ ...band, kind, lineStart: first, lineEnd: last, title })
+      }
+    }
+
+    return { version, side: 'base', regions, skipped }
   }
 
   /**
@@ -1143,7 +1265,7 @@ export class LatexPreviewService extends TypertRemoteService {
       configure: (request) => this.applyConfigure(request),
       compile: () => this.runCompile(),
       diff: () => this.readDiff(),
-      diffRegions: () => this.readDiffRegions(),
+      diffRegions: (request) => this.readDiffRegions(request.side === 'base' ? 'base' : 'new'),
       diffDoc: () => this.applyDiffDoc(),
       accept: () => this.applyAccept(),
       revert: () => this.applyRevert(),
@@ -1205,6 +1327,22 @@ export class LatexPreviewService extends TypertRemoteService {
 }
 
 export default LatexPreviewService
+
+/**
+ * Drop blank lines from a sampled range.
+ *
+ * `synctex view` has no box for an empty line and answers with the **next** rendered
+ * line's box instead (measured: old line 8, a blank, came back as line 9's box),
+ * so a blank line in the middle of a hunk paints an unchanged line as changed.
+ * A blank line has no glyphs, so marking nothing is the truthful answer — and a
+ * hunk that is *only* blanks counts as skipped rather than pointing at a neighbour.
+ * @param lines - 1-based line numbers, ascending.
+ * @param sourceLines - the revision's lines, already split.
+ * @returns the numbers whose line is not blank.
+ */
+function typesetLines(lines: readonly number[], sourceLines: readonly string[]): number[] {
+  return lines.filter((line) => (sourceLines[line - 1] ?? '').trim() !== '')
+}
 
 /**
  * Pick the lines of a range that fit the budget, spread evenly.

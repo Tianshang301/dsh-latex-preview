@@ -48,11 +48,16 @@ export function normalizeLatex(source: string): string {
 
 /**
  * Line-level diff between two revisions.
+ *
+ * Both sides are numbered, not just the new one: a deletion has no lines left in
+ * the new revision, and the only place its text still exists is the old PDF —
+ * which means mapping it needs the *old* line number (docs/spikes.md §B21).
  * @param oldText - previous source.
  * @param newText - current source.
  * @param options.normalize - compare normalised lines (default true).
- * @returns blocks in document order; line numbers are 1-based and refer to `newText`,
- *   except for `delete` blocks which point at the position they were removed from.
+ * @returns blocks in document order; `startLine`/`endLine` are 1-based and refer to
+ *   `newText` (a `delete` points at the position it was removed from), while
+ *   `oldStart`/`oldLines` refer to `oldText`.
  */
 export function lineDiff(oldText: string, newText: string, options: { normalize?: boolean } = {}): DiffBlock[] {
   const normalize = options.normalize ?? true
@@ -64,21 +69,33 @@ export function lineDiff(oldText: string, newText: string, options: { normalize?
   const mapper = new DiffMatchPatch()
   const mapped = mapper.diff_linesToChars_(left, right)
   const diffs = mapper.diff_main(mapped.chars1, mapped.chars2, false)
-  mapper.diff_charsToLines_(diffs, mapped.lineArray)
+  // Clean up **while one line is still one character**: the pass merges a
+  // delete/insert separated by a short equal run, which is what keeps "changed a
+  // line" one hunk instead of three. Run after `diff_charsToLines_` it shifts
+  // boundaries to character-level semantic edges — a fragment then starts in the
+  // middle of a line, every line count gains one, and the PDF band lands on the
+  // line *after* the change (docs/spikes.md §B21).
   mapper.diff_cleanupSemantic(diffs)
+  mapper.diff_charsToLines_(diffs, mapped.lineArray)
 
   const blocks: DiffBlock[] = []
   let newLine = 1
+  let oldLine = 1
   for (const [op, text] of diffs) {
     if (text === '') continue
     const lineCount = countLines(text)
     const startLine = newLine
+    const oldStart = oldLine
     if (op !== -1) newLine += lineCount
+    // An equal or deleted block consumes old lines; an insertion consumes none.
+    if (op !== 1) oldLine += lineCount
     blocks.push({
       type: op === 1 ? 'insert' : op === -1 ? 'delete' : 'equal',
       text,
       startLine,
       endLine: op === -1 ? startLine : startLine + Math.max(0, lineCount - 1),
+      oldStart,
+      oldLines: op === 1 ? 0 : lineCount,
     })
   }
   return blocks

@@ -125,8 +125,20 @@ export interface EditOutcome {
 export interface DiffBlock {
   readonly type: 'insert' | 'delete' | 'equal'
   readonly text: string
+  /** First line in the **new** revision (for a deletion: where it was removed). */
   readonly startLine: number
   readonly endLine: number
+  /**
+   * First line in the **old** revision this block covers, 1-based.
+   *
+   * Needed by the previous-revision view: a deleted line no longer exists in the
+   * new PDF, but it does exist in the old one, and only its *old* number can be
+   * looked up in the old `.synctex.gz`. For an insertion this is the position it
+   * was inserted at, i.e. the old line it now follows.
+   */
+  readonly oldStart: number
+  /** How many old lines the block covers; 0 for a pure insertion. */
+  readonly oldLines: number
 }
 
 /**
@@ -139,10 +151,13 @@ export interface DiffBlock {
  */
 export type ReviewMode = 'manual' | 'auto' | 'open'
 
-/** What a changed region means, in diff terms. */
-export type DiffRegionKind = 'insert' | 'delete' | 'modify'
+/** Which document a set of regions describes. */
+export type DiffSide = 'new' | 'base'
 
-/** One highlight box drawn on a page of the current PDF. */
+/** What a changed region means, in diff terms. */
+export type DiffRegionKind = 'insert' | 'delete' | 'modify' | 'removed'
+
+/** One highlight box drawn on a page of one revision's PDF. */
 export interface DiffRegion {
   /** 1-based page. */
   readonly page: number
@@ -151,8 +166,19 @@ export interface DiffRegion {
   readonly y: number
   readonly width: number
   readonly height: number
+  /**
+   * What the band means.
+   *
+   * `delete` is the one kind with no pixels of its own: on the *new* PDF the
+   * lines are gone, so it is drawn as a seam where they used to be. `removed` is
+   * the same change seen on the *old* PDF, where the text is still typeset, so it
+   * is a normal band.
+   */
   readonly kind: DiffRegionKind
-  /** Source line range in the *new* revision; equal values mean one line. */
+  /**
+   * Source line range **in the document being shown**: new lines for a region
+   * from the live PDF, old lines for one from {@link DiffRegions.side} `base`.
+   */
   readonly lineStart: number
   readonly lineEnd: number
   /** Hover text: what changed and where. */
@@ -167,15 +193,34 @@ export interface DiffRegion {
   readonly text?: string
   /** Lines the deletion removed; 0 (absent) for insert/modify bands. */
   readonly removed?: number
+  /**
+   * Draw this as a thin seam rather than a band over a line.
+   *
+   * Set where the marked line does not exist on the page being shown: a deletion
+   * on the live PDF, an insertion on the previous one. Geometry, not colour —
+   * `kind` alone cannot express it because the same kind can be a band on one
+   * side and a seam on the other.
+   */
+  readonly seam?: boolean
 }
 
 /** Regions for one compiled revision, plus what the caps left out. */
 export interface DiffRegions {
   /** `PreviewState.version` these regions belong to; the panel applies on match. */
   readonly version: number
+  /** Which document these rectangles describe; `base` means the old PDF. */
+  readonly side: DiffSide
   readonly regions: readonly DiffRegion[]
   /** Hunks skipped by the caps, so the UI can say so instead of lying. */
   readonly skipped: number
+  /**
+   * Why `side: 'base'` came back empty, when it did.
+   *
+   * The panel shows this instead of an empty overlay: "no previous revision" and
+   * "its sync map could not be paired" are different facts, and drawing nothing
+   * for both is what makes a UI feel broken.
+   */
+  readonly message?: string
 }
 
 /** Outcome of building the latexdiff 对比视图, as handed back to the client. */

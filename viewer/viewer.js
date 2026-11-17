@@ -21,6 +21,12 @@
  * Contract with the host panel (`client/panel.tsx`):
  *   parent ← { source: 'latex-preview-viewer', type: 'ready' | 'page' | 'sync-reverse' | 'edit-request' | 'diff-click' | 'error' }
  *   viewer ← { source: 'latex-preview-panel', type: 'diff', regions, visible }
+ *   viewer ← { source: 'latex-preview-panel', type: 'mode', readOnly }
+ *
+ * `readOnly` is set while the previous revision is on screen: its page maps to the
+ * *old* source, so a selection there would hand the Host old line numbers, and a
+ * reverse jump would report a line that no longer holds that text. The overlay
+ * still works — that is the whole reason to look at that document.
  *
  * @module dsh-latex-preview/viewer
  */
@@ -221,6 +227,14 @@ let diffRegions = []
 let diffVisible = true
 
 /**
+ * True while the previous revision is the document on screen.
+ *
+ * Every gesture on that page would resolve against the old source, so they are
+ * suppressed rather than mis-answered: no edit bar, no reverse jump, no line jump.
+ */
+let readOnly = false
+
+/**
  * Bumped on every incoming `diff` message. A paint started under an older
  * generation must not commit: it was computed from regions that no longer apply.
  */
@@ -330,13 +344,15 @@ async function paintDiffPage(pageEl) {
     box.style.left = `${pct.left}%`
     box.style.top = `${pct.top}%`
     box.style.width = `${pct.width}%`
-    // A deletion has no text left to tint. It gets a short hatched band instead of
-    // a solid one, so it reads as "something was removed here" and not as "this
-    // line changed". Its thickness follows the line so it scales with zoom instead
-    // of staying 7 screen pixels at every magnification.
+    // A seam marks a change whose line is not on *this* page: a deletion on the
+    // live PDF, an insertion on the previous one. It gets a short hatched band
+    // instead of a solid one, so it reads as "something happened here" and not as
+    // "this line changed". Its thickness follows the line so it scales with zoom
+    // instead of staying 7 screen pixels at every magnification.
+    const seam = region.seam === true
     const linePx = pageHeightPx > 0 ? (region.height / viewport.height) * pageHeightPx : 0
     const seamPx = Math.min(SEAM_MAX, Math.max(SEAM_MIN, linePx * 0.55))
-    box.style.height = region.kind === 'delete' ? `${seamPx}px` : `${pct.height}%`
+    box.style.height = seam ? `${seamPx}px` : `${pct.height}%`
     layer.append(box)
 
     if (region.kind === 'delete') {
@@ -349,7 +365,7 @@ async function paintDiffPage(pageEl) {
       chip.style.top = `${pct.top}%`
       layer.append(chip)
     }
-    nextPainted.push({ pageEl, region, width: viewport.width, height: viewport.height, seamPx })
+    nextPainted.push({ pageEl, region, width: viewport.width, height: viewport.height, seamPx, seam })
   }
 
   // Swap in one step: the old layer stays until the new one is in the DOM.
@@ -383,8 +399,7 @@ function regionClientRect(entry) {
   const top = box.top + (entry.region.y / entry.height) * box.height
   // Match what is actually drawn: a seam has its own thickness, a band has the
   // line height. Both fall back to HIT_MIN so a hairline is still reachable.
-  const drawn =
-    entry.region.kind === 'delete' ? entry.seamPx : (entry.region.height / entry.height) * box.height
+  const drawn = entry.seam ? entry.seamPx : (entry.region.height / entry.height) * box.height
   return { left, right, top, bottom: top + Math.max(drawn || 0, HIT_MIN) }
 }
 
@@ -474,7 +489,16 @@ eventBus.on('pagerendered', (event) => {
 
 window.addEventListener('message', (event) => {
   const data = event.data
-  if (!data || data.source !== PANEL_SOURCE || data.type !== 'diff') return
+  if (!data || data.source !== PANEL_SOURCE) return
+  if (data.type === 'mode') {
+    readOnly = data.readOnly === true
+    if (readOnly) {
+      closeBar()
+      drag = null
+    }
+    return
+  }
+  if (data.type !== 'diff') return
   // Any paint already in flight is now working from regions that no longer apply.
   diffGeneration += 1
   diffRegions = Array.isArray(data.regions) ? data.regions : []
@@ -502,6 +526,7 @@ container.addEventListener('mouseleave', hideDiffFlyout)
 // A click on a band jumps to the source line that produced it. Hit-tested rather
 // than bound to the element, because the layer must stay transparent to the mouse.
 container.addEventListener('click', (event) => {
+  if (readOnly) return
   if (Date.now() < suppressClickUntil) return
   if (!window.getSelection()?.isCollapsed) return
   const region = diffRegionAt(event.clientX, event.clientY)
@@ -515,6 +540,7 @@ container.addEventListener('click', (event) => {
  * Two frames of the same gesture are not needed — the panel only reads the line.
  */
 viewerEl.addEventListener('dblclick', async (event) => {
+  if (readOnly) return
   const pageEl = pageOf(event.target)
   if (!pageEl) return
   const point = await toPdfRect(pageEl, {
@@ -529,6 +555,7 @@ viewerEl.addEventListener('dblclick', async (event) => {
 
 /** Selection → bar, on mouse release inside the document. */
 container.addEventListener('mouseup', async () => {
+  if (readOnly) return
   const selection = window.getSelection()
   if (!selection || selection.isCollapsed) return
   const text = selection.toString().trim()
@@ -549,6 +576,7 @@ container.addEventListener('mouseup', async () => {
  */
 let drag = null
 container.addEventListener('mousedown', (event) => {
+  if (readOnly) return
   if (event.button !== 0) return
   const target = event.target instanceof Element ? event.target : null
   if (target?.closest('.textLayer')) return

@@ -16,13 +16,23 @@
 
 import type { DiffBlock, DiffRegionKind, SyncViewHit } from '../types.ts'
 
-/** One contiguous change, in terms of the new revision's line numbers. */
+/** One contiguous change, described in both revisions' line numbers. */
 export interface DiffHunk {
   readonly kind: DiffRegionKind
   /** First source line in the new revision (for a deletion: where it was). */
   readonly lineStart: number
   /** Last source line in the new revision; equals `lineStart` for a deletion. */
   readonly lineEnd: number
+  /**
+   * First source line **in the old revision** that this hunk touched.
+   *
+   * The previous-revision view maps this against `main.prev.synctex.gz`, which is
+   * the only way to get a real box for text that the new PDF has already dropped.
+   * For a pure insertion it is the old line the new text was inserted after.
+   */
+  readonly oldStart: number
+  /** Old lines the hunk covers; 0 for a pure insertion. */
+  readonly oldLines: number
   /** How many lines the deletion removed, 0 otherwise. */
   readonly removed: number
   /** First few characters of the changed text, for the hover title. */
@@ -47,6 +57,10 @@ export function diffHunks(blocks: readonly DiffBlock[]): DiffHunk[] {
 
   const flush = (): void => {
     if (inserts.length === 0 && deletes.length === 0) return
+    // A replacement may be emitted either way round; the old side starts at the
+    // first *deleted* line whenever there is one.
+    const oldStart = deletes.length > 0 ? deletes[0]!.oldStart : inserts[0]!.oldStart
+    const oldLines = deletes.reduce((sum, block) => sum + block.oldLines, 0)
     if (inserts.length > 0) {
       const lineStart = inserts[0]!.startLine
       const lineEnd = inserts[inserts.length - 1]!.endLine
@@ -54,6 +68,8 @@ export function diffHunks(blocks: readonly DiffBlock[]): DiffHunk[] {
         kind: deletes.length > 0 ? 'modify' : 'insert',
         lineStart,
         lineEnd: Math.max(lineStart, lineEnd),
+        oldStart,
+        oldLines,
         removed: deletedLineCount(deletes),
         preview: previewOf(inserts),
         // The new lines render under the band; only the removed ones need the
@@ -66,6 +82,8 @@ export function diffHunks(blocks: readonly DiffBlock[]): DiffHunk[] {
         kind: 'delete',
         lineStart,
         lineEnd: lineStart,
+        oldStart,
+        oldLines,
         removed: deletedLineCount(deletes),
         preview: previewOf(deletes),
         // The removed lines exist nowhere in the new PDF; this text is the only

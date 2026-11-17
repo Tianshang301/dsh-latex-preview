@@ -165,6 +165,18 @@ export class PDFViewer {
     this.adapter.post({ source: 'latex-preview-panel', type: 'diff', regions, visible })
   }
 
+  /**
+   * Turn the viewer's gestures off (or back on).
+   *
+   * Set while the previous revision is on screen: its pages map to the *old*
+   * source, so pointing at a line there would edit or report the wrong one. The
+   * overlay stays live, which is the only thing that view is for.
+   * @param readOnly - true to suppress selection, double-click and band jumps.
+   */
+  setReadOnly(readOnly: boolean): void {
+    this.adapter.post({ source: 'latex-preview-panel', type: 'mode', readOnly })
+  }
+
   /** Drop any captured state (called when the user opens a different file). */
   reset(): void {
     this.state = null
