@@ -108,6 +108,42 @@ export function diffHunks(blocks: readonly DiffBlock[]): DiffHunk[] {
 }
 
 /**
+ * Where a pure insertion belongs on the **previous** revision.
+ *
+ * The inserted lines exist only in the new document, so the old page can only say
+ * "it went in here": at the foot of the line before it, or — when it went in
+ * above line 1 — at the top edge of line 1. Both the line to locate and which of
+ * its edges to use have to be decided together, which is why this returns both.
+ */
+export interface InsertionAnchor {
+  /** 1-based line of the old revision to locate. */
+  readonly line: number
+  /** Which edge of that line the seam sits on. */
+  readonly edge: 'top' | 'bottom'
+}
+
+/**
+ * Resolve the anchor for an insertion that inserted no old lines.
+ *
+ * `oldStart` is the first old line that *follows* the insertion, so the seam
+ * belongs to `oldStart - 1`. Clamping `oldStart` itself (the pre-fix behaviour)
+ * pointed at the line after the insertion — for text added just before
+ * `\end{document}` that is the closing tag, whose `synctex view` answer is the
+ * page-number box at the bottom of the sheet (docs/spikes.md §B17), so the marker
+ * landed in the footer.
+ * @param oldStart - `DiffHunk.oldStart` of a pure insertion.
+ * @param totalLines - line count of the old revision.
+ * @returns the line to locate and the edge the seam is drawn on.
+ */
+export function insertionAnchor(oldStart: number, totalLines: number): InsertionAnchor {
+  const total = Math.max(1, totalLines)
+  // Inserted above the first line: nothing precedes it, so hang the seam on the
+  // top edge of line 1 rather than being clamped to the bottom of line 1.
+  if (oldStart <= 1) return { line: 1, edge: 'top' }
+  return { line: Math.min(oldStart - 1, total), edge: 'bottom' }
+}
+
+/**
  * One rectangle per text line, built from the boxes SyncTeX reported.
  *
  * Merge rule: boxes on the same page whose vertical ranges overlap by at least

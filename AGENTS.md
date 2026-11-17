@@ -20,7 +20,8 @@
 - **Read `docs/spikes.md` before writing any code.** It replaces most of HANDOFF §6's open questions with evidence read out of the real published packages.
 - Source of truth for design: `docs/LaTeX Preview — 开发文档.md` — but note it is **wrong on three points**, corrected in `docs/spikes.md`: (a) callbacks cannot cross Host↔Client, (b) `createUserMessage` takes `source: { kind: 'user' }` — a discriminated object, and `dsh-llm@0.2.2-rc.1` removed the old `plugin` kind, (c) `synctex` field/regex details differ from the spec's parser.
 - Key docs (all under `docs/`): `spikes.md` (verified contracts), `HANDOFF.md` (status/decisions), `DEVELOPMENT_PLAN.md` (WBS + risks + gates), `LaTeX Preview — 开发文档.md` (architecture).
-- Commands: `npx tsc -p tsconfig.json --noEmit` (typecheck), `npx tsx test/contract/probe.ts` (contract probe), `npx tsc -p tsconfig.json && node scripts/build-client.mjs` (build). `pnpm run <script>` is broken on this machine — see `docs/spikes.md` §B10.
+- Commands: `npx tsc -p tsconfig.json --noEmit` (typecheck), `npx tsx test/contract/probe.ts` (contract probe), `npm test` (`tsx --test test/unit/*.test.ts`), `npx tsc -p tsconfig.json && node scripts/build-client.mjs` (build). `pnpm run <script>` is broken on this machine — see `docs/spikes.md` §B10.
+- **Insertion seams anchor on the line before** (2026-11-18): `insertionAnchor(oldStart, totalLines)` in `diff-regions.ts` returns both the line to locate and the edge to draw on — an insertion above line 1 hangs on its **top** edge, everything else on the previous line's bottom. Clamping `oldStart` itself (the first version) pointed at `\end{document}` for text added near the end, which answers `synctex view` with the page-number box, so the seam landed in the page footer. `mappedLine(..., renders)` must also skip blank/comment-only lines: they answer with the *next* rendered line's box and put the seam one paragraph low. See `docs/spikes.md` §B22.
 
 ## What is being built
 

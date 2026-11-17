@@ -72,6 +72,10 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 - 13 `@Remote` methods mirror the routes for in-process callers.
 - `发送给 Agent` hands the current compile failure to the session, with a redaction switch.
 
+**Tests**
+
+- `npm test` runs `tsx --test test/unit/*.test.ts` — `node:test`, no new dependency. The first suite pins the previous-revision insertion anchor: above the first line, between two lines, after the last line, in front of a closing tag, and the clamps at both ends. It also asserts the diff really emits a *pure* insertion (0 old lines) for each, so the anchor rule cannot silently start applying to a `modify`.
+
 ### Changed
 
 - `getDiffRegions` takes `{ side: 'new' | 'base' }` and every region says which document it describes; the panel fetches only the side on screen (each one costs a `synctex view` sweep).
@@ -84,6 +88,7 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 
 - **Every diff line number was one too high, which put bands on the wrong line.** `diff_cleanupSemantic` was being run *after* `diff_charsToLines_`, so it moved fragment boundaries to character-level semantic edges — a fragment then began with a newline that actually terminated the previous line, and each block's line count gained one. A paragraph split in three painted the line after the change. Normalisation now runs while the text is still one character per line, so fragments stay line-aligned and the counts are exact.
 - **A blank line inside a change painted an unchanged line.** `synctex view` has no box for an empty line and answers with the *next* rendered line's box, so a deleted paragraph whose range included the blank line after it produced two bands, the second over text nobody had touched. Blank lines are dropped from the resolved range on both sides.
+- **An insertion just above `\end{document}` marked the page footer.** The previous-revision seam for a pure insertion was anchored at `hunk.oldStart` — the first old line *after* the insertion — instead of the line before it. Above the closing tag that anchor is `\end{document}` itself, and `synctex view` answers for it with the page-number box (measured on a real compile: y≈695.6, the footer, versus 197.6 for the right line). `insertionAnchor()` now decides the line **and** which edge to draw on, so an insertion at the very top of a file hangs on line 1's top edge instead of being clamped to its bottom; the walk to that anchor also skips blank and comment-only lines, which answer with the *next* rendered line's box and had put a mid-document insertion one paragraph low.
 - **PDF coordinates were scaled twice.** `page.getViewport({ scale: 1 })` already returns points (Letter → 612×792), but the click-to-point path also applied `72/96`, shrinking y to 0.75 and landing every lookup a few lines high — sometimes off the page.
 - **`synctex view`'s `y` is not the box top.** Comparing candidate rectangles against the text layer's spans showed `v - H` coincides with the line (full vertical overlap) while `y` sits below it, so every diff band was drawn a line low.
 - **`getDiff` always returned empty.** `previousSource` was overwritten with the current file after every successful compile, i.e. `diff(x, x)`. It now holds the previous *compiled* revision, alongside `compiledSource` for the current PDF, and only advances when the content actually changed — so pressing 编译 twice no longer erases the marks.

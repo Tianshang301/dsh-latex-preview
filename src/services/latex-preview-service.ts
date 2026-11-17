@@ -29,8 +29,8 @@ import { synctexEdit, synctexView } from '../utils/synctex.ts'
 import { CompileService, compilePaths } from './compile.ts'
 import { DiffDocService } from './diffdoc.ts'
 import { FileWatcher } from './watcher.ts'
-import { lineDiff } from './diff.ts'
-import { bandsFromHits, diffHunks, type DiffHunk } from './diff-regions.ts'
+import { lineDiff, normalizeLatexLine } from './diff.ts'
+import { bandsFromHits, diffHunks, insertionAnchor, type DiffHunk } from './diff-regions.ts'
 import { AgentBridge, buildSelectionPrompt, type AgentLike, type AgentRegistryLike } from './agent-bridge.ts'
 import { renderDiffForReview, reviewDiff, type LlmLike, type ReviewRoute, type ReviewVerdict } from './reviewer.ts'
 import { createApiHandler, type PreviewHost } from './http-api.ts'
@@ -462,7 +462,10 @@ export class LatexPreviewService extends TypertRemoteService {
         // answers for those with the *page-number* box at the bottom of the sheet.
         // The text above the hole always renders, and the seam belongs at its foot.
         budget -= 1
-        const anchor = first > 1 ? await this.mappedLine(rootFile, pdf, totalLines, first - 1, 'before') : null
+        const anchor =
+          first > 1
+            ? await this.mappedLine(rootFile, pdf, totalLines, first - 1, 'before', (line) => isTypeset(sourceLines, line))
+            : null
         if (anchor === null) {
           skipped += 1
           continue
@@ -545,19 +548,31 @@ export class LatexPreviewService extends TypertRemoteService {
       }
 
       if (hunk.oldLines === 0) {
-        // Insertion: nothing on the old page to tint. Mark where it landed.
+        // Insertion: nothing on the old page to tint, so mark where it landed.
+        // `oldStart` is the first old line *after* the insertion; the seam belongs
+        // on the one before it (see `insertionAnchor`).
         budget -= 1
-        const anchorLine = Math.min(Math.max(1, hunk.oldStart), totalLines)
-        const anchor = await this.mappedLine(rootFile, basePdf, totalLines, anchorLine, 'before')
+        const { line: anchorLine, edge } = insertionAnchor(hunk.oldStart, totalLines)
+        const anchor = await this.mappedLine(
+          rootFile,
+          basePdf,
+          totalLines,
+          anchorLine,
+          'before',
+          (line) => isTypeset(sourceLines, line),
+        )
         if (anchor === null) {
           skipped += 1
           continue
         }
-        const title = `旧版第 ${anchorLine} 行之后新增了内容（旧版 PDF 里没有这段）`
+        const title =
+          edge === 'top'
+            ? `旧版第 ${anchorLine} 行之前新增了内容（旧版 PDF 里没有这段）`
+            : `旧版第 ${anchorLine} 行之后新增了内容（旧版 PDF 里没有这段）`
         for (const band of bandsFromHits(anchor)) {
           regions.push({
             ...band,
-            y: band.y + band.height,
+            y: edge === 'top' ? band.y : band.y + band.height,
             kind: 'insert',
             seam: true,
             lineStart: anchorLine,
@@ -1033,6 +1048,9 @@ export class LatexPreviewService extends TypertRemoteService {
    * @param totalLines - line count of the compiled source.
    * @param line - the line to start from.
    * @param direction - search up or down first when `line` itself renders nothing.
+   * @param renders - whether a line can have a box at all; blank lines answer with
+   *   the *next* rendered line's box instead of nothing (docs/spikes.md §B21), so
+   *   callers that need "the line above the hole" must exclude them here.
    * @returns hits for the first line that renders, or null when none does.
    */
   private async mappedLine(
@@ -1041,12 +1059,15 @@ export class LatexPreviewService extends TypertRemoteService {
     totalLines: number,
     line: number,
     direction: 'before' | 'after' = 'after',
+    renders?: (line: number) => boolean,
   ): Promise<SyncViewHit[] | null> {
     const offsets = direction === 'before' ? [0, -1, -2, -3, -4, 1, 2, 3, 4] : [0, 1, 2, 3, 4, -1, -2, -3, -4]
     const candidates: number[] = []
     for (const offset of offsets) {
       const candidate = line + offset
-      if (candidate >= 1 && candidate <= totalLines && !candidates.includes(candidate)) candidates.push(candidate)
+      if (candidate < 1 || candidate > totalLines || candidates.includes(candidate)) continue
+      if (renders && !renders(candidate)) continue
+      candidates.push(candidate)
     }
     for (const candidate of candidates) {
       const hits = await synctexView(rootFile, candidate, pdf, { cwd: this.outDir })
@@ -1329,6 +1350,22 @@ export class LatexPreviewService extends TypertRemoteService {
 export default LatexPreviewService
 
 /**
+ * Whether a source line can have a box on the page.
+ *
+ * Judged on the *normalised* line, so a blank line and a comment-only line both
+ * count as nothing to render — and `synctex view` answers for either with the
+ * next rendered line's box, so "walk up to the line above the hole" must skip them
+ * rather than accept that answer (docs/spikes.md §B21).
+ * @param sourceLines - the revision's lines, already split.
+ * @param line - 1-based line number.
+ * @returns false when the line carries no typeset content.
+ */
+function isTypeset(sourceLines: readonly string[], line: number): boolean {
+  const text = sourceLines[line - 1]
+  return text !== undefined && normalizeLatexLine(text) !== ''
+}
+
+/**
  * Drop blank lines from a sampled range.
  *
  * `synctex view` has no box for an empty line and answers with the **next** rendered
@@ -1341,7 +1378,7 @@ export default LatexPreviewService
  * @returns the numbers whose line is not blank.
  */
 function typesetLines(lines: readonly number[], sourceLines: readonly string[]): number[] {
-  return lines.filter((line) => (sourceLines[line - 1] ?? '').trim() !== '')
+  return lines.filter((line) => isTypeset(sourceLines, line))
 }
 
 /**
