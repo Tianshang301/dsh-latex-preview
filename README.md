@@ -16,23 +16,23 @@ This plugin collapses that into the sidebar:
 
 | While writing | When it breaks | When you want something changed |
 |---|---|---|
-| Save → compile → PDF refreshes in place, scroll position kept | Click a diagnostic to jump to its source line | Select or box a region in the PDF → one sentence → the Agent edits the source → recompile |
+| Save → compile → PDF refreshes in place, scroll position kept | Click a diagnostic to scroll the PDF to where that line landed | Select or box a region in the PDF → one sentence → the Agent edits the source → recompile |
 
-Compiling, rendering, SyncTeX, and diffing all run **on your machine**. Only the error context or selection anchor you explicitly send reaches the Agent session.
+Compiling, rendering, SyncTeX, and diffing all run **on your machine**. Only what you explicitly send reaches the Agent session — plus the change diff when auto review is on (see [Privacy boundary](#privacy-boundary)).
 
 ## Features
 
 - **Live preview** — `chokidar` watch plus a 500 ms debounce; save and the PDF refreshes in place.
 - **Scroll preservation** — your reading position survives the refresh. This is deliberate, not incidental: `captureScrollState()` has to run **before** the new PDF loads.
 - **A failed compile never blanks the preview** — the old PDF is copied to `.pdf.prev` before compiling and restored on failure.
-- **Two-way SyncTeX** — double-click the PDF to get the source line; go from a source line to the PDF location. Always shells out to the `synctex` CLI; the `.synctex` file is never hand-parsed.
+- **Two-way SyncTeX** — double-click the PDF and the status line names the source line under the cursor; click a diagnostic and the PDF scrolls to where that line landed. Always shells out to the `synctex` CLI; the `.synctex` file is never hand-parsed.
 - **One-click error hand-off** — builds a prompt from "file:line + message + source context" and steers it into the current session. The Agent fixes the `.tex`, the watcher recompiles.
 - **Point at the PDF, change the source** — select text, or drag a box over anything → an inline bar appears → type one sentence → the Agent receives the **source line range** to edit.
 - **Three review modes** — `手动审核` (you accept every change), `自动审核` (a **separate AI** reviews each change and rolls the source back when it says no), `完全放开` (no gate). The verdict and its reason land in the status bar.
 - **Diff highlight on the PDF (git-diff look)** — a `差异 N` button and coloured bands over the lines this compile changed: green for added, amber for modified, with a red/green **gutter strip** on each band's left edge; a deletion draws a red hatched seam plus a `−N 行` count chip. **Hovering a seam pops the removed source lines up — struck through, monospace, red** — the deleted words have no pixels left in the new PDF, and this is the only way to show them without re-typesetting. Click to pin in the status bar. Computed against the *previous compiled* revision, not the file on disk.
 - **对比视图 (latexdiff view, optional)** — the `对比` button hands the accepted and current revisions to `latexdiff`, which merges them into a third document that is then compiled: removed text is **typeset struck through in red**, added text is coloured — as readable as a git diff. Costs one extra compile and requires `latexdiff` (MiKTeX's `latexdiff.exe` additionally needs Perl on Windows, e.g. Strawberry Perl); when it is missing the button explains instead of failing.
 - **Redaction switch** — when on, only "message + line number" is sent; no source, no selected text.
-- **Clickable diagnostics** — clicking an error or warning jumps to its source location.
+- **Clickable diagnostics** — clicking an error or warning scrolls the PDF to where that source line landed, printing the page and coordinates in the status line (the reverse direction, source → PDF).
 
 ## Requirements
 
@@ -42,6 +42,7 @@ Compiling, rendering, SyncTeX, and diffing all run **on your machine**. Only the
 | Node.js | ≥ 20 (developed on 22.x) |
 | `tectonic` | **You install it** and put it on `PATH`; verified at startup |
 | `synctex` | Shipped with your TeX distribution, **must be on `PATH`**; verified at startup |
+| `latexdiff` | **Optional**, only for `对比`; MiKTeX's `latexdiff.exe` additionally needs Perl |
 
 Official `tectonic` binaries cover win-x64 / macos-universal / linux-x64; on arm64 use `cargo install tectonic`. When something is missing the panel names it (`latex-preview/binary-missing`) instead of failing silently.
 
@@ -80,13 +81,13 @@ A LaTeX preview tab shows up in the right sidebar. `main.tex` in the workspace r
 
 ### The panel
 
-The top strip holds status and actions (compile state and duration, `编译` / Compile, `发送给 Agent` / Send to Agent, plus `重新检测` / Re-check when a binary is missing), the middle is the PDF, the bottom is the diagnostics list.
+The top strip is one row: `编译` / Compile, a **review-mode** dropdown, `发送给 Agent` / Send to Agent, then the controls that only exist when they mean something — `接受 N` (manual review, changes pending), `撤销` / Revert (any mode but open, changes pending), `差异 N` (disabled when this compile changed nothing), `对比` / Diff view, and the `脱敏` / Redaction checkbox, ending with a status line (compile result and duration, or the last message). The middle is the PDF, the bottom is the diagnostics list. If `tectonic` is missing the whole panel is replaced by an install hint and a `重新检测` / Re-check button.
 
 | Action | Result |
 |---|---|
 | Save a `.tex` | Compiles automatically after the 500 ms debounce |
-| Double-click the PDF | Reverse-jumps to the source file and line |
-| Click a diagnostic | Jumps to that source line |
+| Double-click the PDF | Names the source line under the cursor in the status line |
+| Click a diagnostic | Scrolls the PDF to where that source line landed, with page and coordinates in the status line |
 | "Send to Agent" | Hands this compile's errors to the current session (disabled with an explanation when there are none) |
 | "差异 N" / Diff N | Toggles the change highlight; the title says how many hunks and whether the caps left any out |
 | Hover a band | Shows which source line changed and the first sensible characters of it; hovering a deletion seam/chip pops up **the removed lines**, struck through |
@@ -94,6 +95,18 @@ The top strip holds status and actions (compile state and duration, `编译` / C
 | Review dropdown | Manual / Auto (independent AI) / Fully open |
 | "接受 N" / Accept N | Marks the change set accepted and clears the marks (manual mode only) |
 | "撤销" / Revert | Writes the source back to the previous revision and recompiles; needs a second click |
+
+### Review modes
+
+The diff is always computed between **the last accepted revision** and **the PDF you are looking at**, so the marks are literally "what has not been signed off yet". The mode decides who signs.
+
+| Mode | After a compile | Marks | Revert |
+|---|---|---|---|
+| `手动审核` / Manual | waits for you; nothing counts yet | accumulate every change since the last 接受 | yes |
+| `自动审核` / Auto | a **separate one-shot model call** reviews the diff — no tools, no history, not the Agent that made the change | that one change | yes, and a rejection performs it |
+| `完全放开` / Open | accepted immediately | that one change, informational only | not offered |
+
+Auto review needs a model route: it reads the session's `requestHeader()`, falling back to the profile's default model. If either is missing, or the call fails or exceeds 25 s, the verdict is **manual** — it never approves by default.
 
 ### Point at a spot, change the source
 
@@ -139,13 +152,13 @@ src/
     diff.ts                      line-level diff
     diff-regions.ts              hunks → PDF band/seam coordinates (with removed text)
     diffdoc.ts                   latexdiff 对比视图 (optional capability)
-    reviewer.ts                  change review (manual / auto / open)
+    reviewer.ts                  the independent reviewer (one-shot model call)
     agent-bridge.ts              prompt assembly + agent.steer delivery
     http-api.ts                  same-origin JSON routes /.latex-preview/api/*
     static-route.ts              /assets static mount
   utils/                         binaries / root / log-parser / synctex / assets
   client/                        panel.tsx / pdf-viewer.ts / api.ts / index.tsx
-viewer/                          the PDF.js viewer page (selection, box, inline bar, diff layer)
+viewer/                          PDF.js viewer page (selection, box, inline bar, diff layer, removed-text flyout)
 ```
 
 Two constraints worth knowing up front:

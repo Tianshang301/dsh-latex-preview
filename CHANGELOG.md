@@ -81,6 +81,7 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 - `docs/spikes.md` §B11–§B18 record the verified contracts and the three findings above, including the geometry sweeps that produced them.
 - `AGENTS.md` carries the repo-state invariants: box top is `v - H`, bands are `pointer-events: none` and positioned in percent, the diff baseline is two *compiled* snapshots, the reviewer must not be the session's Agent, and both READMEs change in one commit.
 - MIT `LICENSE`, © 2026 Tianshang301; `package.json` gained a matching `author`.
+- README (both languages) describes what the panel actually does: the toolbar shows `接受`/`撤销`/`差异`/`对比`/`脱敏` conditionally, clicking a diagnostic scrolls the **PDF** to that line (not the editor), double-click only names the line in the status line, `latexdiff` is listed as an optional requirement, and a review-mode table states what each mode does to the reference.
 
 ### Security / privacy
 
