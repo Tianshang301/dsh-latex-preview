@@ -25,6 +25,7 @@ import test from 'node:test'
 
 import { CompileService, compilePaths, type CompileOptions, type CompileRun } from '../../src/services/compile.ts'
 import { LatexPreviewService } from '../../src/services/latex-preview-service.ts'
+import { workspaceIdOf } from '../../src/services/provenance.ts'
 import type { PreviewState } from '../../src/types.ts'
 
 const DOC = (body: string): string =>
@@ -381,10 +382,18 @@ test('an unprovable artefact is withdrawn instead of left on screen', async () =
 
     assert.equal(result.artifactState, 'unavailable')
     assert.equal(result.pdfPath, null)
+    assert.equal(result.pdfUrl, null, 'the result carries no URL either')
     assert.equal(state.pdfUrl, null, 'no URL for an artefact nobody can vouch for')
     assert.equal(state.viewerUrl, null)
     assert.equal(state.baseRevisionId, null)
     assert.equal(state.recentRevisionId, null)
+    // Withdrawing the URL is not enough: the files sit in the directory the static
+    // route serves, and the next run's backup would adopt them. They must be gone.
+    assert.equal(existsSync(paths.pdf), false, 'the untrusted PDF is deleted')
+    assert.equal(existsSync(paths.synctex), false, 'and its sync map with it')
+    // The status line must not promise a document that is no longer offered.
+    assert.ok(!state.message?.includes('保留'), state.message ?? '')
+    assert.ok(!state.message?.includes('回滚到'), state.message ?? '')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -392,12 +401,20 @@ test('an unprovable artefact is withdrawn instead of left on screen', async () =
 
 test('a reviewer that accepts immediately still gets a credential to publish with', async () => {
   const dir = workspace(A)
+  const outDir = join(dir, '.latex-preview')
   try {
     // `auto` mode with the model replaced by a reviewer that answers at once — the
     // worst case for ordering, because approving promotes the current PDF to the
     // baseline immediately.
     const { service, behaviour, stop } = await boot(dir, 'auto')
-    ;(service as unknown as { runReview: unknown }).runReview = async () => ({ verdict: 'accept', reason: 'ok' })
+    // Record what the reviewer could see when it was asked. If the credential were
+    // issued after the review started, this is null and approving would silently
+    // withdraw the baseline instead of promoting it.
+    let trustedAtReview: unknown = 'never ran'
+    ;(service as unknown as { runReview: unknown }).runReview = async () => {
+      trustedAtReview = (service as unknown as { trusted: unknown }).trusted
+      return { verdict: 'accept', reason: 'ok' }
+    }
     await settled(service, behaviour)
 
     writeFileSync(join(dir, 'main.tex'), B)
@@ -408,8 +425,18 @@ test('a reviewer that accepts immediately still gets a credential to publish wit
     const state = await service.getState(signal())
     await stop()
 
+    assert.notEqual(trustedAtReview, null, 'the credential existed before the reviewer ran')
+    assert.notEqual(trustedAtReview, 'never ran')
+    assert.equal(
+      (trustedAtReview as { sourceDigest: string }).sourceDigest,
+      digestOf(B),
+      'and it names the revision being reviewed',
+    )
     assert.equal(state.baseRevisionId, digestOf(B), 'the approved revision became the baseline')
     assert.equal(state.recentRevisionId, digestOf(A), 'and its predecessor is still the previous compile')
+    const paths = compilePaths(join(dir, 'main.tex'), outDir)
+    assert.equal(readFileSync(paths.basePdf, 'utf8'), `PDF:${digestOf(B)}`, 'the promoted bytes are the ones approved')
+    assert.equal(readFileSync(paths.baseSynctex, 'utf8'), `SYNC:${digestOf(B)}`)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -482,6 +509,12 @@ test('a compile that outlives its workspace publishes nothing and patches nothin
       assert.equal(existsSync(join(out, 'main.prev.manifest.json')), false, `${dir} base`)
     }
     assert.equal((service as unknown as { trusted: { sourceDigest: string } | null }).trusted?.sourceDigest, digestOf(B))
+    // The credential names the *new* workspace: a digest alone would let A's bytes be
+    // published as B's revision if the two ever shared a source.
+    assert.equal(
+      (service as unknown as { trusted: { workspaceId: string } | null }).trusted?.workspaceId,
+      workspaceIdOf(join(b, 'main.tex'), join(b, '.latex-preview')),
+    )
     assert.equal(state.baseRevisionId, null)
     assert.equal(state.recentRevisionId, null)
   } finally {

@@ -14,7 +14,9 @@
  *    the preview nor leaves a new sync map pointing at an old PDF; when only one
  *    half can be restored the result says so (`rollbackIncomplete`) instead of
  *    reporting a clean rollback. A first compile that fails has nothing to
- *    restore to, so its partial output is removed rather than shown.
+ *    restore to, and a run whose backup never landed has nothing trustworthy to
+ *    fall back on — in both cases the leftovers are **deleted**: a partial PDF
+ *    that a static route would happily serve is worse than no PDF at all.
  *
  * The pre-compile copies are left in place on success: publishing them as a
  * revision is the service's call, because only it knows which revision they
@@ -255,18 +257,27 @@ export class CompileService {
       // The old bytes are gone or unreachable, so the file on disk is now whatever
       // the failed run left. Nothing here can be called a rollback.
       rollbackIncomplete = true
-    } else {
-      // Nothing to restore to. Whatever the failed run left behind describes a
-      // document that never compiled, so it must not become "the PDF on screen".
-      await removeQuietly(paths.pdf)
-      await removeQuietly(paths.synctex)
     }
+    // The `unavailable` backup status lands here too: there was nothing to restore
+    // to, so the file — if the run wrote one — describes a document that never
+    // compiled.
 
     // What may be shown is a separate question from "did it compile". A partial
     // rollback leaves a file whose provenance is unknown; a failed backup leaves one
     // that may or may not be the previous revision. Neither may be displayed, and a
     // path is not evidence (docs/spikes.md §B25).
     const artifactState: ArtifactState = ok ? 'current' : rolledBack ? 'restored' : 'unavailable'
+
+    if (artifactState === 'unavailable') {
+      // Delete what nobody can vouch for, in *both* halves. Withdrawing the URL is
+      // not enough: the files still sit in `outDir`, where the static route serves
+      // them by name, and the next run's backup would adopt them as "the previous
+      // revision". A partial PDF from a run that exited non-zero is exactly the
+      // artefact that must never be reachable — so it goes, and a viewer holding a
+      // stale URL gets a 404 instead of a truncated document.
+      await removeQuietly(paths.pdf)
+      await removeQuietly(paths.synctex)
+    }
 
     if (!ok && diagnostics.length === 0) {
       diagnostics = [

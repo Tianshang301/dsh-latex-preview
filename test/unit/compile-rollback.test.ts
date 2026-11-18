@@ -142,8 +142,11 @@ test('restoring only the PDF is reported as an incomplete rollback', async () =>
     assert.equal(result.rollbackIncomplete, true)
     assert.equal(result.artifactState, 'unavailable', 'a mixed pair is not showable')
     assert.equal(result.pdfPath, null, 'and no path may invite the caller to show it')
-    assert.equal(await f.read(f.paths.pdf), 'pdf-v1', 'the PDF half did come back')
-    assert.equal(await f.read(f.paths.synctex), 'synctex-broken', 'the map did not, and must say so')
+    // Half a pair is not a pair. The PDF came back but nothing can describe *which*
+    // document it is (its map belongs to a different run), so both halves are
+    // deleted rather than left in `outDir` for a static route or the next backup.
+    assert.equal(await f.read(f.paths.pdf), null)
+    assert.equal(await f.read(f.paths.synctex), null)
   })
 })
 
@@ -179,12 +182,22 @@ test('a run that exits zero without producing a PDF is a failure', async () => {
   })
 })
 
-test('a failed backup makes the result unshowable even when the PDF is still there', async () => {
+test('a failed backup plus a partial PDF leaves nothing to serve', async () => {
   await withDir(async (dir) => {
-    // A directory where the backup's temporary file must go: the pair cannot be
-    // copied, so this run has nothing to restore from and nothing to stand behind.
-    const f = await fixture(dir, async () => failed())
+    // The exact sequence the review asked for: the backup cannot be made, the
+    // compiler writes half a PDF anyway, then exits non-zero. Nothing about the
+    // file that remains can be vouched for — not even that it is the previous
+    // revision — so it must not survive in the output directory, where the static
+    // route would serve it to anyone holding the last URL.
+    const f = await fixture(dir, async () => {
+      await writeFile(f.paths.pdf, 'pdf-partial', 'utf8')
+      await writeFile(f.paths.synctex, 'synctex-partial', 'utf8')
+      await writeFile(f.paths.log, '! Undefined control sequence.\n', 'utf8')
+      return failed()
+    })
     await f.seed('pdf-v1', 'synctex-v1')
+    // A directory where the backup's temporary file must go: the pair cannot be
+    // copied, so this run has nothing to restore from.
     await mkdir(`${f.paths.prev}.tmp`, { recursive: true })
     const result = await f.service.run()
 
@@ -193,6 +206,11 @@ test('a failed backup makes the result unshowable even when the PDF is still the
     assert.equal(result.rollbackIncomplete, true)
     assert.equal(result.artifactState, 'unavailable')
     assert.equal(result.pdfPath, null)
+    assert.equal(await f.read(f.paths.pdf), null, 'the partial PDF is deleted, not merely hidden')
+    assert.equal(await f.read(f.paths.synctex), null, 'and so is the map that would point into it')
+    assert.equal(await f.read(f.paths.prev), null, 'no half-made backup stands in for the old revision')
+    // The log is evidence for the user, not a preview target: it stays.
+    assert.notEqual(result.logPath, null)
   })
 })
 

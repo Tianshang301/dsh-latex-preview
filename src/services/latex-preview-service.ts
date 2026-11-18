@@ -20,7 +20,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, extname, join } from 'node:path'
 import { readFile, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { checkBinaries } from '../utils/binaries.ts'
@@ -876,9 +876,16 @@ export class LatexPreviewService extends TypertRemoteService {
       })
     }
     if (!result.ok) {
-      throw new RemoteError('latex-preview/revert-failed', '源码已回滚，但重新编译失败；PDF 仍是回滚前那一版', {
-        detail: result.diagnostics[0]?.message ?? 'unknown',
-      })
+      // Two different failures wear the same "recompile failed": a rollback that put
+      // the old pair back, and one that could not — and in the second case the PDF
+      // the user was reading is gone, so the message must not claim otherwise.
+      throw new RemoteError(
+        'latex-preview/revert-failed',
+        result.artifactState === 'restored'
+          ? '源码已回滚，但重新编译失败；PDF 仍是回滚前那一版'
+          : '源码已回滚，但重新编译失败，且这一版 PDF 无法校验，已从预览中撤下',
+        { detail: result.diagnostics[0]?.message ?? 'unknown' },
+      )
     }
     if (this.currentSource !== target) {
       // The file changed again while the revert compiled; the state now describes
@@ -1706,7 +1713,10 @@ export class LatexPreviewService extends TypertRemoteService {
       durationMs: result.durationMs,
       message: this.describe(result, stable),
     })
-    return { ...result, pdfUrl }
+    // The *returned* result must agree with the state. Handing back the URL of a
+    // PDF we just withdrew from the panel is the same lie in a different place: a
+    // caller that renders `result.pdfUrl` would show bytes nobody can vouch for.
+    return { ...result, pdfUrl: showable ? pdfUrl : null }
   }
 
   /** One-line status for the panel. */
@@ -1716,11 +1726,14 @@ export class LatexPreviewService extends TypertRemoteService {
         ? `编译成功（${(result.durationMs / 1000).toFixed(1)}s）`
         : `编译成功（${(result.durationMs / 1000).toFixed(1)}s），但编译期间源码又变了，正在重新编译`
     }
-    if (result.timedOut) return '编译超时，已保留上一次的 PDF'
     const errors = result.diagnostics.filter((d) => d.severity === 'error').length
-    return result.rolledBack
-      ? `编译失败（${errors} 个错误），已回滚到上一次的 PDF`
-      : `编译失败（${errors} 个错误）`
+    // Every sentence below has to match what is actually on screen. "保留上一次的
+    // PDF" is only true for a clean rollback; when the artefacts were withdrawn,
+    // saying it would promise a document the panel is no longer showing.
+    if (result.rolledBack) return `编译失败（${errors} 个错误），已回滚到上一次的 PDF`
+    if (result.timedOut) return '编译超时，已终止；本次没有可校验的 PDF，预览已撤下'
+    if (result.artifactState === 'unavailable') return `编译失败（${errors} 个错误），PDF 无法校验，预览已撤下`
+    return `编译失败（${errors} 个错误）`
   }
 
   /** Absolute PDF path or a RemoteError the UI can explain. */
@@ -1770,7 +1783,16 @@ export class LatexPreviewService extends TypertRemoteService {
     if (!this.webServer || this.disposeRoute) return
     const mounts: StaticMount[] = [
       // A getter, not a snapshot: `outDir` follows the configured workspace.
-      { prefix: '/pdf', dir: () => this.workDir, cacheable: false },
+      {
+        prefix: '/pdf',
+        dir: () => this.workDir,
+        // A PDF and nothing else. The same directory holds the compile log, both
+        // manifests and the `.prev` copies; a route that serves them is a file
+        // browser over the build directory, and one of those copies is all it
+        // would take to show a revision the panel has already withdrawn.
+        accept: (name) => extname(name).toLowerCase() === '.pdf',
+        cacheable: false,
+      },
       // Packaged assets, not `process.cwd()/assets`: the viewer must be found
       // wherever DSH happens to be started from (see utils/assets.ts).
       { prefix: '/assets', dir: assetsRoot(), cacheable: true },

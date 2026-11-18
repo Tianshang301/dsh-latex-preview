@@ -20,7 +20,7 @@
 import { createReadStream } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { extname, join, normalize, resolve, sep } from 'node:path'
+import { basename, extname, join, normalize, resolve, sep } from 'node:path'
 
 /** URL prefix the client uses; must match the naming convention. */
 export const ROUTE_PREFIX = '/.latex-preview'
@@ -61,6 +61,15 @@ export interface StaticMount {
    * name). Resolved per request, and only then joined and checked.
    */
   readonly dir: string | (() => string)
+  /**
+   * Whether one file name inside `dir` may be served.
+   *
+   * An output directory is not a document root: it also holds the compile log, two
+   * manifests, and copies of earlier revisions. Serving all of them turns the PDF
+   * route into a file browser over the user's build directory, so the caller says
+   * which names are its own. Omitted means "everything", for the asset mount.
+   */
+  readonly accept?: (fileName: string) => boolean
   /** Whether browser caching is allowed (assets yes, compiled output no). */
   readonly cacheable: boolean
 }
@@ -97,6 +106,12 @@ export function createStaticHandler(
     const target = safeJoin(root, subPath)
     if (!target) {
       res.writeHead(403).end('forbidden')
+      return
+    }
+    // Judged on the name the mount agreed to serve, before touching the disk, so a
+    // refused name is a plain 404 and its existence is not disclosed either.
+    if (mount.accept && !mount.accept(basename(target))) {
+      res.writeHead(404).end('not offered')
       return
     }
 
