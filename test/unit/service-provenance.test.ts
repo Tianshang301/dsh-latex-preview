@@ -332,3 +332,54 @@ test('two compiles fired for one save cannot erase each other', async () => {
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('a failed compile that restored the pair keeps showing it', async () => {
+  const dir = workspace(A)
+  try {
+    const { service, behaviour, stop } = await boot(dir)
+    const first = await settled(service, behaviour)
+    assert.notEqual(first.pdfUrl, null)
+
+    behaviour.fail = true
+    writeFileSync(join(dir, 'main.tex'), B)
+    const result = await service.compileNow(signal())
+    const state = await service.getState(signal())
+    await stop()
+
+    assert.equal(result.artifactState, 'restored', 'the previous revision came back intact')
+    assert.notEqual(state.pdfUrl, null, 'so the panel keeps showing a PDF')
+    assert.ok(state.pdfUrl?.includes('/pdf/main.pdf'), state.pdfUrl ?? '')
+    assert.equal(state.status, 'failed')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('an unprovable artefact is withdrawn instead of left on screen', async () => {
+  const dir = workspace(A)
+  const outDir = join(dir, '.latex-preview')
+  try {
+    const { service, behaviour, stop } = await boot(dir)
+    const first = await settled(service, behaviour)
+    assert.notEqual(first.pdfUrl, null)
+
+    // Backup impossible *and* the compile fails: nothing can be said about the file
+    // that is left, so it must not stay on screen behind a valid-looking URL.
+    const paths = compilePaths(join(dir, 'main.tex'), outDir)
+    mkdirSync(`${paths.prev}.tmp`)
+    behaviour.fail = true
+    writeFileSync(join(dir, 'main.tex'), B)
+    const result = await service.compileNow(signal())
+    const state = await service.getState(signal())
+    await stop()
+
+    assert.equal(result.artifactState, 'unavailable')
+    assert.equal(result.pdfPath, null)
+    assert.equal(state.pdfUrl, null, 'no URL for an artefact nobody can vouch for')
+    assert.equal(state.viewerUrl, null)
+    assert.equal(state.baseRevisionId, null)
+    assert.equal(state.recentRevisionId, null)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

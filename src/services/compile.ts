@@ -27,7 +27,7 @@ import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { copyFile, mkdir, readFile, rename, stat, unlink } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
-import type { BackupResult, CompileResult, LatexDiagnostic } from '../types.ts'
+import type { ArtifactState, BackupResult, CompileResult, LatexDiagnostic } from '../types.ts'
 import { parseLatexLog } from '../utils/log-parser.ts'
 import { artifactPaths } from './artifacts.ts'
 
@@ -262,6 +262,12 @@ export class CompileService {
       await removeQuietly(paths.synctex)
     }
 
+    // What may be shown is a separate question from "did it compile". A partial
+    // rollback leaves a file whose provenance is unknown; a failed backup leaves one
+    // that may or may not be the previous revision. Neither may be displayed, and a
+    // path is not evidence (docs/spikes.md §B25).
+    const artifactState: ArtifactState = ok ? 'current' : rolledBack ? 'restored' : 'unavailable'
+
     if (!ok && diagnostics.length === 0) {
       diagnostics = [
         {
@@ -279,7 +285,8 @@ export class CompileService {
       exitCode: code,
       timedOut,
       durationMs: Date.now() - started,
-      pdfPath: (await exists(paths.pdf)) ? paths.pdf : null,
+      pdfPath: artifactState === 'unavailable' ? null : (await exists(paths.pdf)) ? paths.pdf : null,
+      artifactState,
       pdfUrl: null,
       logPath: (await exists(paths.log)) ? paths.log : null,
       diagnostics,

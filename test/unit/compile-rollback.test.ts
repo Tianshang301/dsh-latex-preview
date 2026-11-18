@@ -96,6 +96,7 @@ test('a successful compile keeps the pre-compile copies as the previous revision
     assert.equal(result.ok, true)
     assert.equal(result.rolledBack, false)
     assert.equal(result.rollbackIncomplete, false)
+    assert.equal(result.artifactState, 'current', 'the new artefacts are this run’s output')
     // The pair is left for the publisher (artifacts.ts), not promoted by the runner.
     assert.equal(await f.read(f.paths.prev), 'pdf-v1')
     assert.equal(await f.read(f.paths.prevSynctex), 'synctex-v1')
@@ -116,6 +117,7 @@ test('a failed compile restores the PDF and the sync map together', async () => 
     assert.equal(result.ok, false)
     assert.equal(result.rolledBack, true)
     assert.equal(result.rollbackIncomplete, false)
+    assert.equal(result.artifactState, 'restored', 'the failure did not damage the previous revision')
     assert.equal(await f.read(f.paths.pdf), 'pdf-v1')
     assert.equal(await f.read(f.paths.synctex), 'synctex-v1')
     assert.equal(result.pdfPath, f.paths.pdf)
@@ -138,6 +140,8 @@ test('restoring only the PDF is reported as an incomplete rollback', async () =>
     assert.equal(result.ok, false)
     assert.equal(result.rolledBack, false, 'a half-done restore is not a rollback')
     assert.equal(result.rollbackIncomplete, true)
+    assert.equal(result.artifactState, 'unavailable', 'a mixed pair is not showable')
+    assert.equal(result.pdfPath, null, 'and no path may invite the caller to show it')
     assert.equal(await f.read(f.paths.pdf), 'pdf-v1', 'the PDF half did come back')
     assert.equal(await f.read(f.paths.synctex), 'synctex-broken', 'the map did not, and must say so')
   })
@@ -156,6 +160,7 @@ test('a first compile that fails leaves no PDF behind', async () => {
     assert.equal(result.ok, false)
     assert.equal(result.rolledBack, false)
     assert.equal(result.rollbackIncomplete, false, 'nothing was there to roll back')
+    assert.equal(result.artifactState, 'unavailable')
     assert.equal(await f.read(f.paths.pdf), null)
     assert.equal(await f.read(f.paths.synctex), null)
     assert.equal(result.pdfPath, null)
@@ -169,6 +174,24 @@ test('a run that exits zero without producing a PDF is a failure', async () => {
 
     assert.equal(result.ok, false)
     assert.equal(result.rolledBack, false)
+    assert.equal(result.artifactState, 'unavailable')
+    assert.equal(result.pdfPath, null)
+  })
+})
+
+test('a failed backup makes the result unshowable even when the PDF is still there', async () => {
+  await withDir(async (dir) => {
+    // A directory where the backup's temporary file must go: the pair cannot be
+    // copied, so this run has nothing to restore from and nothing to stand behind.
+    const f = await fixture(dir, async () => failed())
+    await f.seed('pdf-v1', 'synctex-v1')
+    await mkdir(`${f.paths.prev}.tmp`, { recursive: true })
+    const result = await f.service.run()
+
+    assert.equal(result.ok, false)
+    assert.equal(result.backup.status, 'failed')
+    assert.equal(result.rollbackIncomplete, true)
+    assert.equal(result.artifactState, 'unavailable')
     assert.equal(result.pdfPath, null)
   })
 })

@@ -278,6 +278,22 @@ export type BackupResult =
   | { readonly status: 'unavailable' }
   | { readonly status: 'failed'; readonly reason: string }
 
+/**
+ * Whether the artefacts currently on disk may be shown as this compile's output.
+ *
+ * Separate from {@link CompileResult.ok} on purpose: a *failed* compile can leave a
+ * perfectly good PDF on screen (the previous revision, restored), and a *successful*
+ * one can leave an artefact nobody can account for (a backup that never happened).
+ * `pdfPath !== null` is not a licence to display either.
+ *
+ * - `current`     — this run wrote these bytes; they are its output.
+ * - `restored`    — this run failed, and the previous PDF **and** its sync map were
+ *                   put back intact, so what is on screen is still that revision.
+ * - `unavailable` — no artefact can be vouched for: the rollback was partial, the
+ *                   backup never landed, or there was nothing to fall back to.
+ */
+export type ArtifactState = 'current' | 'restored' | 'unavailable'
+
 /** Outcome of one compile attempt, as handed back to the client. */
 export interface CompileResult {
   readonly ok: boolean
@@ -285,8 +301,15 @@ export interface CompileResult {
   readonly exitCode: number | null
   readonly timedOut: boolean
   readonly durationMs: number
-  /** Absolute path of the PDF on disk, or null when none exists yet. */
+  /**
+   * Absolute path of the PDF on disk, or null when none exists yet.
+   *
+   * Null whenever {@link artifactState} is `unavailable`: a path is only returned
+   * for an artefact the compile is willing to stand behind.
+   */
   readonly pdfPath: string | null
+  /** Whether the artefact on disk may be shown, and as what. */
+  readonly artifactState: ArtifactState
   /** Same-origin URL with a cache-busting version, or null. */
   readonly pdfUrl: string | null
   /** Absolute path of the parsed `.log`, when Tectonic wrote one. */

@@ -1624,9 +1624,10 @@ export class LatexPreviewService extends TypertRemoteService {
       // The credential for the bytes now on screen. Withheld when the input moved:
       // an unprovable pair is exactly what must never be published later.
       this.trusted = stable ? await this.issueTrustFor(rootFile, compiled) : null
-    } else if (result.rollbackIncomplete) {
-      // The PDF on screen and the sync map behind it may now disagree, so neither
-      // old-revision view can be trusted for this state — nor the pair itself.
+    } else if (result.artifactState === 'unavailable') {
+      // No artefact can be vouched for — a partial rollback, a backup that never
+      // landed, or a first compile that failed. Withdraw every claim rather than
+      // leave the panel pointing at bytes of unknown origin.
       this.trusted = null
       await this.dropBaseArtifacts()
       await this.dropRecentArtifacts()
@@ -1638,10 +1639,17 @@ export class LatexPreviewService extends TypertRemoteService {
       void this.runCompile().catch(() => undefined)
     }
 
+    // `restored` keeps showing the previous revision (the compile failed but put it
+    // back); `unavailable` shows nothing, because keeping the old URL would present
+    // an artefact this compile cannot account for as if it were the current one.
+    const showable = result.artifactState !== 'unavailable' && result.pdfPath !== null
     this.patch({
       status: result.ok ? 'ok' : 'failed',
-      pdfUrl: result.pdfPath ? pdfUrl : this.state.pdfUrl,
-      viewerUrl: result.pdfPath ? viewerUrl : this.state.viewerUrl,
+      pdfUrl: showable ? pdfUrl : null,
+      viewerUrl: showable ? viewerUrl : null,
+      // The viewer must not try to reload a document that is no longer offered.
+      ...(showable ? {} : { basePdfUrl: null, baseViewerUrl: null, baseRevisionId: null }),
+      ...(showable ? {} : { recentPdfUrl: null, recentViewerUrl: null, recentRevisionId: null }),
       // A new revision makes the built 对比视图 stale; it must be rebuilt on
       // demand rather than silently shown against the wrong baseline.
       diffDocUrl: contentChanged ? null : this.state.diffDocUrl,
