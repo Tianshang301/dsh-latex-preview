@@ -8,9 +8,6 @@ importers:
 
   .:
     dependencies:
-      '@deepseek-ai/dsh-client-ui-sidebar-right':
-        specifier: 0.1.5-alpha.1
-        version: 0.1.5-alpha.1(@deepseek-ai/cordis@4.1.0)
       '@deepseek-ai/dsh-typert-protocol':
         specifier: 0.2.2-rc.1
         version: 0.2.2-rc.1(@deepseek-ai/cordis@4.1.0)
@@ -82,11 +79,6 @@ packages:
     resolution: {integrity: sha512-ShGNEmNuEQA+bfkspWC2kGrdbrM4dFNhqlrNHIWsHO+PgVH1KoTKTLSraT1pt0A8YYk/moKE0gL2gY9dNBU+rw==}
     peerDependencies:
       '@deepseek-ai/cordis': ~4.1.0
-
-  '@deepseek-ai/dsh-client-ui-sidebar-right@0.1.5-alpha.1':
-    resolution: {integrity: sha512-3msAiVyymMsaBFKKSTsPO4q/x5isVcIYJvhQtuTCH1rEI11FFjm7/FUkOLGlBJsmIrxlubyTQ5lxhZKv+d1X5w==}
-    peerDependencies:
-      '@deepseek-ai/cordis': ^4.0.2
 
   '@deepseek-ai/dsh-client-ui-slots@0.0.1-rc.1':
     resolution: {integrity: sha512-I65xM9wPfAWKaceraDSBRhwv0VR4eljXfimqijLbLuETwbV3XGxlRMx96rWUZMjI02JBSkHqGE68bjAHVtUkvQ==}
@@ -530,10 +522,6 @@ packages:
     resolution: {integrity: sha512-7VT13fmjotKpGipCW9JEQAusEPE+Ei8nl6/g4FBAmIm0GOOLMua9NDDo/DWp0ZAxCr3cPq5ZpBqmPAQgDda2Pw==}
     engines: {node: '>= 8.10.0'}
 
-  clsx@2.1.1:
-    resolution: {integrity: sha512-eYm0QWBtUrBWZWG0d386OGAw16Z995PiOVo2B7bjWSbHedGl5e0ZWaq65kOGgUSNesEIDkB9ISbTg/JK9dhCZA==}
-    engines: {node: '>=6'}
-
   csstype@3.2.3:
     resolution: {integrity: sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ==}
 
@@ -601,10 +589,6 @@ packages:
     resolution: {integrity: sha512-V7+vQEJ06Z+c5tSye8S+nHUfI51xoXIXjHQ99cQtKUkQqqO1kO/KCJUfZXuB47h/YBlDhah2H3hdUGXn8ie0oA==}
     engines: {node: '>=8.6'}
 
-  picomatch@4.0.7:
-    resolution: {integrity: sha512-qcJu88Q2IWqJsDD529JKMdwGm/dvInW4HvQnRwiH9JtihJvzGOscDtHE3x1pBKeUOTysQ8kVmLnJ2kJu7yhcGA==}
-    engines: {node: '>=12'}
-
   react-dom@18.3.1:
     resolution: {integrity: sha512-5m4nQKp+rZRb09LNH59GM4BxTh9251/ylbKIbpe7TpGxfJ+9kv6BLkLBXIjjspbgbnIBNqlI23tRnTWT0snUIw==}
     peerDependencies:
@@ -659,14 +643,6 @@ snapshots:
   '@deepseek-ai/dsh-brand@0.2.2-rc.1(@deepseek-ai/cordis@4.1.0)':
     dependencies:
       '@deepseek-ai/cordis': 4.1.0
-
-  '@deepseek-ai/dsh-client-ui-sidebar-right@0.1.5-alpha.1(@deepseek-ai/cordis@4.1.0)':
-    dependencies:
-      '@deepseek-ai/cordis': 4.1.0
-      clsx: 2.1.1
-      picomatch: 4.0.7
-      react: 18.3.1
-      react-dom: 18.3.1(react@18.3.1)
 
   '@deepseek-ai/dsh-client-ui-slots@0.0.1-rc.1(@deepseek-ai/cordis@4.1.0)(@deepseek-ai/dsh-invariants@0.0.1-rc.1(@deepseek-ai/cordis@4.1.0))':
     dependencies:
@@ -949,8 +925,6 @@ snapshots:
     optionalDependencies:
       fsevents: 2.3.3
 
-  clsx@2.1.1: {}
-
   csstype@3.2.3: {}
 
   diff-match-patch@1.0.5: {}
@@ -1050,8 +1024,6 @@ snapshots:
       '@napi-rs/canvas': 0.1.100
 
   picomatch@2.3.2: {}
-
-  picomatch@4.0.7: {}
 
   react-dom@18.3.1(react@18.3.1):
     dependencies:
