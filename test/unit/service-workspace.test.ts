@@ -20,11 +20,12 @@
 import { Context } from '@deepseek-ai/cordis'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import test from 'node:test'
 
+import { ArtifactStore } from '../../src/services/artifacts.ts'
 import { CompileService, compilePaths, type CompileOptions, type CompileRun } from '../../src/services/compile.ts'
 import { LatexPreviewService } from '../../src/services/latex-preview-service.ts'
 import type { PreviewState } from '../../src/types.ts'
@@ -192,6 +193,100 @@ test('a switch inside the publish window leaves the new workspace untouched', as
       assert.equal(existsSync(path), false, path)
     }
   } finally {
+    await h.stop()
+    rmSync(a, { recursive: true, force: true })
+    rmSync(b, { recursive: true, force: true })
+  }
+})
+
+test('a stale compile cannot take the new workspace’s published pair with it', async () => {
+  const a = workspaceSource(A1)
+  const b = workspaceSource(B1)
+  // Two gates: the run that will go stale, and the new workspace's own compile. The
+  // second one has to be held as well, because a compile of B that ran to completion
+  // would legitimately republish the very pair this test is asking about.
+  const releases: Array<() => void> = []
+  let holdNext = 0
+  const h = await boot(
+    a,
+    () =>
+      new Promise<void>((resolve) => {
+        if (holdNext <= 0) {
+          resolve()
+          return
+        }
+        holdNext -= 1
+        releases.push(resolve)
+      }),
+  )
+  try {
+    await until(() => h.behaviour.runs >= 1, 'A’s first compile')
+    await delay(150)
+    writeFileSync(join(a, 'main.tex'), A2)
+    await h.service.compileNow(signal())
+    assert.equal((await h.service.getState(signal())).baseRevisionId, digestOf(A1))
+
+    holdNext = 2
+    writeFileSync(join(a, 'main.tex'), A3)
+    const running = h.service.compileNow(signal())
+    await until(() => h.behaviour.runs >= 3, 'the run that will go stale')
+
+    await h.service.configure({ rootFile: join(b, 'main.tex'), review: 'manual' }, signal())
+
+    // Give B a previous-compile pair that is real in every sense: published through the
+    // same store the service uses, so its manifest verifies and its hashes are true.
+    // Writing a lone JSON by hand would test nothing.
+    const bPaths = compilePaths(join(b, 'main.tex'), join(b, '.latex-preview'))
+    mkdirSync(join(b, '.latex-preview'), { recursive: true })
+    writeFileSync(bPaths.recentPdf, 'PDF:B-PREVIOUS')
+    writeFileSync(bPaths.recentSynctex, 'SYNC:B-PREVIOUS')
+    const store = new ArtifactStore({
+      pdf: bPaths.recentPdf,
+      synctex: bPaths.recentSynctex,
+      manifest: bPaths.recentManifest,
+    })
+    assert.equal(
+      await store.publish({ revisionId: digestOf(B1), pdf: bPaths.recentPdf, synctex: bPaths.recentSynctex }),
+      true,
+    )
+    const recentUrl = '/.latex-preview/pdf/main.recent.pdf?v=1'
+    ;(h.service as unknown as { patch(next: Partial<PreviewState>): void }).patch({
+      recentRevisionId: digestOf(B1),
+      recentPdfUrl: recentUrl,
+      recentViewerUrl: null,
+    })
+    const before = {
+      manifest: readFileSync(bPaths.recentManifest, 'utf8'),
+      pdf: readFileSync(bPaths.recentPdf, 'utf8'),
+      synctex: readFileSync(bPaths.recentSynctex, 'utf8'),
+    }
+
+    // Release the stale run only. Everything it does from here happens after the
+    // switch, which is the whole point of the test. B's own compile is queued behind
+    // it and parks at the same seam, so nothing else can move while we look.
+    releases.shift()?.()
+    const result = await running
+    await until(() => h.behaviour.runs >= 4, 'B’s own compile to start')
+    await delay(200)
+    const after = await h.service.getState(signal())
+
+    assert.equal(result.pdfUrl, null)
+    // The bug this replaces was silent: A's publish hashed B's (absent) `.prev` pair
+    // against its own backup hashes, never matched, and withdrew B's pair as a result.
+    assert.equal(readFileSync(bPaths.recentManifest, 'utf8'), before.manifest, 'the manifest is untouched')
+    assert.equal(readFileSync(bPaths.recentPdf, 'utf8'), before.pdf, 'the PDF is untouched')
+    assert.equal(readFileSync(bPaths.recentSynctex, 'utf8'), before.synctex, 'the sync map is untouched')
+    assert.equal(after.recentRevisionId, digestOf(B1), 'and the panel still offers it')
+    assert.equal(after.recentPdfUrl, recentUrl)
+    assert.notEqual(await store.verify(), null, 'the pair still verifies')
+    // The three versions and the credential belong to B, not to the run that ended.
+    assert.equal(internals(h.service).currentSource, B1)
+    assert.equal(internals(h.service).acceptedSource, B1)
+    assert.equal(internals(h.service).trusted, null)
+  } finally {
+    // Let anything still parked finish, so no promise is left dangling.
+    while (releases.length > 0) releases.shift()?.()
+    await delay(100)
     await h.stop()
     rmSync(a, { recursive: true, force: true })
     rmSync(b, { recursive: true, force: true })
