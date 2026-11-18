@@ -326,3 +326,96 @@ test('an acceptance sent over HTTP waits for the compile that owns the pair', as
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('a revert sent over HTTP waits for the compile in flight', async () => {
+  const dir = workspace(A)
+  let gate: Promise<void> | null = null
+  const hold: { release?: () => void } = {}
+  const harness = await mount(dir, async () => {
+    if (!gate) return
+    const held = gate
+    gate = null
+    await held
+  })
+  try {
+    await settled(harness)
+    // accepted = A, current = B: 撤销 has a baseline to go back to.
+    writeFileSync(join(dir, 'main.tex'), B)
+    await harness.post('compile')
+
+    // Park a compile after its compiler returned. The revert click lands *now*, over
+    // HTTP, while the queue is held by that run.
+    gate = new Promise<void>((resolve) => {
+      hold.release = resolve
+    })
+    writeFileSync(join(dir, 'main.tex'), C)
+    const runs = harness.behaviour.runs
+    const running = harness.service.compileNow(signal())
+    await until(() => harness.behaviour.runs > runs, 'the held run to reach the compiler')
+
+    const reverting = harness.post('revert')
+    const early = await Promise.race([
+      reverting.then(() => 'done' as const),
+      delay(200).then(() => 'pending' as const),
+    ])
+    assert.equal(early, 'pending', 'the revert must join the queue behind the compile')
+
+    hold.release?.()
+    await running
+    const reverted = await reverting
+    assert.equal(reverted.ok, true, JSON.stringify((reverted as { error?: { message: string } }).error))
+
+    const state = await harness.service.getState(signal())
+    assert.equal(readFileSync(join(dir, 'main.tex'), 'utf8'), A, 'the source went back to the baseline')
+    assert.equal(state.baseRevisionId, digestOf(A))
+    assert.equal(readFileSync(join(dir, '.latex-preview', 'main.pdf'), 'utf8'), `PDF:${digestOf(A)}`, 'the page is the reverted document')
+  } finally {
+    hold.release?.()
+    await harness.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a revert whose workspace went away reports the switch instead of acting on the new one', async () => {
+  const dirA = workspace(A)
+  const dirB = workspace(B)
+  let gate: Promise<void> | null = null
+  const hold: { release?: () => void } = {}
+  const harness = await mount(dirA, async () => {
+    if (!gate) return
+    const held = gate
+    gate = null
+    await held
+  })
+  try {
+    await settled(harness)
+    writeFileSync(join(dirA, 'main.tex'), C)
+    const runs = harness.behaviour.runs
+    const running = harness.service.compileNow(signal())
+    await until(() => harness.behaviour.runs > runs, 'the held run to reach the compiler')
+
+    // 撤销 is clicked for A, and the click is what the task must remember.
+    const reverting = harness.post('revert')
+    await delay(30)
+    await harness.service.configure({ rootFile: join(dirB, 'main.tex'), review: 'manual' }, signal())
+
+    hold.release?.()
+    await running
+    const reverted = await reverting
+    assert.equal(reverted.ok, false, 'the click was for A; acting on B would be wrong')
+    assert.match(
+      (reverted as { error?: { message: string } }).error?.message ?? '',
+      /工作区已切换/,
+      JSON.stringify(reverted.error),
+    )
+
+    const state = await harness.service.getState(signal())
+    assert.equal(state.rootFile, join(dirB, 'main.tex'))
+    assert.equal(readFileSync(join(dirB, 'main.tex'), 'utf8'), B, "B's source is untouched by A's revert")
+  } finally {
+    hold.release?.()
+    await harness.close()
+    rmSync(dirA, { recursive: true, force: true })
+    rmSync(dirB, { recursive: true, force: true })
+  }
+})

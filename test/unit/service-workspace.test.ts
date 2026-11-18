@@ -65,6 +65,8 @@ interface Harness {
   stop(): Promise<void>
   /** Set once the fake diff build has started (and parked, if armed). */
   diffStarted: { started: boolean }
+  /** Arm or replace the pause inside the diff build, at any time. */
+  setBeforeDiffWrite(hook: () => Promise<void>): void
 }
 
 /** How a test wants the service booted. */
@@ -89,6 +91,7 @@ interface BootOptions {
 async function boot(workDir: string, options: BootOptions = {}): Promise<Harness> {
   const behaviour: Behaviour = { runs: 0 }
   const diffStartedRef: { current: { started: boolean } } = { current: { started: false } }
+  const beforeDiffWriteRef: { current?: () => Promise<void> } = {}
   const service = new LatexPreviewService(new Context(), {
     binaryProbe: async () => fakeBinaries(),
     onRunReturned: options.onRunReturned,
@@ -99,7 +102,7 @@ async function boot(workDir: string, options: BootOptions = {}): Promise<Harness
           diffStartedRef.current.started = true
           void base
           void head
-          await options.beforeDiffWrite?.()
+          await beforeDiffWriteRef.current?.()
           return { ok: true, pdfPath: join(diffOptions.outDir, `${basename(diffOptions.rootFile, '.tex')}.diff.pdf`), message: 'fake diff' }
         },
       } as unknown as DiffDocService
@@ -133,7 +136,15 @@ async function boot(workDir: string, options: BootOptions = {}): Promise<Harness
   const request = { rootFile: join(workDir, 'main.tex'), review: 'manual' as const }
   await service.configure(options.outDir ? { ...request, outDir: options.outDir } : request, signal())
   await stop()
-  return { service, behaviour, stop, diffStarted: diffStartedRef.current }
+  return {
+    service,
+    behaviour,
+    stop,
+    diffStarted: diffStartedRef.current,
+    setBeforeDiffWrite(hook: () => Promise<void>): void {
+      beforeDiffWriteRef.current = hook
+    },
+  }
 }
 
 /** A fresh workspace with `main.tex` holding `source`. */
@@ -603,15 +614,7 @@ test('a configure colliding with a diff build waits for the reader instead of re
   const shared = mkdtempSync(join(tmpdir(), 'dsh-latex-lease-read-'))
   let gate: Promise<void> | null = null
   const hold: { release?: () => void } = {}
-  const h = await boot(a, {
-    outDir: shared,
-    beforeDiffWrite: async () => {
-      if (!gate) return
-      const held = gate
-      gate = null
-      await held
-    },
-  })
+  const h = await boot(a, { outDir: shared })
   const pathsA = compilePaths(join(a, 'main.tex'), shared)
   try {
     await until(() => h.behaviour.runs >= 1, 'A’s first compile')
@@ -622,6 +625,12 @@ test('a configure colliding with a diff build waits for the reader instead of re
 
     // The reader takes the paths and parks inside its build — outside the lifecycle
     // queue, which is exactly why the queue alone could never order this.
+    h.setBeforeDiffWrite(async () => {
+      if (!gate) return
+      const held = gate
+      gate = null
+      await held
+    })
     gate = new Promise<void>((resolve) => {
       hold.release = resolve
     })
@@ -651,5 +660,46 @@ test('a configure colliding with a diff build waits for the reader instead of re
     rmSync(a, { recursive: true, force: true })
     rmSync(c, { recursive: true, force: true })
     rmSync(shared, { recursive: true, force: true })
+  }
+})
+
+test('a diff build that outlives its baseline is dropped, not published', async () => {
+  const a = workspaceSource(A1)
+  const h = await boot(a)
+  try {
+    await until(() => h.behaviour.runs >= 1, 'A’s first compile')
+    await delay(150)
+    writeFileSync(join(a, 'main.tex'), A2)
+    await h.service.compileNow(signal())
+
+    // Park the build inside its read lease, then move the baseline under it — what 接受
+    // does. Done directly on the field rather than through 接受, because a queued 接受
+    // would apply only after the reader releases, and the check would then race the
+    // queue instead of testing the guard.
+    let gate: Promise<void> | null = null
+    const hold: { release?: () => void } = {}
+    gate = new Promise<void>((resolve) => {
+      hold.release = resolve
+    })
+    h.setBeforeDiffWrite(async () => {
+      if (!gate) return
+      const held = gate
+      gate = null
+      await held
+    })
+    const building = h.service.buildDiffDoc(signal())
+    await until(() => h.diffStarted.started, 'the diff build to park inside its read lease')
+    ;(h.service as unknown as { acceptedSource: string | null }).acceptedSource = A2
+
+    hold.release?.()
+    const build = await building
+    assert.equal(build.ok, false, 'the diff describes accepted→current that no longer exists')
+    assert.match(build.message, /对比基准已变化/)
+    const state = await h.service.getState(signal())
+    assert.equal(state.diffDocUrl, null, 'and nothing was published into the state')
+    assert.equal(state.baseRevisionId, digestOf(A1), 'the baseline itself is untouched by the build')
+  } finally {
+    await h.stop()
+    rmSync(a, { recursive: true, force: true })
   }
 })

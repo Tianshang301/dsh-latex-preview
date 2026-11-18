@@ -522,3 +522,57 @@ test('a compile that outlives its workspace publishes nothing and patches nothin
     rmSync(b, { recursive: true, force: true })
   }
 })
+
+test('a review in flight for one workspace does not suppress the next one’s', async () => {
+  const dirA = workspace(A)
+  const dirB = workspace(C)
+  let calls = 0
+  const hold: { release?: () => void } = {}
+  const gate = new Promise<void>((resolve) => {
+    hold.release = resolve
+  })
+  const internals = (service: LatexPreviewService) => service as unknown as { reviewing: unknown; acceptedSource: string | null; workspace: { id: string } | null }
+  try {
+    const { service, behaviour, stop } = await boot(dirA, 'auto')
+    ;(service as unknown as { runReview: unknown }).runReview = async () => {
+      calls += 1
+      // The first review belongs to A and parks; everything after answers at once.
+      if (calls === 1) await gate
+      return { verdict: 'accept', reason: 'ok' }
+    }
+    await settled(service, behaviour)
+
+    writeFileSync(join(dirA, 'main.tex'), B)
+    await service.compileNow(signal())
+    for (let i = 0; i < 300 && calls < 1; i += 1) await delay(20)
+    assert.equal(calls, 1, 'A’s review is running and parked')
+
+    // Switch while the reviewer thinks. The old single boolean made this configure's
+    // own review silently skipped — no message, no fallback, no verdict.
+    await service.configure({ rootFile: join(dirB, 'main.tex'), review: 'auto' }, signal())
+    await (service as unknown as { watcher: { stop(): Promise<void> } }).watcher.stop()
+    writeFileSync(join(dirB, 'main.tex'), B)
+    await service.compileNow(signal())
+
+    for (let i = 0; i < 300 && calls < 2; i += 1) await delay(20)
+    assert.equal(calls, 2, 'B’s review ran despite A’s being in flight')
+    for (let i = 0; i < 300 && internals(service).acceptedSource !== B; i += 1) await delay(20)
+    assert.equal(internals(service).acceptedSource, B, 'and its verdict was applied')
+
+    // A's parked verdict lands afterwards — and must not relabel B.
+    hold.release?.()
+    for (let i = 0; i < 300 && internals(service).reviewing !== null; i += 1) await delay(20)
+    await delay(120)
+    const state = await service.getState(signal())
+    await stop()
+
+    assert.equal(state.rootFile, join(dirB, 'main.tex'))
+    assert.equal(internals(service).acceptedSource, B, 'B’s accepted revision is untouched')
+    assert.equal(state.baseRevisionId, digestOf(B), 'the baseline belongs to B, not to A’s late verdict')
+  } finally {
+    hold.release?.()
+    await delay(100)
+    rmSync(dirA, { recursive: true, force: true })
+    rmSync(dirB, { recursive: true, force: true })
+  }
+})
