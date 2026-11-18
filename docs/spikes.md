@@ -36,6 +36,7 @@
 | **B27** | 工作区不是"进入时检查一次"，而是一条贯穿到 state 提交的边界 | `WorkspaceContext`（workspace + 已解析 paths）随任务传递，发布/凭据/落盘一律不再读 `this.workDir`/`this.workspace.id`；每个 `await` 后复核身份，state 写入走 `commit(ctx, …)`；`configure` 串行化 | 已实现，测试在去掉守卫时失败（`result.pdfUrl` 变回非空） |
 | **B28** | 工作区切换是状态机 | `prepareWorkspace`（只动候选目录）→ `activateWorkspace`（无 await 的赋值块）；`configure` 不进入编译队列（首次编译可达数分钟）；`BuildContext` 带三版本/审核模式/凭据快照；helper 每次 `await` 后复核并返回 `published/withdrawn/stale`；接受/撤销/审核裁决与编译同队列 | 已实现，测试在还原旧行为时红（两个切换用例） |
 | **B29** | 变更入口也是生命周期的一部分 | 接受/撤销的 HTTP 路由必须与 Remote 走同一个 `acceptQueued`/`revertQueued`（否则面板一点就能在编译窗口里提升基线并删掉已接受对）；陈旧任务不写状态；`restoreArtifacts` 按名删对，**与活动工作区同路径候选**的恢复进队列，其余照旧不排队 | 已实现，71 例；去掉任一条守卫，对应用例都在最早的信号处变红 |
+| **B30** | 产物路径是租约，不是比较 | `artifactPathsBusy` 判「这组路径是否被任何任务占用」：当前工作区 ∪ 在途租约；租约带身份（自排除）、模式（写/读，diff 构建是读）、`running`（排队预约 vs 正在 I/O）；入队即登记、任务 `finally` 才释放（stale 不提前放）；`restoreArtifacts` 撞见运行中的同伴直接抛 `artifact-busy` | 已实现，73 例；去掉租约判定/自排除/finally 释放，对应用例各自变红 |
 
 ---
 
@@ -894,6 +895,46 @@ interface TrustedArtifacts { workspaceId; sourceDigest; pdfSha256; synctexSha256
 **3. 审核不能抢在凭据之前。** `queueReview()` 原先在成功分支里、`issueTrustFor()` 之前启动。审核通过会调 `snapshotBaseFromCurrent()` 把当前 PDF 提升为基线，而此刻 `trusted` 还描述着被替换的那一版，于是提升被拒、已接受对被丢弃。顺序固定为：发布 → 推进 → 采纳 → 签发 → 审核（发布必须在签发之前，因为它用的是**编译前**的凭据）。两个测试：立即 accept（base 落到新版本）、立即 reject（源码回滚、被拒版本成为「上次编译」、不触发第二次审核）。
 
 **4. 一次编译只认一个工作区。** `compileOnce` 逐处读 `state.rootFile` / `outDir` / `compiler`，`configure` 落在中间就会"用旧源码编译、把产物发布到新工作区"，甚至能观察到半应用状态（新编译器 + 旧根文件）。现在 `Workspace`（generation / id / rootFile / outDir / compiler）一次性替换、整轮捕获；进程返回时若已不是当前工作区，则不 patch、不发布、不签发。测试：A 的编译被卡在编译器里 → 配置 B → 放行 A，B 的文件不被污染、两个工作区都没有被误发布的清单、凭据指向 B。
+
+---
+
+## B30 · 路径租约：冲突判定从"是谁"改成"谁还占着"
+
+§B29 把冲突判定做成了"候选 vs 当前工作区"。评审指出这不完整：**在途任务**也可能写同一组路径，而它们不是"当前"。A→B→C 的时序打穿了它：
+
+1. `configure(A, outDir=shared)`，A 的第三次编译进入 `compiler.run()`，**还没写出任何字节**；
+2. `configure(B)`（自己的目录）→ 判定只看当前工作区 → 立即激活，`this.workspace = B`；
+3. `configure(C)`，C 与 A 同名同目录 → 比较对象是 **B** → 判"不冲突" → `restoreArtifacts` 当场删掉 A 目录里的两对产物；
+4. C 开始编译并写下 `main.pdf`；
+5. A 的 `run()` 返回，把 A 的字节写到同一批名字上 —— 面板显示 C，磁盘是 A。
+
+第 5 步就是验收标准里那句更严格的话：**任何已经启动的旧任务，都不能在新工作区接管同一组产物路径之后，继续改变这组路径上的最终文件状态。**"stale 任务不发布"不够，它已经不发布了；要堵的是**写**。
+
+**设计（按评审修正后落地）**
+
+- **带身份的租约**：`owner: symbol`。`commitActivation` 持有候选自己的租约再去恢复，
+  `assertArtifactPathsQuiet(paths, self)` 排除自己 —— 否则第 1 步就会自冲突。
+  有齿验证：删掉自排除，所有 configure 立即红在 `artifact-busy`。
+- **读写分模式**：编译/恢复/发布/接受/撤销是**写**；`applyDiffDoc` 是**读**（读 live 对 + 两份同步表，
+  可长达两分钟）。读只被写阻挡，读读并发 —— 否则每个 diff 构建都会排在每个编译后面。
+  同时给 `applyDiffDoc` 补上工作区守卫：租约解决磁盘竞争，解决不了"两分钟的结果属于谁"，
+  build 之后 `isCurrent` 不成立就丢弃，不写新工作区的 state。
+- **排队预约 ≠ 正在 I/O**：租约带 `running`。两个问题用它分开回答：
+  `artifactPathsBusy` 数**所有**租约（恢复不能删一个排队任务将要写的文件）；
+  `assertArtifactPathsQuiet` 只数**运行中**的同伴（队列保证排队的稍后才跑）。
+- **入队即登记、`finally` 才释放**：任务在队列里等待时对外不可见，这正是要堵的窗口；
+  释放挂在 `finally` 上 —— **stale 不提前放**，被判定 stale 改变的是"字节可否发布"，
+  不是"字节正在被写"。有齿验证：去掉 `finally` 里的 release，四个用例红在 `artifact-busy`。
+- `runCompile` 因此把 workspace 解析提前到**入队时**（租约必须指名它要写谁）；
+  附带一个语义收紧：排队的 `compile` 绑定发起时的工作区，而不是执行到它时恰好活跃的那个。
+
+**测试**：`beforeWrite` 缝隙把假编译器停在**写出之前**（`onRunReturned` 来不及 ——
+那时字节已落盘，恢复会先删掉它们，竞态反而复现不出来）。A 停住 → B 快速切换（显式 outDir，
+注意 `outDirExplicit` 是粘性的：不带 outDir 的 configure 会继承上一个目录，
+测试必须写明意图）→ C 认领 shared → 断言 pending、A 的对还在、A 的字节最后写入；
+放行后断言最终字节是 C 的、A 的迟到字节不在盘上。
+另有一例：编译抛错后租约必须已释放（否则下次恢复被 `artifact-busy` 拒绝），
+以及同一路径上两个排队任务互不视为冲突。
 
 ---
 
