@@ -178,6 +178,7 @@ viewer/                          PDF.js 查看器页面（选区、框选、浮�
 npm run typecheck    # tsc --noEmit
 npm run verify       # 契约探针（5 pass / 0 fail / 2 skip）
 npm test             # 单元测试（node:test，无额外依赖）
+npm run typecheck:test   # 测试代码也是 TypeScript，同样要检查
 npm run build        # tsc + client bundle + assets
 npm run assets       # 只重建 PDF.js 运行时与查看器页面
 npm run binaries     # 检查 tectonic / synctex

@@ -28,6 +28,8 @@
 | **B19** | 覆盖层渲染三坑 | 绘制要代次+每页令牌+原子替换；`multiply` 混合模式会随底图变色，删；接缝按行高缩放；CSS 也要 `?v=` | 已修并真机验证（40 次快速缩放后每页仍只有 1 层） |
 | **B20** | 旧版产物成对与基线 | 旧 PDF + 旧 SyncTeX 必须同名配对（CLI 按 basename 找）；失败要成对回滚；只在基线推进时采纳，否则丢弃 | 已实现并真机验证（失败前后 sha 与反查结果一致） |
 | **B21** | diff 的行号为什么差一行 | `cleanupSemantic` 在**转回真实文本之后**跑，会把片段边界挪到行中间，每个块的行数都多 1；必须在一行一字符的阶段跑。另外 `synctex view` 对**空行**返回下一行的盒子 | 已修并真机验证（旧行号往返一致，空行不再误标） |
+| **B23** | 产物事务 | 每对产物带 sha256 清单（先删清单→装文件→最后写清单）；`main.prev.*` 与 `main.recent.*` 独立；三条版本线与两条 diff 路径 | 已实现并真机验证（篡改 recent 后拒绝出图） |
+| **B24** | 来源证明 | 清单只证明完整性；凭据（workspace + 源码摘要 + 两份哈希）只在「本进程编译且输入未变」时签发，三个发布入口都要它 | 已实现并真机验证（残留 PDF 不发布、撤销后 recent=C、重启恢复已接受对） |
 | **B22** | 在旧版 PDF 上标删除 | 旧行号 + 旧 SyncTeX 才能拿到被删文字的真实盒子（`kind: 'removed'` 红带 + 中线删除线）；该视图必须只读 | 已实现并真机验证（`main.prev.pdf` 加载、红带压在第二段、选区不起浮条） |
 
 ---
@@ -832,6 +834,49 @@ await this.snapshotBaseFromCurrent()
 | 手动改坏 `main.recent.pdf` 字节 | 拒绝出图、状态撤下 URL | `message` 为"未能成对校验"，`regions: 0`，`recentRevisionId: null` ✔ |
 
 回滚与清单校验另有 17 个 `node:test` 用例（`test/unit/compile-rollback.test.ts`、`test/unit/artifacts.test.ts`），含"只回滚了 PDF"和"首次编译失败留下半成品"两条故障注入。
+
+---
+
+## B24 · 来源证明：清单能证明"没被改过"，证明不了"是谁编译的"
+
+**问题**：B23 的清单只约束**完整性**。它回答"磁盘上的字节与记录一致吗"，不回答"这些字节是由哪一版源码编译出来的"。两者在下面两种情形下会分离，且**都表现为色带位置错误、哈希校验全部通过**：
+
+1. 进程重启，磁盘上留着上一轮会话编译的 `main.pdf`（源码可能已经不同）；首次编译把它拷成 `prev`，再用当前源码的摘要给它签发清单；
+2. 编译期间用户继续编辑：编译器读到的是 B，编译结束后 `readSource` 拿到的是 C，PDF 属于 B，清单却写 C。
+
+**解法**（`services/provenance.ts`，纯函数 + 单测）：
+
+```ts
+interface TrustedArtifacts { workspaceId; sourceDigest; pdfSha256; synctexSha256 }
+```
+
+凭据只在**本进程刚编译完、且编译输入经复核未变**时签发；三个发布入口都必须通过 `trustCovers`（四个字段全等）：`publishCompileArtifacts`（上次编译）、`adoptBaseArtifacts`（已接受，来自备份）、`snapshotBaseFromCurrent`（已接受，来自当前 PDF）。**没有凭据就不发布**，界面明说不可用。
+
+配套：
+- `BackupResult` 把"没东西可备份 / 只备到 PDF / 两份都备到 / 备份失败"分开；拷贝先写 `.tmp`、两份都成功才 rename，并记录哈希供服务核对；
+- 服务层 `compileQueue` 串行化编译——进程本来就是 single-flight，但**记账不是**；
+- 冗余编译（内容没变）不重发 `recent`，否则"这次保存改了什么"会被覆盖成"当前版"；
+- 重启后不重新采纳 `recent`（只有编译它的进程知道它装的是什么），但**已接受对**只要清单仍写着当前源码就保留。
+
+**踩到的两个真机 bug**：
+
+| 现象 | 根因 |
+|---|---|
+| 手动模式 A→B→C 后 `base`/`recent` 全空，两个版本视图按钮都不出现 | watcher 对一次保存触发两次编译，两次 `runCompile` 交错：后者把前者刚发布的产物 drop 掉 |
+| 撤销 A 之后 `recent` 显示 A 而不是 C | 撤销后 watcher 又编译一次（内容未变），把 `recent` 从 C 覆盖成 A |
+
+**真机验证**（DSH 0.2.2-rc.1 + Edge headless，manual，A→B→C→撤销）：
+
+| 场景 | 期望 | 实测 |
+|---|---|---|
+| 编到 C | `base`=A、`recent`=B | `7d1b0e625b87` / `62185a1cb70d` ✔ |
+| 「已接受版」 | 打开 `main.prev.pdf`，1 条 modify | ✔ |
+| 「上次编译版」 | 打开 `main.recent.pdf`，1 条 modify | ✔ |
+| 撤销 | `recent`=C、源码回到 A | `98f3b4450f34` ✔ |
+| 改坏 `main.recent.pdf` | 拒绝出图 | "未能成对校验"、`regions: 0`、URL 置空 ✔ |
+| 重启后（清单仍描述当前源码） | 恢复已接受对 | ✔ |
+
+测试：`test/unit/service-provenance.test.ts` 8 例，用真实 `LatexPreviewService` + 真实 Cordis 上下文 + 真实 `CompileService`（只把进程换成假实现，`ServiceOptions.compileFactory`）。覆盖：残留 PDF 不发布、第二次编译后才可发布、重启恢复、备份失败不发布、撤销的版本推进、`side` 元数据、编译期间改源码、并发编译。全套 54 例；`.github/workflows/ci.yml` 跑 `typecheck` / `typecheck:test` / `test`。
 
 ---
 

@@ -35,6 +35,15 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 - The reference is the **previous compiled revision**, not the file on disk — see the baseline fix below.
 - Caps: 24 hunks and 40 resolved lines per revision. Longer blocks are **sampled evenly** rather than truncated (highlighting only the top would imply the change ends there); the surplus is reported in the button's title instead of being silently dropped.
 
+**Artefact provenance**
+
+- **A revision is published only when this process can prove it produced the bytes.** A manifest records *integrity* (these are the bytes it named), which is a different claim from *provenance* (they were compiled from that revision). `services/provenance.ts` holds the credential: workspace, source digest, and both file hashes, issued only right after a compile that read a source it re-read unchanged. All three publish sites check it — 上次编译版, 已接受版 from the backup, and 已接受版 from the current PDF. No credential means no revision, never a guess.
+- **The compile's backup is a decision, not a copy.** `BackupResult` is `complete` / `pdf-only` / `unavailable` / `failed`; the two files are copied to `.tmp` names and renamed only once both succeeded, and the hashes are recorded so the service can confirm the bytes it is about to claim. `complete` is required before anything may be published.
+- **Compiles are serialised at the service level.** `CompileService.run` already single-flights the process, but the revision snapshots and the artefact publishes are this service's own bookkeeping, and two interleaved bookkeepings are not one.
+- **A redundant compile republishes nothing.** "上次编译" answers *what did the last save change*; a compile of unchanged content has no answer, and letting it overwrite the pair loses the comparison.
+- **A restart re-adopts an accepted pair** when its manifest still names the source on disk, and the restore result is committed in the same state patch as the rest of the configuration instead of being patched separately first.
+- `npm test` now runs 54 cases, including service-level ones that drive a real `LatexPreviewService` in a real Cordis context with a real `CompileService` whose process is faked (`ServiceOptions.compileFactory`). `.github/workflows/ci.yml` runs typecheck, test typecheck and tests on Node 22 via pnpm.
+
 **Previous-revision view**
 
 - `上次编译版` shows the PDF of the revision the diff is measured against, with the lines that have since been **deleted** painted as ordinary red bands with a midline strikethrough — the one place that text is still typeset, in its original position. The live PDF can only ever show a seam there.
@@ -94,6 +103,14 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 
 ### Fixed
 
+- **A leftover PDF could be published as the revision currently on disk.** The pre-compile copy was taken from whatever `main.pdf` happened to be there — possibly compiled by an earlier session from a different source — and committed under the digest of the file just read. Both revision views would then draw correct-looking bands in wrong places, with every hash check passing. Fixed by the credential above: nothing is published without a compile this process ran and verified.
+- **`configure` restored artefacts before the state knew the root file, then erased them.** `restoreArtifacts()` read `state.rootFile` (still null on the first configure of a process, so it silently did nothing) and the configuration patch that followed reset the six publication fields anyway. The restore now takes the workspace explicitly and returns state fields, so exactly one snapshot is committed.
+- **`outDir` never fell back to the workspace.** The constructor seeds `outDir` with `<cwd>/.latex-preview`, and `configure` used `request.outDir ?? this.outDir ?? <rootDir>/.latex-preview` — the middle term is always set, so a workspace outside the process directory compiled its artefacts into the wrong folder. The seeded value is now tracked as a default rather than a choice.
+- **Switching workspace kept the previous PDF on screen** and skipped the first compile, because the automatic compile is gated on `pdfUrl` being empty.
+- **撤销 named the wrong revision as its predecessor.** `applyRevert` moved `currentSource` to the baseline before compiling, so the compile believed it was replacing the *baseline* rather than the document being discarded: the previous-compile pair was published with the wrong digest (or, after the credential check, dropped). The revert now passes `beforeOverride` and suppresses the reviewer.
+- **A failed backup is not a rollback.** With the pair uncopyable, the service reported `rolledBack` from a restore that had nothing to restore from; the result now carries the backup status and a `failed` backup forces `rollbackIncomplete`.
+- **A compile whose input changed mid-run claimed the new source.** The PDF belongs to neither snapshot then, so the credential is withheld and a follow-up compile converges.
+- **`baseRegions()` always answered `side: 'base'`,** even for a 上次编译版 request — the panel keys results by the side it asked for, so this was invisible until something read the field.
 - **A failed compile could report a clean rollback after restoring only the PDF.** `rolledBack` came from the PDF's restore alone, so a sync map that could not be put back left the state claiming "rolled back" while reverse jumps read a map for a document that was no longer on screen. Both halves are now restored and reported together (`rollbackIncomplete`), and both revision pairs are dropped when they could not be.
 - **A first compile that failed left its partial output behind.** With no previous PDF to restore, the failed run's half-written `main.pdf` stayed on disk and could be served as if it had compiled; it is now removed, along with its sync map.
 

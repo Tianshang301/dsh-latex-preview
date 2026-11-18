@@ -1,0 +1,30 @@
+# Typecheck and unit tests.
+#
+# Deliberately not the contract probe (`pnpm verify`): it needs a DSH runtime and
+# answers SKIP without one, so running it here would look like coverage it is not.
+# The unit suite drives real services with a fake *process*, so no TeX distribution
+# is required.
+name: CI
+
+on:
+  push:
+    branches: [main, 'fix/**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      # The tests are TypeScript too; `tsx --test` runs them without checking them.
+      - run: pnpm typecheck:test
+      - run: pnpm test

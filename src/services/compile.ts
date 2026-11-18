@@ -24,9 +24,10 @@
  */
 
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { copyFile, mkdir, readFile, rename, stat, unlink } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
-import type { CompileResult, LatexDiagnostic } from '../types.ts'
+import type { BackupResult, CompileResult, LatexDiagnostic } from '../types.ts'
 import { parseLatexLog } from '../utils/log-parser.ts'
 import { artifactPaths } from './artifacts.ts'
 
@@ -144,6 +145,18 @@ async function removeQuietly(path: string): Promise<void> {
   }
 }
 
+/** sha256 of a file, for the backup record the service verifies against. */
+async function sha256(path: string): Promise<string> {
+  const bytes = await readFile(path)
+  return createHash('sha256').update(bytes).digest('hex')
+}
+
+/** One-line reason from an unknown thrown value. */
+function messageOf(error: unknown): string {
+  if (error instanceof Error) return error.message
+  return String(error)
+}
+
 export class CompileService {
   private running: Promise<CompileResult> | null = null
   private pending = false
@@ -200,14 +213,7 @@ export class CompileService {
     await mkdir(this.opts.outDir, { recursive: true })
     await mkdir(dirname(this.opts.rootFile), { recursive: true }).catch(() => undefined)
 
-    const hadPdf = await exists(paths.pdf)
-    const hadSynctex = await exists(paths.synctex)
-    if (hadPdf) await copyFile(paths.pdf, paths.prev).catch(() => undefined)
-    // The sync map is part of the artefact pair: restoring only the PDF after a
-    // failure would leave the new map describing a document that is no longer
-    // on screen, and every reverse jump would land on the wrong line.
-    if (hadSynctex) await copyFile(paths.synctex, paths.prevSynctex).catch(() => undefined)
-    else await removeQuietly(paths.prevSynctex)
+    const backup = await this.backupPair(paths)
     // A stale log would otherwise be parsed as if it belonged to this run.
     await removeQuietly(paths.log)
 
@@ -230,16 +236,25 @@ export class CompileService {
       // The pre-compile copies stay where they are: publishing them as a revision
       // is the service's decision, because only it knows which revision they
       // describe and whether the manifest may claim them (artifacts.ts).
-    } else if (hadPdf) {
+    } else if (backup.status === 'complete') {
       // Both halves or neither. A restored PDF next to an unrestored (new) sync map
       // is the exact failure the pair exists to prevent, so a half-done rollback is
       // reported instead of being rounded up to "rolled back".
       const pdfRestored = await this.restore(paths.prev, paths.pdf)
-      let syncRestored = true
-      if (hadSynctex) syncRestored = await this.restore(paths.prevSynctex, paths.synctex)
-      else await removeQuietly(paths.synctex)
+      const syncRestored = await this.restore(paths.prevSynctex, paths.synctex)
       rolledBack = pdfRestored && syncRestored
       rollbackIncomplete = !rolledBack
+    } else if (backup.status === 'pdf-only') {
+      // A PDF without a sync map can still be put back — it is what the user was
+      // looking at — but no map may survive to describe it.
+      const pdfRestored = await this.restore(paths.prev, paths.pdf)
+      await removeQuietly(paths.synctex)
+      rolledBack = pdfRestored
+      rollbackIncomplete = !pdfRestored
+    } else if (backup.status === 'failed') {
+      // The old bytes are gone or unreachable, so the file on disk is now whatever
+      // the failed run left. Nothing here can be called a rollback.
+      rollbackIncomplete = true
     } else {
       // Nothing to restore to. Whatever the failed run left behind describes a
       // document that never compiled, so it must not become "the PDF on screen".
@@ -272,7 +287,66 @@ export class CompileService {
       stderrTail: tail(stderr),
       rolledBack,
       rollbackIncomplete,
+      backup,
     }
+  }
+
+  /**
+   * Copy the artefacts on screen aside, as one pair.
+   *
+   * Three things this must not do, each a way the earlier version could hand a
+   * stale or half-written file to the publisher:
+   * - leave a copy from an earlier run in place (a failed copy then looks like a
+   *   successful one) — hence the removal before copying;
+   * - install either file before both are known good — hence the `.tmp` names and
+   *   the rename at the end;
+   * - report success without saying *which* bytes were copied — hence the hashes,
+   *   which the service checks against the revision it is about to claim.
+   * @param paths - this run's output paths.
+   * @returns what was copied, and whether it forms a complete pair.
+   */
+  private async backupPair(paths: CompilePaths): Promise<BackupResult> {
+    const tmpPdf = `${paths.prev}.tmp`
+    const tmpSynctex = `${paths.prevSynctex}.tmp`
+    await removeQuietly(paths.prev)
+    await removeQuietly(paths.prevSynctex)
+    await removeQuietly(tmpPdf)
+    await removeQuietly(tmpSynctex)
+
+    if (!(await exists(paths.pdf))) return { status: 'unavailable' }
+    try {
+      await copyFile(paths.pdf, tmpPdf)
+    } catch (error) {
+      await removeQuietly(tmpPdf)
+      return { status: 'failed', reason: `PDF 备份失败：${messageOf(error)}` }
+    }
+    const pdfSha256 = await sha256(tmpPdf)
+    try {
+      await rename(tmpPdf, paths.prev)
+    } catch (error) {
+      await removeQuietly(tmpPdf)
+      return { status: 'failed', reason: `PDF 备份无法就地安装：${messageOf(error)}` }
+    }
+
+    if (!(await exists(paths.synctex))) return { status: 'pdf-only', pdfSha256 }
+    try {
+      await copyFile(paths.synctex, tmpSynctex)
+    } catch (error) {
+      // Half a pair is not a pair: drop the PDF copy too, so nothing downstream can
+      // mistake it for one.
+      await removeQuietly(tmpSynctex)
+      await removeQuietly(paths.prev)
+      return { status: 'failed', reason: `SyncTeX 备份失败：${messageOf(error)}` }
+    }
+    const synctexSha256 = await sha256(tmpSynctex)
+    try {
+      await rename(tmpSynctex, paths.prevSynctex)
+    } catch (error) {
+      await removeQuietly(tmpSynctex)
+      await removeQuietly(paths.prev)
+      return { status: 'failed', reason: `SyncTeX 备份无法就地安装：${messageOf(error)}` }
+    }
+    return { status: 'complete', pdfSha256, synctexSha256 }
   }
 
   /** Restore `.pdf.prev` over the PDF, preferring an atomic rename. */

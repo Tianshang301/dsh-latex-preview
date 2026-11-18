@@ -37,6 +37,7 @@
     "build": "tsc -p tsconfig.json && node scripts/build-client.mjs && node scripts/build-assets.mjs",
     "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:test": "tsc -p tsconfig.test.json",
     "test": "tsx --test test/unit/*.test.ts",
     "verify": "tsx test/contract/probe.ts"
   },

@@ -26,8 +26,15 @@ import { createHash } from 'node:crypto'
 import { checkBinaries } from '../utils/binaries.ts'
 import { isRootCandidate, listTexFiles, resolveRoot, type RootResolution } from '../utils/root.ts'
 import { synctexEdit, synctexView } from '../utils/synctex.ts'
-import { CompileService, compilePaths, type CompilePaths } from './compile.ts'
-import { ArtifactStore } from './artifacts.ts'
+import { CompileService, compilePaths, type CompileOptions, type CompilePaths } from './compile.ts'
+import { ArtifactStore, pairHashes } from './artifacts.ts'
+import {
+  issueTrust,
+  manifestStillDescribes,
+  trustCovers,
+  workspaceIdOf,
+  type TrustedArtifacts,
+} from './provenance.ts'
 import {
   acceptCurrent,
   advanceRevisions,
@@ -47,6 +54,7 @@ import { createApiHandler, type PreviewHost } from './http-api.ts'
 import { mountStaticRoute, ROUTE_PREFIX, type StaticMount, type WebServerLike } from './static-route.ts'
 import { assetsRoot, VIEWER_PATH, viewerAvailable } from '../utils/assets.ts'
 import type {
+  BackupResult,
   CompileResult,
   DiffBlock,
   DiffDocResult,
@@ -101,6 +109,34 @@ const DEFAULT_DEBOUNCE_MS = 500
 const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_FIRST_RUN_TIMEOUT_MS = 300_000
 
+/** Constructor options; every field is optional so `ctx.plugin(Service)` still works. */
+export interface ServiceOptions {
+  /**
+   * Builds the compiler for a workspace.
+   *
+   * The only reason this exists is testability: a service-level test has to control
+   * what one compile produces *and* what the source looks like when it starts and
+   * finishes, which is exactly the pair of facts `CompileService.run` alone cannot
+   * express.
+   */
+  readonly compileFactory?: (options: CompileOptions) => CompileService
+}
+
+/** Per-run overrides for one compile. */
+interface RunOptions {
+  /**
+   * Source that produced the artefacts currently on disk, when it is not
+   * `currentSource`.
+   *
+   * 撤销 writes the baseline back to disk *before* compiling, so the PDF being
+   * replaced belongs to the revision that is being discarded — not to the source
+   * that is about to be read.
+   */
+  readonly beforeOverride?: string | null
+  /** Skip the reviewer: a revert is not a proposal, it is the undo of one. */
+  readonly suppressReview?: boolean
+}
+
 export class LatexPreviewService extends TypertRemoteService {
   private state: PreviewState
   private compiler: CompileService
@@ -154,14 +190,45 @@ export class LatexPreviewService extends TypertRemoteService {
    * numbers checks it before trusting the pair (docs/spikes.md §B23).
    */
   private baseRevisionId: string | null = null
+  /**
+   * Identity of the workspace the fields above describe (`rootFile` + `outDir`).
+   *
+   * A credential names a workspace; switching projects must therefore invalidate it
+   * even when the two happen to share a source digest.
+   */
+  private workspaceId: string | null = null
+  /**
+   * Permission to publish a pair as a named revision, for the pair this process
+   * produced itself.
+   *
+   * Null on start, after a workspace switch, and whenever a compile failed without
+   * a clean rollback. Null means "publish no revision" — never "publish anyway"
+   * (services/provenance.ts explains why integrity is not provenance).
+   */
+  private trusted: TrustedArtifacts | null = null
+  /** Builds the compiler; injectable so service tests can drive real compiles. */
+  private readonly compileFactory: (options: CompileOptions) => CompileService
+  /** Tail of the compile queue; see {@link runCompile}. */
+  private compileQueue: Promise<void> = Promise.resolve()
   private outDir: string
+  /**
+   * Whether {@link outDir} came from the caller.
+   *
+   * The constructor seeds it with `<cwd>/.latex-preview`, which is right for the
+   * common case (DSH started inside the paper folder) but wrong as a *default*: a
+   * workspace elsewhere must compile next to its own root file, not into whatever
+   * directory DSH happens to be running from. Without this flag the seeded value
+   * wins and the per-workspace fallback below never runs.
+   */
+  private outDirExplicit = false
   private debounceMs = DEFAULT_DEBOUNCE_MS
 
-  constructor(ctx: Context) {
+  constructor(ctx: Context, options: ServiceOptions = {}) {
     super(ctx, SERVICE_KEY, { namespace: SERVICE_KEY })
 
+    this.compileFactory = options.compileFactory ?? ((compileOptions) => new CompileService(compileOptions))
     this.outDir = join(process.cwd(), '.latex-preview')
-    this.compiler = new CompileService({
+    this.compiler = this.compileFactory({
       rootFile: join(process.cwd(), 'main.tex'),
       outDir: this.outDir,
       timeoutMs: DEFAULT_TIMEOUT_MS,
@@ -319,9 +386,11 @@ export class LatexPreviewService extends TypertRemoteService {
       })
     }
 
-    const outDir = request.outDir ?? this.outDir ?? join(dirname(rootFile), '.latex-preview')
+    const outDir =
+      request.outDir ?? (this.outDirExplicit ? this.outDir : join(dirname(rootFile), '.latex-preview'))
+    if (request.outDir) this.outDirExplicit = true
     this.outDir = outDir
-    this.compiler = new CompileService({
+    this.compiler = this.compileFactory({
       rootFile,
       outDir,
       timeoutMs: DEFAULT_TIMEOUT_MS,
@@ -334,14 +403,20 @@ export class LatexPreviewService extends TypertRemoteService {
       firstRunTimeoutMs: DEFAULT_FIRST_RUN_TIMEOUT_MS,
     })
     const initial = await this.readSource(rootFile)
+    const workspace = workspaceIdOf(rootFile, outDir)
+    // A credential names the workspace it was issued in: the same source digest in
+    // another project says nothing about these bytes.
+    if (this.workspaceId !== workspace) this.trusted = null
+    this.workspaceId = workspace
     // A fresh configure starts from "what is on disk is the accepted revision and
     // the current one"; the previous-compile revision is unknown until we compile.
     this.acceptedSource = initial
     this.currentSource = initial
     this.previousCompileSource = null
-    // A different root (or outDir) means any pair belongs to another document;
-    // restoreArtifacts() keeps a pair only when its manifest names this source.
-    await this.restoreArtifacts()
+    // Restore before the single state commit: the restore needs a root file that is
+    // not in `state` yet, and letting it patch `state` itself is what allowed the
+    // commit below to erase the result again. It returns the fields instead.
+    const restored = await this.restoreArtifacts(rootFile, outDir, initial)
 
     await this.stopWatching()
     this.watcher = new FileWatcher({
@@ -361,12 +436,15 @@ export class LatexPreviewService extends TypertRemoteService {
       rootCandidates: resolution?.candidates ?? [rootFile],
       watching: true,
       redact: this.redact,
-      basePdfUrl: null,
-      baseViewerUrl: null,
-      baseRevisionId: null,
-      recentPdfUrl: null,
-      recentViewerUrl: null,
-      recentRevisionId: null,
+      // A workspace switch must not inherit the previous project's PDF: the panel
+      // would present it as this document's output, and the automatic first compile
+      // below is skipped whenever `pdfUrl` is already set.
+      pdfUrl: null,
+      viewerUrl: null,
+      compiledAt: null,
+      diagnostics: [],
+      diffDocUrl: null,
+      ...restored,
     })
 
     // First view of a workspace has no PDF yet; without this the panel stays
@@ -473,7 +551,7 @@ export class LatexPreviewService extends TypertRemoteService {
       await (side === 'base' ? this.dropBaseArtifacts() : this.dropRecentArtifacts())
       return { ...empty, message: '旧版 PDF 与其 SyncTeX 未能成对校验，无法定位被删除的内容' }
     }
-    return this.baseRegions(version, rootFile, pdf, hunks, left)
+    return this.baseRegions(version, side, rootFile, pdf, hunks, left)
   }
 
   /**
@@ -576,11 +654,15 @@ export class LatexPreviewService extends TypertRemoteService {
    */
   private async baseRegions(
     version: number,
+    side: 'base' | 'compile',
     rootFile: string,
     basePdf: string,
     hunks: readonly DiffHunk[],
     base: string,
   ): Promise<DiffRegions> {
+    // The title has to name the document the user is looking at: the same hunk is
+    // "已接受版第 7 行" on one side and "上次编译版第 7 行" on the other.
+    const label = side === 'base' ? '已接受版' : '上次编译版'
     // The *old* source is what the old line numbers index; using the new one
     // here would decide which lines are blank against the wrong document.
     const sourceLines = base.split(/\r?\n/)
@@ -615,8 +697,8 @@ export class LatexPreviewService extends TypertRemoteService {
         }
         const title =
           edge === 'top'
-            ? `旧版第 ${anchorLine} 行之前新增了内容（旧版 PDF 里没有这段）`
-            : `旧版第 ${anchorLine} 行之后新增了内容（旧版 PDF 里没有这段）`
+            ? `${label}第 ${anchorLine} 行之前新增了内容（那一版 PDF 里没有这段）`
+            : `${label}第 ${anchorLine} 行之后新增了内容（那一版 PDF 里没有这段）`
         for (const band of bandsFromHits(anchor)) {
           regions.push({
             ...band,
@@ -646,13 +728,13 @@ export class LatexPreviewService extends TypertRemoteService {
       const kind: DiffRegionKind = hunk.kind === 'delete' ? 'removed' : 'modify'
       const where = first === last ? `第 ${first} 行` : `第 ${first}-${last} 行`
       const what = kind === 'removed' ? `这 ${hunk.removed} 行已被删除` : '这一处已被改写'
-      const title = hunk.preview === '' ? `旧版${where}：${what}` : `旧版${where}：${what}（${hunk.preview}）`
+      const title = hunk.preview === '' ? `${label}${where}：${what}` : `${label}${where}：${what}（${hunk.preview}）`
       for (const band of bandsFromHits(hits)) {
         regions.push({ ...band, kind, lineStart: first, lineEnd: last, title })
       }
     }
 
-    return { version, side: 'base', regions, skipped }
+    return { version, side, regions, skipped }
   }
 
   /**
@@ -750,12 +832,15 @@ export class LatexPreviewService extends TypertRemoteService {
     }
 
     await writeFile(rootFile, target, 'utf8')
-    // Line both snapshots up *before* compiling: otherwise the compile sees the
-    // reverted file as a brand-new change and paints the rollback as a diff.
-    this.currentSource = target
+    // The PDF on screen still belongs to the revision being thrown away, so the
+    // compile must be told what it is replacing instead of inferring it from a
+    // `currentSource` we just moved. Moving it here would also make the compile
+    // look like a no-op and leave the previous-compile snapshot pointing at the
+    // baseline rather than at the document the user was reading.
+    const discarded = this.currentSource
     let result: CompileResult
     try {
-      result = await this.runCompile()
+      result = await this.runCompile({ beforeOverride: discarded, suppressReview: true })
     } catch (error) {
       throw new RemoteError('latex-preview/revert-failed', '源码已回滚，但重新编译没有启动', {
         detail: error instanceof Error ? error.message : String(error),
@@ -764,6 +849,13 @@ export class LatexPreviewService extends TypertRemoteService {
     if (!result.ok) {
       throw new RemoteError('latex-preview/revert-failed', '源码已回滚，但重新编译失败；PDF 仍是回滚前那一版', {
         detail: result.diagnostics[0]?.message ?? 'unknown',
+      })
+    }
+    if (this.currentSource !== target) {
+      // The file changed again while the revert compiled; the state now describes
+      // that newer content, so calling it "rolled back" would be false.
+      throw new RemoteError('latex-preview/revert-failed', '源码已回滚，但编译期间文件又被修改，屏幕上不是回滚后的版本', {
+        detail: '文件在回滚编译期间被改动',
       })
     }
     // The rolled-back content is the baseline, so the pair must describe it
@@ -902,12 +994,16 @@ export class LatexPreviewService extends TypertRemoteService {
 
   /**
    * Paths of both revision pairs, or null before a root file is known.
-   * @returns `{ accepted, recent }` stores plus the live compile paths.
+   * @param rootFile - workspace root; defaults to the state's.
+   * @param outDir - workspace output dir; defaults to the service's.
+   * @returns `{ paths, accepted, recent }` stores, or null.
    */
-  private artifactPathsNow(): { paths: CompilePaths; accepted: ArtifactStore; recent: ArtifactStore } | null {
-    const rootFile = this.state.rootFile
+  private artifactPathsNow(
+    rootFile: string | null = this.state.rootFile,
+    outDir: string = this.outDir,
+  ): { paths: CompilePaths; accepted: ArtifactStore; recent: ArtifactStore } | null {
     if (!rootFile) return null
-    const paths = compilePaths(rootFile, this.outDir)
+    const paths = compilePaths(rootFile, outDir)
     return {
       paths,
       accepted: new ArtifactStore({ pdf: paths.basePdf, synctex: paths.baseSynctex, manifest: paths.baseManifest }),
@@ -916,18 +1012,71 @@ export class LatexPreviewService extends TypertRemoteService {
   }
 
   /**
+   * Whether this process may claim `source` produced the bytes at these paths.
+   *
+   * The credential must name this workspace, this revision *and* these hashes. A
+   * manifest alone cannot answer this: it records what the bytes were, never who
+   * compiled them (services/provenance.ts).
+   * @param source - revision the caller wants to name.
+   * @param hashes - hashes of the files as they sit on disk right now.
+   * @returns true only for an exact match.
+   */
+  private claimCovers(source: string | null, hashes: { pdfSha256: string; synctexSha256: string }): boolean {
+    if (source === null || this.workspaceId === null) return false
+    return trustCovers(this.trusted, {
+      workspaceId: this.workspaceId,
+      sourceDigest: this.digestOf(source),
+      pdfSha256: hashes.pdfSha256,
+      synctexSha256: hashes.synctexSha256,
+    })
+  }
+
+  /**
+   * Issue a credential for the pair currently on screen.
+   *
+   * Only called right after this process compiled it and confirmed the input did not
+   * move; the hashes are of the files on disk, so the credential names the exact
+   * bytes a later publish would install.
+   * @param rootFile - workspace root.
+   * @param source - source the compile read.
+   * @returns the credential, or null when the pair cannot be hashed.
+   */
+  private async issueTrustFor(rootFile: string, source: string | null): Promise<TrustedArtifacts | null> {
+    const stores = this.artifactPathsNow(rootFile)
+    if (!stores || source === null || this.workspaceId === null) return null
+    const hashes = await pairHashes(stores.paths.pdf, stores.paths.synctex)
+    if (hashes === null) return null
+    return issueTrust({
+      workspaceId: this.workspaceId,
+      sourceDigest: this.digestOf(source),
+      pdfSha256: hashes.pdfSha256,
+      synctexSha256: hashes.synctexSha256,
+    })
+  }
+
+  /**
    * Publish the pair that describes the **previous compile** (diff path B).
    *
-   * Every successful compile overwrites the pre-compile copies, so this runs on
-   * every successful run and always describes `before` — the revision that was on
-   * screen a moment ago. It is not gated by the review mode: "what did this save
-   * change" is a question about the compiler, not about approval.
+   * Three gates, all of which must pass: the backup copied both halves this run,
+   * the bytes on disk hash to what the backup recorded, and this process holds a
+   * credential for `before` naming exactly those hashes. Anything less and the
+   * previous-compile view is withdrawn rather than drawn from a guess.
    * @param before - source that produced the artefacts now sitting in `prev`.
+   * @param backup - what the compile's backup step reported.
    */
-  private async publishCompileArtifacts(before: string | null): Promise<void> {
+  private async publishCompileArtifacts(before: string | null, backup: BackupResult): Promise<void> {
     const stores = this.artifactPathsNow()
-    if (!stores) return
-    if (before === null) {
+    if (!stores || before === null || backup.status !== 'complete') {
+      await this.dropRecentArtifacts()
+      return
+    }
+    const hashes = await pairHashes(stores.paths.prev, stores.paths.prevSynctex)
+    if (
+      hashes === null ||
+      hashes.pdfSha256 !== backup.pdfSha256 ||
+      hashes.synctexSha256 !== backup.synctexSha256 ||
+      !this.claimCovers(before, hashes)
+    ) {
       await this.dropRecentArtifacts()
       return
     }
@@ -949,17 +1098,17 @@ export class LatexPreviewService extends TypertRemoteService {
    *
    * Two cases, and they are not the same question:
    *
-   * - The accepted revision **moved to** what this compile replaced (`open`, or a
-   *   redundant compile): publish those bytes as the new pair.
+   * - The accepted revision **moved to** what this compile replaced (`open`, a
+   *   revert, or a redundant compile): publish those bytes — but only with a
+   *   credential proving this process compiled them, for the same reason as above.
    * - It did not (`manual`/`auto` with a pending change): the pair already on disk
    *   still describes the accepted revision, because compiles no longer overwrite
-   *   it. Keep it — dropping it would take away the one document where the removed
-   *   text is still typeset, which is the whole point of the base view.
-   *
-   * The pair is dropped only when it can no longer prove what it claims.
+   *   it. Keep it when its manifest still names that revision — dropping it would
+   *   take away the one document where removed text is still typeset.
    * @param expected - source that produced the artefacts in the `prev` copies.
+   * @param backup - what the compile's backup step reported.
    */
-  private async adoptBaseArtifacts(expected: string | null): Promise<void> {
+  private async adoptBaseArtifacts(expected: string | null, backup: BackupResult): Promise<void> {
     const stores = this.artifactPathsNow()
     const accepted = this.acceptedSource
     if (!stores || accepted === null) {
@@ -968,37 +1117,56 @@ export class LatexPreviewService extends TypertRemoteService {
     }
     const id = this.digestOf(accepted)
 
-    if (expected !== null && accepted === expected) {
-      const ok = await stores.accepted.publish({
-        revisionId: id,
-        pdf: stores.paths.prev,
-        synctex: stores.paths.prevSynctex,
-      })
-      if (!ok) {
-        await this.dropBaseArtifacts()
+    if (expected !== null && accepted === expected && backup.status === 'complete') {
+      const hashes = await pairHashes(stores.paths.prev, stores.paths.prevSynctex)
+      const proven =
+        hashes !== null &&
+        hashes.pdfSha256 === backup.pdfSha256 &&
+        hashes.synctexSha256 === backup.synctexSha256 &&
+        this.claimCovers(accepted, hashes)
+      if (proven) {
+        const ok = await stores.accepted.publish({
+          revisionId: id,
+          pdf: stores.paths.prev,
+          synctex: stores.paths.prevSynctex,
+        })
+        if (!ok) {
+          await this.dropBaseArtifacts()
+          return
+        }
+        this.publishBaseUrls(id)
         return
       }
-      this.publishBaseUrls(id)
-      return
+      // Those bytes may still be the accepted revision even though this process
+      // cannot re-attest them — it is a restart, and the pair was published by the
+      // process that compiled it. Fall through to the manifest check instead of
+      // deleting a pair that is still correct.
     }
 
     const manifest = await stores.accepted.verify()
-    if (manifest && manifest.revisionId === id) this.publishBaseUrls(id)
+    if (manifestStillDescribes(manifest, id)) this.publishBaseUrls(id)
     else await this.dropBaseArtifacts()
   }
 
   /**
    * Replace the accepted pair with the artefacts currently on screen.
    *
-   * Used when the baseline catches up with what is displayed (接受, auto approval,
-   * revert): at that moment the current PDF *is* the baseline, so it can be copied
-   * without a second compile — and committed with a manifest, so a later reader can
-   * prove the pair still belongs to it.
+   * Used when the baseline catches up with what is displayed (接受, an approving
+   * reviewer): the current PDF *is* the baseline then, so it can be installed
+   * without a second compile — provided this process compiled it, which is what the
+   * credential says.
    */
   private async snapshotBaseFromCurrent(): Promise<void> {
     const stores = this.artifactPathsNow()
     const source = this.acceptedSource
     if (!stores || source === null) {
+      await this.dropBaseArtifacts()
+      return
+    }
+    const hashes = await pairHashes(stores.paths.pdf, stores.paths.synctex)
+    if (hashes === null || !this.claimCovers(source, hashes)) {
+      // The PDF is on screen but nobody can say which revision produced it, so it
+      // must not be promoted to a baseline that later line-number lookups trust.
       await this.dropBaseArtifacts()
       return
     }
@@ -1043,8 +1211,23 @@ export class LatexPreviewService extends TypertRemoteService {
    */
   private urlsFor(id: string, tag: 'base' | 'recent'): Partial<PreviewState> {
     const stores = this.artifactPathsNow()
-    const file = tag === 'base' ? stores?.paths.basePdf : stores?.paths.recentPdf
-    if (!file) return {}
+    if (!stores) return {}
+    return this.urlsAt(stores, id, tag)
+  }
+
+  /**
+   * Same as {@link urlsFor}, for a workspace that is not in `state` yet.
+   * @param stores - the workspace's paths.
+   * @param id - revision digest.
+   * @param tag - which pair.
+   * @returns the fields to publish.
+   */
+  private urlsAt(
+    stores: { paths: CompilePaths },
+    id: string,
+    tag: 'base' | 'recent',
+  ): Partial<PreviewState> {
+    const file = tag === 'base' ? stores.paths.basePdf : stores.paths.recentPdf
     const route = `${ROUTE_PREFIX}/pdf/${encodeURIComponent(basename(file))}`
     const viewer = viewerAvailable()
       ? `${ROUTE_PREFIX}${VIEWER_PATH}?file=${encodeURIComponent(route)}&v=${id}`
@@ -1055,28 +1238,48 @@ export class LatexPreviewService extends TypertRemoteService {
   }
 
   /**
-   * Re-establish what the artefacts on disk are allowed to claim, at configure time.
+   * What the artefacts on disk are allowed to claim, at configure time.
    *
-   * A manifest survives a restart, so a pair can be picked up again — but only when
-   * its recorded `revisionId` is the digest of the source we just adopted. Anything
-   * else is dropped rather than shown against line numbers it does not describe.
+   * A manifest survives a restart, so an accepted pair can be picked up again — but
+   * only when its recorded `revisionId` is the digest of the source we just adopted.
+   * Anything else is deleted rather than shown against line numbers it does not
+   * describe. A previous-compile pair is never restored: which revision it holds is
+   * known only to the process that compiled it.
+   *
+   * Returns the state fields instead of patching them: `applyConfigure` is about to
+   * commit one snapshot, and a restore that patched on its own would be erased by
+   * that commit — which is exactly what used to happen.
+   * @param rootFile - workspace root.
+   * @param outDir - workspace output dir.
+   * @param source - the accepted revision.
+   * @returns the publication fields for the configuration snapshot.
    */
-  private async restoreArtifacts(): Promise<void> {
-    const stores = this.artifactPathsNow()
-    const source = this.acceptedSource
-    if (!stores || source === null) {
-      await this.dropBaseArtifacts()
-      await this.dropRecentArtifacts()
-      return
+  private async restoreArtifacts(rootFile: string, outDir: string, source: string | null): Promise<Partial<PreviewState>> {
+    const vanished: Partial<PreviewState> = {
+      basePdfUrl: null,
+      baseViewerUrl: null,
+      baseRevisionId: null,
+      recentPdfUrl: null,
+      recentViewerUrl: null,
+      recentRevisionId: null,
     }
-    const digest = this.digestOf(source)
-    const accepted = await stores.accepted.verify()
-    if (accepted && accepted.revisionId === digest) this.publishBaseUrls(digest)
-    else await this.dropBaseArtifacts()
+    const stores = this.artifactPathsNow(rootFile, outDir)
+    if (!stores || source === null) {
+      if (stores) {
+        await stores.accepted.drop()
+        await stores.recent.drop()
+      }
+      return vanished
+    }
+    await stores.recent.drop()
 
-    // A previous-compile pair cannot be re-adopted: which revision it holds is only
-    // known in memory, and guessing would be exactly the pairing error this guards.
-    await this.dropRecentArtifacts()
+    const digest = this.digestOf(source)
+    const manifest = await stores.accepted.verify()
+    if (!manifestStillDescribes(manifest, digest)) {
+      await stores.accepted.drop()
+      return vanished
+    }
+    return this.urlsAt(stores, digest, 'base')
   }
 
   /**
@@ -1325,8 +1528,37 @@ export class LatexPreviewService extends TypertRemoteService {
     }
   }
 
-  /** One compile, with state transitions around it. */
-  private async runCompile(): Promise<CompileResult> {
+  /**
+   * Serialise compiles, then run one.
+   *
+   * `CompileService.run` already single-flights the *process*, but this method also
+   * moves the revision snapshots and publishes artefacts — and two interleaved
+   * bookkeepings are not the same thing as one. A watcher that fires twice for a
+   * single save produced exactly that: the second run copied the PDF the first had
+   * just written, published it under the older revision, and the first run's publish
+   * was then dropped as stale. One at a time is the only way the snapshots and the
+   * pairs stay in step.
+   * @param run - caller overrides; see {@link RunOptions}.
+   * @returns the compile result, with its URL filled in.
+   */
+  private runCompile(run: RunOptions = {}): Promise<CompileResult> {
+    const next = this.compileQueue.then(
+      () => this.compileOnce(run),
+      () => this.compileOnce(run),
+    )
+    this.compileQueue = next.then(
+      () => undefined,
+      () => undefined,
+    )
+    return next
+  }
+
+  /**
+   * One compile, with state transitions around it.
+   * @param run - caller overrides; see {@link RunOptions}.
+   * @returns the compile result, with its URL filled in.
+   */
+  private async compileOnce(run: RunOptions = {}): Promise<CompileResult> {
     const rootFile = this.state.rootFile
     if (!rootFile) {
       throw new RemoteError('latex-preview/no-root-file', 'nothing configured', { hint: '先调用 configure' })
@@ -1336,7 +1568,13 @@ export class LatexPreviewService extends TypertRemoteService {
     }
 
     // What the artifacts on disk describe *before* this compile overwrites them.
-    const before = this.currentSource
+    // Not always what `currentSource` says: 撤销 writes the file back first, and the
+    // PDF on screen still belongs to the revision it is throwing away.
+    const before = run.beforeOverride !== undefined ? run.beforeOverride : this.currentSource
+    // The input the compiler is about to read. Comparing it with the file after the
+    // run is the only way to notice an edit that landed mid-compile: the PDF then
+    // belongs to neither snapshot, and must not be given a credential.
+    const input = await this.readSource(rootFile)
     this.patch({ status: 'compiling', message: '正在编译…' })
     let result: CompileResult
     try {
@@ -1359,33 +1597,45 @@ export class LatexPreviewService extends TypertRemoteService {
         ? `${ROUTE_PREFIX}${VIEWER_PATH}?file=${encodeURIComponent(pdfRoute)}&v=${version}`
         : null
 
+    const compiled = result.ok ? await this.readSource(rootFile) : null
+    // A compile is only as trustworthy as its input: if the file changed while the
+    // compiler had it open, the PDF corresponds to neither the before- nor the
+    // after-snapshot.
+    const stable = result.ok && compiled !== null && compiled === input
     let contentChanged = false
+
     if (result.ok) {
-      const compiled = await this.readSource(rootFile)
-      // Advance only when the content actually moved. A redundant compile (the
-      // user pressing 编译 twice) must not erase the marks they are looking at,
-      // and a failed compile keeps the old PDF, so its baseline stays.
-      // One pure rule decides what moves: the accepted revision only where the mode
-      // allows it, the previous compile always (services/revisions.ts).
-      const advanced = compiled === null ? null : advanceRevisions(this.revisions(), compiled, this.review)
+      // Advance only when the content actually moved. A redundant compile (the user
+      // pressing 编译 twice, or the watcher reporting one save) must not erase the
+      // marks they are looking at, and it must not republish "上次编译" either: the
+      // last compile before the current one is still the answer, and overwriting it
+      // with the revision that is already on screen loses the comparison.
+      const advanced = stable && compiled !== null ? advanceRevisions(this.revisions(), compiled, this.review) : null
       if (advanced?.changed) {
+        // Publish before advancing: the credential that authorises the pre-compile
+        // copies describes the bytes that were on screen a moment ago, and the
+        // advance is what decides whether those bytes also become a baseline.
+        await this.publishCompileArtifacts(before, result.backup)
         this.applyRevisions(advanced.revisions)
         contentChanged = true
-        if (this.review === 'auto') void this.queueReview()
+        if (this.review === 'auto' && run.suppressReview !== true) void this.queueReview()
       }
-    }
-
-    // A failed compile leaves both pairs untouched: nothing moved, so whatever was
-    // valid before is still valid. On success the two pairs are published from the
-    // pre-compile copies, each gated by which revision it actually describes.
-    if (result.ok) {
-      await this.publishCompileArtifacts(before)
-      await this.adoptBaseArtifacts(before)
+      await this.adoptBaseArtifacts(before, result.backup)
+      // The credential for the bytes now on screen. Withheld when the input moved:
+      // an unprovable pair is exactly what must never be published later.
+      this.trusted = stable ? await this.issueTrustFor(rootFile, compiled) : null
     } else if (result.rollbackIncomplete) {
       // The PDF on screen and the sync map behind it may now disagree, so neither
-      // old-revision view can be trusted for this state.
+      // old-revision view can be trusted for this state — nor the pair itself.
+      this.trusted = null
       await this.dropBaseArtifacts()
       await this.dropRecentArtifacts()
+    }
+
+    if (result.ok && !stable) {
+      // Converge: the edit that landed mid-compile is now on disk, and the PDF on
+      // screen predates it.
+      void this.runCompile().catch(() => undefined)
     }
 
     this.patch({
@@ -1398,14 +1648,18 @@ export class LatexPreviewService extends TypertRemoteService {
       compiledAt: result.ok ? new Date().toISOString() : this.state.compiledAt,
       diagnostics: result.diagnostics,
       durationMs: result.durationMs,
-      message: this.describe(result),
+      message: this.describe(result, stable),
     })
     return { ...result, pdfUrl }
   }
 
   /** One-line status for the panel. */
-  private describe(result: CompileResult): string {
-    if (result.ok) return `编译成功（${(result.durationMs / 1000).toFixed(1)}s）`
+  private describe(result: CompileResult, stable = true): string {
+    if (result.ok) {
+      return stable
+        ? `编译成功（${(result.durationMs / 1000).toFixed(1)}s）`
+        : `编译成功（${(result.durationMs / 1000).toFixed(1)}s），但编译期间源码又变了，正在重新编译`
+    }
     if (result.timedOut) return '编译超时，已保留上一次的 PDF'
     const errors = result.diagnostics.filter((d) => d.severity === 'error').length
     return result.rolledBack

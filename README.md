@@ -178,6 +178,7 @@ HTTP routes the panel uses (`POST`, except `state` which is `GET`): `state` `con
 npm run typecheck    # tsc --noEmit
 npm run verify       # contract probe (5 pass / 0 fail / 2 skip)
 npm test             # unit tests (node:test, no extra dependency)
+npm run typecheck:test   # the tests are TypeScript too
 npm run build        # tsc + client bundle + assets
 npm run assets       # rebuild only the PDF.js runtime and viewer page
 npm run binaries     # check tectonic / synctex

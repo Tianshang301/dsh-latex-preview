@@ -257,6 +257,27 @@ export interface DiffDocResult {
   readonly version: number
 }
 
+/**
+ * How the pre-compile copy of the previous artefacts went.
+ *
+ * Three states, because "no PDF to copy" and "the copy broke" lead to different
+ * answers. A boolean cannot tell them apart, and the difference matters: with no
+ * previous pair a first compile is simply the beginning, while a failed copy means
+ * something *was* there and may now be half-gone — which must never be published as
+ * a revision (docs/spikes.md §B23).
+ *
+ * - `complete`  — PDF and `.synctex.gz` both copied, hashes recorded.
+ * - `pdf-only`  — a PDF existed but its sync map did not; usable for rollback, not
+ *                 as a revision pair.
+ * - `unavailable` — nothing to copy: this is the first compile of a workspace.
+ * - `failed`    — a pair existed and could not be copied; no bytes are claimed.
+ */
+export type BackupResult =
+  | { readonly status: 'complete'; readonly pdfSha256: string; readonly synctexSha256: string }
+  | { readonly status: 'pdf-only'; readonly pdfSha256: string }
+  | { readonly status: 'unavailable' }
+  | { readonly status: 'failed'; readonly reason: string }
+
 /** Outcome of one compile attempt, as handed back to the client. */
 export interface CompileResult {
   readonly ok: boolean
@@ -284,6 +305,14 @@ export interface CompileResult {
    * a map that no longer matches the page, so the UI must stop offering them.
    */
   readonly rollbackIncomplete: boolean
+  /**
+   * What the pre-compile copy of the previous artefacts achieved.
+   *
+   * Only a `complete` backup may be published as a revision: it is the only state
+   * in which both halves of the pair are known to be this run's copy of the bytes
+   * that were on screen before compiling.
+   */
+  readonly backup: BackupResult
 }
 
 /** Tunables the client may push down; every field has a host-side default. */

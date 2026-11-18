@@ -24,6 +24,7 @@
 import { createHash } from 'node:crypto'
 import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
+import type { PairHashes } from './provenance.ts'
 
 /** Bumped when the manifest shape changes; an unknown version is not trusted. */
 const MANIFEST_VERSION = 1
@@ -88,6 +89,25 @@ async function usable(path: string): Promise<boolean> {
     return info.isFile() && info.size > 0
   } catch {
     return false
+  }
+}
+
+/**
+ * Hash two files as one pair, for a provenance check.
+ *
+ * The service needs this for files it is about to *claim* a revision for — the
+ * pre-compile copies and the live output — and it must hash the same bytes it will
+ * hand to `publish()`, not the source it copied from.
+ * @param pdf - PDF path.
+ * @param synctex - sync map path.
+ * @returns both sha256s, or null when either file is missing or unreadable.
+ */
+export async function pairHashes(pdf: string, synctex: string): Promise<PairHashes | null> {
+  try {
+    const [left, right] = await Promise.all([hashFile(pdf), hashFile(synctex)])
+    return { pdfSha256: left.sha256, synctexSha256: right.sha256 }
+  } catch {
+    return null
   }
 }
 
