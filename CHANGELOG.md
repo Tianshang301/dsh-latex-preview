@@ -35,6 +35,14 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 - The reference is the **previous compiled revision**, not the file on disk — see the baseline fix below.
 - Caps: 24 hunks and 40 resolved lines per revision. Longer blocks are **sampled evenly** rather than truncated (highlighting only the top would imply the change ends there); the surplus is reported in the button's title instead of being silently dropped.
 
+**Reliability boundaries**
+
+- **The PDF route follows the configured workspace.** `StaticMount.dir` also accepts a getter, resolved per request before the path is normalised and checked. A workspace outside the process directory used to 404 on every PDF (the mount captured `<cwd>/.latex-preview` at registration), and two workspaces sharing a file name would serve each other's document at a URL that looked valid.
+- **`CompileResult.artifactState`** (`current` / `restored` / `unavailable`) separates "did it compile" from "may this be shown": a failed compile that restored the pair keeps the previous PDF on screen, while one whose rollback or backup fell through withdraws both URLs and both revision pairs. `pdfPath` is null whenever nothing can be vouched for.
+- **The reviewer starts last**, after the credential for the bytes on screen exists. An immediately-approving reviewer used to reach `snapshotBaseFromCurrent()` while `trusted` still described the revision being replaced, so the promotion was refused and the accepted pair was dropped.
+- **A compile is bound to one workspace.** `Workspace` (generation, identity, root file, out dir, compiler) is replaced in a single assignment and captured once per run; if it is no longer current when the process returns, nothing is patched, published or credentialed.
+- 62 unit tests, including a real HTTP server for the route and a service test that parks one workspace's compile while another is configured.
+
 **Artefact provenance**
 
 - **A revision is published only when this process can prove it produced the bytes.** A manifest records *integrity* (these are the bytes it named), which is a different claim from *provenance* (they were compiled from that revision). `services/provenance.ts` holds the credential: workspace, source digest, and both file hashes, issued only right after a compile that read a source it re-read unchanged. All three publish sites check it — 上次编译版, 已接受版 from the backup, and 已接受版 from the current PDF. No credential means no revision, never a guess.
@@ -103,6 +111,7 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 
 ### Fixed
 
+- **The panel could keep showing an artefact the compile could not account for.** `pdfUrl` fell back to `this.state.pdfUrl` whenever the run produced no path, so a partial rollback or a failed backup left a URL pointing at bytes of unknown origin. The URL is now cleared with `artifactState === 'unavailable'`.
 - **A leftover PDF could be published as the revision currently on disk.** The pre-compile copy was taken from whatever `main.pdf` happened to be there — possibly compiled by an earlier session from a different source — and committed under the digest of the file just read. Both revision views would then draw correct-looking bands in wrong places, with every hash check passing. Fixed by the credential above: nothing is published without a compile this process ran and verified.
 - **`configure` restored artefacts before the state knew the root file, then erased them.** `restoreArtifacts()` read `state.rootFile` (still null on the first configure of a process, so it silently did nothing) and the configuration patch that followed reset the six publication fields anyway. The restore now takes the workspace explicitly and returns state fields, so exactly one snapshot is committed.
 - **`outDir` never fell back to the workspace.** The constructor seeds `outDir` with `<cwd>/.latex-preview`, and `configure` used `request.outDir ?? this.outDir ?? <rootDir>/.latex-preview` — the middle term is always set, so a workspace outside the process directory compiled its artefacts into the wrong folder. The seeded value is now tracked as a default rather than a choice.

@@ -29,6 +29,7 @@
 | **B20** | 旧版产物成对与基线 | 旧 PDF + 旧 SyncTeX 必须同名配对（CLI 按 basename 找）；失败要成对回滚；只在基线推进时采纳，否则丢弃 | 已实现并真机验证（失败前后 sha 与反查结果一致） |
 | **B21** | diff 的行号为什么差一行 | `cleanupSemantic` 在**转回真实文本之后**跑，会把片段边界挪到行中间，每个块的行数都多 1；必须在一行一字符的阶段跑。另外 `synctex view` 对**空行**返回下一行的盒子 | 已修并真机验证（旧行号往返一致，空行不再误标） |
 | **B23** | 产物事务 | 每对产物带 sha256 清单（先删清单→装文件→最后写清单）；`main.prev.*` 与 `main.recent.*` 独立；三条版本线与两条 diff 路径 | 已实现并真机验证（篡改 recent 后拒绝出图） |
+| **B25** | 四个边界 | 路由目录按请求解析；`artifactState` 决定能否展示；审核在凭据之后启动；一次编译只认一个 `Workspace` | 已实现并真机验证（外部工作区 PDF 200、跨工作区编译不污染） |
 | **B24** | 来源证明 | 清单只证明完整性；凭据（workspace + 源码摘要 + 两份哈希）只在「本进程编译且输入未变」时签发，三个发布入口都要它 | 已实现并真机验证（残留 PDF 不发布、撤销后 recent=C、重启恢复已接受对） |
 | **B22** | 在旧版 PDF 上标删除 | 旧行号 + 旧 SyncTeX 才能拿到被删文字的真实盒子（`kind: 'removed'` 红带 + 中线删除线）；该视图必须只读 | 已实现并真机验证（`main.prev.pdf` 加载、红带压在第二段、选区不起浮条） |
 
@@ -877,6 +878,18 @@ interface TrustedArtifacts { workspaceId; sourceDigest; pdfSha256; synctexSha256
 | 重启后（清单仍描述当前源码） | 恢复已接受对 | ✔ |
 
 测试：`test/unit/service-provenance.test.ts` 8 例，用真实 `LatexPreviewService` + 真实 Cordis 上下文 + 真实 `CompileService`（只把进程换成假实现，`ServiceOptions.compileFactory`）。覆盖：残留 PDF 不发布、第二次编译后才可发布、重启恢复、备份失败不发布、撤销的版本推进、`side` 元数据、编译期间改源码、并发编译。全套 54 例；`.github/workflows/ci.yml` 跑 `typecheck` / `typecheck:test` / `test`。
+
+---
+
+## B25 · 四个边界：路由、产物可用性、审核时序、工作区捕获
+
+**1. 静态路由的目录必须按请求解析。** 挂载发生在 `webServer` 注入时（构造函数），`outDir` 却由 `configure` 决定。捕获字符串的后果：工作区不在进程目录时每个 PDF 都 404；两个工作区同名文件则会互相串。`StaticMount.dir` 现在允许传函数，**先解析目录再做路径规范化与越界判定**（顺序不能反，否则 `..` 是相对旧目录判断的）。真机验证：把 rootFile 指到 `E://dsh-elsewhere//main.tex`，`GET /.latex-preview/pdf/main.pdf` 返回 200、10261 字节。
+
+**2. `pdfPath !== null` 不是"可以展示"。** 半回滚会留下"PDF 回滚了、同步表没有"的文件；备份失败会留下来历不明的文件。`artifactState` 三分：`current`（本次产物）、`restored`（失败但成对恢复，画面仍是上一版）、`unavailable`（无法自证）。服务层不再回退到旧 `pdfUrl`，`unavailable` 时清空 URL 并撤下两对产物。**注意 `unavailable` ≠ 编译失败**。
+
+**3. 审核不能抢在凭据之前。** `queueReview()` 原先在成功分支里、`issueTrustFor()` 之前启动。审核通过会调 `snapshotBaseFromCurrent()` 把当前 PDF 提升为基线，而此刻 `trusted` 还描述着被替换的那一版，于是提升被拒、已接受对被丢弃。顺序固定为：发布 → 推进 → 采纳 → 签发 → 审核（发布必须在签发之前，因为它用的是**编译前**的凭据）。两个测试：立即 accept（base 落到新版本）、立即 reject（源码回滚、被拒版本成为「上次编译」、不触发第二次审核）。
+
+**4. 一次编译只认一个工作区。** `compileOnce` 逐处读 `state.rootFile` / `outDir` / `compiler`，`configure` 落在中间就会"用旧源码编译、把产物发布到新工作区"，甚至能观察到半应用状态（新编译器 + 旧根文件）。现在 `Workspace`（generation / id / rootFile / outDir / compiler）一次性替换、整轮捕获；进程返回时若已不是当前工作区，则不 patch、不发布、不签发。测试：A 的编译被卡在编译器里 → 配置 B → 放行 A，B 的文件不被污染、两个工作区都没有被误发布的清单、凭据指向 B。
 
 ---
 
