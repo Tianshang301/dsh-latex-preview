@@ -70,8 +70,29 @@ function factory(behaviour: Behaviour): (options: CompileOptions) => CompileServ
     })
 }
 
-/** The handler the service registers, captured so tests can serve it. */
-interface Harness {
+/**
+ * Make the service believe both binaries exist, and keep believing it.
+ *
+ * `compileOnce` refuses to start without `tectonic`, and the availability flag is
+ * written by a probe the constructor fires without awaiting — so a single patch can
+ * be undone a few milliseconds later. The loop ends only once two consecutive reads
+ * agree, which is enough for a probe that has already landed.
+ * @param service - the service under test.
+ */
+async function trustFakeBinaries(service: LatexPreviewService): Promise<void> {
+  const patched = service as unknown as { patch(next: Partial<PreviewState>): void }
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    patched.patch({ binaries: { tectonic: true, synctex: true } })
+    await delay(25)
+    if ((await service.getState(signal())).binaries.tectonic) {
+      await delay(50)
+      if ((await service.getState(signal())).binaries.tectonic) return
+    }
+  }
+  throw new Error('could not keep the binary probe from vetoing the fake compiler')
+}
+
+/** The handler the service registers, captured so tests can serve it. */interface Harness {
   readonly service: LatexPreviewService
   readonly behaviour: Behaviour
   /** Base URL of the mounted route, e.g. `http://127.0.0.1:1234/.latex-preview`. */
@@ -101,9 +122,12 @@ async function mount(workDir: string): Promise<Harness> {
     },
   })
   const service = new LatexPreviewService(ctx, { compileFactory: factory(behaviour) })
-  ;(service as unknown as { patch(next: Partial<PreviewState>): void }).patch({
-    binaries: { tectonic: true, synctex: true },
-  })
+  // The constructor probes for `tectonic` in the background over a real `spawn`. A
+  // patch applied before that probe lands is overwritten by it (available: false),
+  // and every compile is then vetoed before the fake process ever runs — the failure
+  // is timing-dependent, which is exactly how it passed here and failed on CI. So:
+  // let the probe settle, patch, then keep patching until the value sticks.
+  await trustFakeBinaries(service)
   await delay(0)
   assert.ok(handler, 'the service registered a route; without one these tests prove nothing')
 
@@ -138,6 +162,14 @@ async function settled(harness: Harness, timeoutMs = 20_000): Promise<PreviewSta
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const state = await harness.service.getState(signal())
+    // Say *why* rather than timing out: a vetoed compiler and a swallowed exception
+    // both look like "nothing happened" from the outside.
+    if (!state.binaries.tectonic) {
+      throw new Error(`the binary probe vetoed the fake compiler: ${JSON.stringify(state.binaries)}`)
+    }
+    if (harness.behaviour.runs > 0 && state.status === 'failed') {
+      throw new Error(`the compile failed: ${state.message ?? ''}`)
+    }
     const done = harness.behaviour.runs > 0 && state.durationMs !== null && state.status === 'ok'
     if (done) return state
     await delay(20)
