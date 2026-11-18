@@ -37,6 +37,7 @@
 | **B28** | 工作区切换是状态机 | `prepareWorkspace`（只动候选目录）→ `activateWorkspace`（无 await 的赋值块）；`configure` 不进入编译队列（首次编译可达数分钟）；`BuildContext` 带三版本/审核模式/凭据快照；helper 每次 `await` 后复核并返回 `published/withdrawn/stale`；接受/撤销/审核裁决与编译同队列 | 已实现，测试在还原旧行为时红（两个切换用例） |
 | **B29** | 变更入口也是生命周期的一部分 | 接受/撤销的 HTTP 路由必须与 Remote 走同一个 `acceptQueued`/`revertQueued`（否则面板一点就能在编译窗口里提升基线并删掉已接受对）；陈旧任务不写状态；`restoreArtifacts` 按名删对，**与活动工作区同路径候选**的恢复进队列，其余照旧不排队 | 已实现，71 例；去掉任一条守卫，对应用例都在最早的信号处变红 |
 | **B30** | 产物路径是租约，不是比较 | `artifactPathsBusy` 判「这组路径是否被任何任务占用」：当前工作区 ∪ 在途租约；租约带身份（自排除）、模式（写/读，diff 构建是读）、`running`（排队预约 vs 正在 I/O）；入队即登记、任务 `finally` 才释放（stale 不提前放）；`restoreArtifacts` 撞见运行中的同伴直接抛 `artifact-busy` | 已实现，73 例；去掉租约判定/自排除/finally 释放，对应用例各自变红 |
+| **B31** | 租约要等待，审核与 diff 要认主 | 读冲突从"拒绝"（`artifact-busy`）改为 FIFO 读写锁**等待**：写等读者排空、读等写者、队头级联授予、写者优先防饿死、dispose 拒绝所有等待者；diff 构建复核 revision（接受/撤销/新编译都会动基准）；审核标记按工作区（旧全局 boolean 会**静默跳过**切走后的审核）；接受/撤销在入队时捕获工作区，唤醒后发现换人就报"工作区已切换" | 已实现，84 例；`path-lease.test.ts` 先钉语义再接线；去掉锁/自排除/释放/捕获，对应用例各自红 |
 
 ---
 
@@ -895,6 +896,42 @@ interface TrustedArtifacts { workspaceId; sourceDigest; pdfSha256; synctexSha256
 **3. 审核不能抢在凭据之前。** `queueReview()` 原先在成功分支里、`issueTrustFor()` 之前启动。审核通过会调 `snapshotBaseFromCurrent()` 把当前 PDF 提升为基线，而此刻 `trusted` 还描述着被替换的那一版，于是提升被拒、已接受对被丢弃。顺序固定为：发布 → 推进 → 采纳 → 签发 → 审核（发布必须在签发之前，因为它用的是**编译前**的凭据）。两个测试：立即 accept（base 落到新版本）、立即 reject（源码回滚、被拒版本成为「上次编译」、不触发第二次审核）。
 
 **4. 一次编译只认一个工作区。** `compileOnce` 逐处读 `state.rootFile` / `outDir` / `compiler`，`configure` 落在中间就会"用旧源码编译、把产物发布到新工作区"，甚至能观察到半应用状态（新编译器 + 旧根文件）。现在 `Workspace`（generation / id / rootFile / outDir / compiler）一次性替换、整轮捕获；进程返回时若已不是当前工作区，则不 patch、不发布、不签发。测试：A 的编译被卡在编译器里 → 配置 B → 放行 A，B 的文件不被污染、两个工作区都没有被误发布的清单、凭据指向 B。
+
+---
+
+## B31 · 等待，而不是拒绝：读写锁、审核认主、diff 认基准
+
+§B30 的租约只回答了"是否被占用"，两个方向都没有**等待**：
+
+- 写遇读：`applyDiffDoc` 在生命周期队列**外**读 live 对可长达两分钟。撞上它的 configure 把恢复排进队列，
+  队列空闲即执行，`assertArtifactPathsQuiet` 看到读者还在 → `artifact-busy` —— **一次项目切换直接失败**。
+- 读遇写：diff 构建拿到读租约后立即 `build()`，不检查有没有人正在写它要读的那批文件。
+
+`services/path-lease.ts` 是修法：FIFO 读写锁。授予规则：写者要求无活动写者、无活动读者且位于队头；
+读者要求无活动写者且队头是读者（后面连排的读者一起授予）。**队头的写者挡住后来的读者** —— 写者优先，不饿死。
+`release` 幂等（持有者在 `finally` 里释放，`finally` 可能跑两次）；`dispose` 拒绝所有等待者，
+服务卸载后不许有永远叫不醒的 promise。六例 `path-lease.test.ts` 在服务依赖它之前把语义钉死。
+队列任务内等待是安全的：读者从不进队列，所以不存在"队列任务等另一个队列任务的锁"的环。
+
+**读租约修好后暴露第二层**：diff 构建两分钟里，接受/撤销/一次编译都会动基准。只复核 workspace 不够，
+还要复核 `acceptedSource === base && currentSource === head`，否则产出的是一对没人看得见的版本之间的 diff。
+
+**审核的全局 boolean**：`if (this.reviewing) return` 让 A 的模型调用在飞时，切到 B 后 B 的改动被
+**静默跳过**（没有消息、没有兜底、没有裁决）。改为 `reviewing: Workspace | null`：同工作区防重入，
+跨工作区允许并发（裁决本来就复核工作区与 revision），`finally` 只清自己的。
+
+**接受/撤销的认主**：`applyRevert` 原来在任务**执行时**才解析工作区 —— 排在编译后面、唤醒时项目已换，
+它会对新项目回答"没有可撤回的改动"。现在入队时捕获，唤醒后复核，换了就报"工作区已切换，本次撤销没有执行"。
+
+**测试**
+
+- `path-lease.test.ts`：读写互斥、FIFO+写者优先、级联授予、幂等释放、dispose。
+  （写测试时踩过一个自伤：级联授予意味着"先释放前置票才能 await 后续票"，await 顺序写反就是测试自己死锁。）
+- 服务级：diff 构建停在读租约内 → 同路径 configure 必须 **pending**（去掉锁即红在旧症状 `artifact-busy`）；
+  基准漂移的 build 丢弃不落盘（基准直接改字段，不走队列，避免与接受竞态）；
+  A 的审核挂起时 B 的审核照常执行且 A 的迟到裁决不改 B 的基线；
+  HTTP `POST /api/revert` 在编译窗口内等待、随后把源码/PDF/基线全部滚回；
+  工作区被切走的 revert 报"工作区已切换"（去掉入队捕获即红在旧症状"没有可撤回的改动"）。
 
 ---
 
