@@ -893,7 +893,52 @@ interface TrustedArtifacts { workspaceId; sourceDigest; pdfSha256; synctexSha256
 
 **4. 一次编译只认一个工作区。** `compileOnce` 逐处读 `state.rootFile` / `outDir` / `compiler`，`configure` 落在中间就会"用旧源码编译、把产物发布到新工作区"，甚至能观察到半应用状态（新编译器 + 旧根文件）。现在 `Workspace`（generation / id / rootFile / outDir / compiler）一次性替换、整轮捕获；进程返回时若已不是当前工作区，则不 patch、不发布、不签发。测试：A 的编译被卡在编译器里 → 配置 B → 放行 A，B 的文件不被污染、两个工作区都没有被误发布的清单、凭据指向 B。
 
+| **B28** | 工作区切换是状态机 | `prepareWorkspace`（只动候选目录）→ `activateWorkspace`（无 await 的赋值块）；`configure` 不进入编译队列（首次编译可达数分钟）；`BuildContext` 带三版本/审核模式/凭据快照；helper 每次 `await` 后复核并返回 `published/withdrawn/stale`；接受/撤销/审核裁决与编译同队列 | 已实现，68 例；还原旧行为时两个切换用例都红 |
+
 ---
+
+## B28 · 切工作区是状态机：先准备，再激活，然后只认快照
+
+§B27 让一个编译任务带着 `WorkspaceContext` 活到底，但还有三个洞会被同一条异步链咬到：
+
+1. **`configure` 先赋值、后恢复。** `this.workspace = workspace` 在 `await restoreArtifacts(...)` **之前**，因此新工作区在产物尚未校验时就已经"当前"，编译可以对着它启动；prepare 失败还会留下一个半初始化的活工作区。
+2. **`BuildContext` 不是完整快照。** 它有 workspace/paths/before/input，却在编译结束后仍读 `this.revisions()` / `this.acceptedSource` / `this.trusted`。若中途有接受，旧视图会覆盖新状态。
+3. **helper 内部的 await 无人管。** 外层守卫在 helper 返回后，`pairHashes → publish → drop` 之间的切换照旧会让一个已失效的任务继续发布/删除。而且 `void` 返回值让调用方无法区分"没东西可发""已撤下""工作区没了"。
+
+**做法一：先准备，再原子激活。**
+
+`configureOnce` = `prepareWorkspace`（解析 root / outDir / compiler / diffDoc、读源码、只对**候选目录**跑 `restoreArtifacts`）+ `activateWorkspace`（`stopWatching` 之后一个**不含 await** 的赋值块：generation、workspace、diffDoc、三版本、trusted、一次 patch、起 watcher、踢首编）。配置项（redact/review/debounceMs）先在局部算好，激活时才提交 —— 失败不留痕。
+
+**没有把 configure 合进编译队列**，这偏离了原建议，理由有两条：其一，`applyRevert` 必须在队列任务内等自己的编译，若 configure 也在同一队列，一个首次编译（300s）会把"切项目"冻住；其二，单队列会让"运行中途切换"这个场景根本不可能发生 —— 而它正是本轮要测的危险窗口。原子激活给出的保证更强也更便宜：**没有半初始化的 workspace 可被观察到**，而不是"观察到时它在排队"。
+
+**顺带修掉一个更容易被忽略的现象**：同一工作区、同一源码的重复 configure（面板重挂载、切审核档）以前会走完整恢复，把当前正在用的 recent pair 删掉。现在识别为 **settings refresh**：PDF、两对产物、三版本都保留，只换设置和 watcher。（不这么做就得把 `previousCompileSource` 的正文持久化下来 —— 那属于 §6.5 的项目级版本管理，不在本轮。）
+
+**做法二：快照 + 提交保护 + 明确的返回类型。**
+
+- `BuildContext` 增加 `revisions` / `review` / `trusted`；`advanceRevisions(ctx.revisions, …, ctx.review)`、`adoptBaseArtifacts` 用 `ctx.revisions.accepted`、`claimCovers(…, ctx.trusted)`。凭据取**任务开始时**的那一份：它描述的正是即将被备份的字节，中途被别的编译换掉也不该影响本轮的判定。
+- `commitRevisions(ctx, next)` 与 `commit(ctx, next)` 同构；有了它，快照才是安全的（否则等于用旧视图覆盖新状态）。
+- `publishCompileArtifacts` / `adoptBaseArtifacts` / `snapshotBaseFromCurrent` / `drop*` 一律返回 `StoreOutcome = 'published' | 'withdrawn' | 'stale'`，并在**每个** await 之后复核。`compileOnce` 收到 `'stale'` 立刻 `discarded()`，不再启动下一步。
+- 已经开始的 `publish()` 不能撤回 —— 这是物理事实；能保证的是它只作用于**捕获的旧路径**，且之后不再写 state、不再发 URL。所以路径隔离与守卫缺一不可。
+
+**做法三：队列成员。** `enqueue()`（`lifecycleQueue`）串行化：编译、`compileNow`、watcher 触发的编译、`acceptChanges`、`revertChanges`、审核裁决的落定。审核的模型调用**在队列外**（25s），裁决回来后经 `applyVerdict` 重新入队，并复核 `workspace` 与 `currentSource`。队列任务内需要编译时（撤销、审核驳回）直接调 `compileOnce` —— 走 `runCompile` 会等自己，死锁。
+
+**新测试**（`service-workspace.test.ts` 第 2 例）按评审 §5.2 的步骤构造：
+
+| 步骤 | 做法 |
+|---|---|
+| A 拥有有效 baseline | 两次真实编译 |
+| 第三次编译停在 `onRunReturned` | 双闸：第二次留给 B 自己的编译，否则 B 跑完会合法地重发那对产物 |
+| 切到 B | 新 configure 完成（B 的编译排在 A 后面） |
+| B 拥有**真实**的 recent 对 | 用真的 `ArtifactStore.publish()` 发布 `main.recent.pdf` / `.synctex.gz` / `.manifest.json`，手工写一份 JSON 测不出任何东西 |
+| 放行 A | 只放第一个闸，A 恢复并判定失效 |
+| 断言 | manifest / PDF / SyncTeX 三份字节完全相同、`recentRevisionId` 与 URL 不变、`store.verify()` 仍通过、`currentSource`/`acceptedSource` 仍是 B、`trusted` 仍为 null |
+
+**有齿验证**：把三处旧行为同时还原（`isCurrent` 恒真、publish 用 `storesNow()`、drop 用 `storesNow()`）后，第 1、2 例都红，且都红在最早的信号上 —— `result.pdfUrl` 变成 `/.latex-preview/pdf/main.pdf?v=12` / `?v=13`。只还原其中一处不够：路径隔离和守卫各自都能挡住一部分，这正是需要**两个**用例的原因（一个查三版本与凭据，一个查已发布产物）。
+
+**残留风险（已记录，未修）**：`applyDiffDoc`（latexdiff 构建）仍直接读写 `this.diffDoc` 与 state，一次 2 分钟的构建期间切工作区会把 `diffDocUrl` 打到新工作区上；`configure` 不与编译互斥，靠原子激活而非排队；多文件输入仍未纳入 `stable`（见 §6.5，需 `BuildInputManifest`）。
+
+---
+
 
 ## B27 · 工作区隔离：一次检查守不住一条异步长链
 
