@@ -345,7 +345,16 @@ export class LatexPreviewService extends TypertRemoteService {
   /** `ctx.llm`, used only by the reviewer; absent in profiles without a model. */
   private llm: LlmLike | undefined
   /** True while a reviewer call is in flight, so two compiles cannot race. */
-  private reviewing = false
+  /**
+   * The workspace whose change is being reviewed, if any.
+   *
+   * Per workspace, not a global boolean: a review for A can legitimately run while B
+   * is being reviewed after a switch (both verdicts are re-checked against their
+   * workspace before they touch anything), but the *same* workspace must not start a
+   * second review while one is in flight. The old single boolean silently skipped
+   * B's review entirely whenever A's was still running.
+   */
+  private reviewing: Workspace | null = null
   /** Last Session the panel named; the reviewer reads its model route from it. */
   private lastSessionId: string | undefined
   /** Profile default model, used when no Session has published a header yet. */
@@ -1146,11 +1155,16 @@ export class LatexPreviewService extends TypertRemoteService {
       held.release()
     }
     // Path leases keep two tasks off the same files; they say nothing about *whose*
-    // result this is. A switch during the build (or a 接受 that moved the baseline)
-    // makes this answer describe a document nobody is looking at, so it is dropped
-    // rather than written into the new workspace's state.
+    // result this is. Three things can move under a two-minute build: the workspace
+    // (a switch), the accepted revision (接受, an approving reviewer, 撤销) and the
+    // current one (another compile). Any of them makes this answer describe a pair of
+    // revisions nobody can see, so it is dropped rather than written into a state that
+    // has already moved on.
     if (!this.isCurrent(ctx)) {
       return { ok: false, url: this.state.diffDocUrl, message: '工作区已切换，本次对比视图未生成', version: this.state.version }
+    }
+    if (this.acceptedSource !== base || this.currentSource !== head) {
+      return { ok: false, url: this.state.diffDocUrl, message: '对比基准已变化（编译或接受），请重新生成对比视图', version: this.state.version }
     }
     if (!build.ok || !build.pdfPath) {
       this.patch({ diffDocUrl: null })
@@ -1192,7 +1206,10 @@ export class LatexPreviewService extends TypertRemoteService {
    * @returns the state after acceptance.
    */
   private acceptQueued(): Promise<PreviewState> {
-    return this.enqueueLeased(this.pathsOf(), 'write', () => this.applyAccept())
+    // The click belongs to the workspace that was on screen; a switch between the click
+    // and the queue task must not accept the new project's pending change.
+    const workspace = this.workspace
+    return this.enqueueLeased(this.pathsOf(workspace), 'write', () => this.applyAccept(workspace))
   }
 
   /**
@@ -1204,9 +1221,12 @@ export class LatexPreviewService extends TypertRemoteService {
    * *producing*, and a run that lost its workspace must not relabel the new one.
    * @returns the state after acceptance.
    */
-  private async applyAccept(): Promise<PreviewState> {
-    const ctx = this.currentContext()
-    if (!ctx) throw new RemoteError('latex-preview/nothing-to-review', '尚未配置主文件', {})
+  private async applyAccept(workspace: Workspace | null): Promise<PreviewState> {
+    // Captured by the queue caller, so the click and the task name the same project.
+    const ctx = workspace !== undefined && this.workspace === workspace ? this.currentContext() : null
+    if (!ctx || this.workspace !== workspace) {
+      throw new RemoteError('latex-preview/nothing-to-review', '工作区已切换，本次操作没有执行', {})
+    }
     if (!hasPendingChanges(this.revisions())) {
       throw new RemoteError('latex-preview/nothing-to-review', '没有待审核的改动', {})
     }
@@ -1253,7 +1273,9 @@ export class LatexPreviewService extends TypertRemoteService {
    * @returns the state after the recompile.
    */
   private revertQueued(): Promise<PreviewState> {
-    return this.enqueueLeased(this.pathsOf(), 'write', () => this.applyRevert())
+    // Same capture as 接受: the click belongs to the workspace that was on screen.
+    const workspace = this.workspace
+    return this.enqueueLeased(this.pathsOf(workspace), 'write', () => this.applyRevert(workspace))
   }
 
   /**
@@ -1262,9 +1284,17 @@ export class LatexPreviewService extends TypertRemoteService {
    * Called from inside a queue task, so it runs the compile directly instead of
    * re-entering {@link runCompile} — the task would then be waiting for a job that is
    * queued behind itself.
+   * @param workspace - the workspace the click was made for; the task refuses to act
+   * on a different one, because "roll this project back" has no meaning for the
+   * project that replaced it.
    * @returns the state after the recompile.
    */
-  private async applyRevert(): Promise<PreviewState> {
+  private async applyRevert(workspace: Workspace | null): Promise<PreviewState> {
+    if (workspace === null || this.workspace !== workspace) {
+      throw new RemoteError('latex-preview/revert-failed', '工作区已切换，本次撤销没有执行', {
+        detail: '工作区已切换',
+      })
+    }
     const ctx = this.currentContext()
     const target = this.acceptedSource
     if (!ctx || target === null || !hasPendingChanges(this.revisions())) {
@@ -1342,10 +1372,10 @@ export class LatexPreviewService extends TypertRemoteService {
   private async queueReview(workspace: Workspace): Promise<void> {
     const target = this.currentSource
     const base = this.acceptedSource
-    if (this.reviewing || target === null || base === null || target === base) return
+    if (this.reviewing === workspace || target === null || base === null || target === base) return
     if (this.workspace !== workspace) return
 
-    this.reviewing = true
+    this.reviewing = workspace
     this.patch({ message: '自动审核中：正在请独立 AI 审这次改动…' })
     try {
       const verdict = await this.runReview(base, target)
@@ -1363,7 +1393,9 @@ export class LatexPreviewService extends TypertRemoteService {
         })
       }
     } finally {
-      this.reviewing = false
+      // Only clear our own claim: if a switch happened mid-review, the flag now names
+      // another workspace and that one's review must keep its protection.
+      if (this.reviewing === workspace) this.reviewing = null
     }
   }
 
@@ -1398,7 +1430,7 @@ export class LatexPreviewService extends TypertRemoteService {
       this.commit(ctx, { message: `自动审核通过：${verdict.reason}`, diffDocUrl: null })
       return
     }
-    await this.applyRevert()
+    await this.applyRevert(workspace)
     if (this.workspace === workspace) {
       this.patch({ message: `自动审核未通过，已回滚：${verdict.reason}`, diffDocUrl: null })
     }
