@@ -83,7 +83,10 @@ function factory(behaviour: Behaviour): (options: CompileOptions) => CompileServ
 }
 
 /** A configured service whose watcher is off, so compiles happen only when asked. */
-async function boot(workDir: string): Promise<{ service: LatexPreviewService; behaviour: Behaviour; stop: () => Promise<void> }> {
+async function boot(
+  workDir: string,
+  review: 'manual' | 'auto' = 'manual',
+): Promise<{ service: LatexPreviewService; behaviour: Behaviour; stop: () => Promise<void> }> {
   const behaviour: Behaviour = { runs: 0 }
   const service = new LatexPreviewService(new Context(), { compileFactory: factory(behaviour) })
   // The binary probe is not what these tests are about, and a missing `tectonic`
@@ -92,7 +95,7 @@ async function boot(workDir: string): Promise<{ service: LatexPreviewService; be
   ;(service as unknown as { patch(next: Partial<PreviewState>): void }).patch({
     binaries: { tectonic: true, synctex: true },
   })
-  await service.configure({ rootFile: join(workDir, 'main.tex'), review: 'manual' }, signal())
+  await service.configure({ rootFile: join(workDir, 'main.tex'), review }, signal())
   await (service as unknown as { watcher: { stop(): Promise<void> } }).watcher.stop()
   const stop = async (): Promise<void> => {
     await (service as unknown as { watcher: { stop(): Promise<void> } }).watcher.stop()
@@ -379,6 +382,58 @@ test('an unprovable artefact is withdrawn instead of left on screen', async () =
     assert.equal(state.viewerUrl, null)
     assert.equal(state.baseRevisionId, null)
     assert.equal(state.recentRevisionId, null)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a reviewer that accepts immediately still gets a credential to publish with', async () => {
+  const dir = workspace(A)
+  try {
+    // `auto` mode with the model replaced by a reviewer that answers at once — the
+    // worst case for ordering, because approving promotes the current PDF to the
+    // baseline immediately.
+    const { service, behaviour, stop } = await boot(dir, 'auto')
+    ;(service as unknown as { runReview: unknown }).runReview = async () => ({ verdict: 'accept', reason: 'ok' })
+    await settled(service, behaviour)
+
+    writeFileSync(join(dir, 'main.tex'), B)
+    await service.compileNow(signal())
+    // The verdict is applied on a detached promise; wait for it to settle.
+    for (let i = 0; i < 100 && (service as unknown as { reviewing: boolean }).reviewing; i += 1) await delay(20)
+    await delay(120)
+    const state = await service.getState(signal())
+    await stop()
+
+    assert.equal(state.baseRevisionId, digestOf(B), 'the approved revision became the baseline')
+    assert.equal(state.recentRevisionId, digestOf(A), 'and its predecessor is still the previous compile')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a rejecting reviewer rolls back without asking for a second review', async () => {
+  const dir = workspace(A)
+  try {
+    const { service, behaviour, stop } = await boot(dir, 'auto')
+    let reviews = 0
+    ;(service as unknown as { runReview: unknown }).runReview = async () => {
+      reviews += 1
+      return { verdict: 'reject', reason: 'not wanted' }
+    }
+    await settled(service, behaviour)
+
+    writeFileSync(join(dir, 'main.tex'), B)
+    await service.compileNow(signal())
+    for (let i = 0; i < 100 && (service as unknown as { reviewing: boolean }).reviewing; i += 1) await delay(20)
+    await delay(200)
+    const state = await service.getState(signal())
+    await stop()
+
+    assert.equal(reviews, 1, 'the revert it causes must not trigger another review')
+    assert.equal(readFileSync(join(dir, 'main.tex'), 'utf8'), A, 'the source went back')
+    assert.equal(state.baseRevisionId, digestOf(A))
+    assert.equal(state.recentRevisionId, digestOf(B), 'what was rejected is now the previous compile')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

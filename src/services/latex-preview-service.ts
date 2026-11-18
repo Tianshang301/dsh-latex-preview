@@ -1618,12 +1618,17 @@ export class LatexPreviewService extends TypertRemoteService {
         await this.publishCompileArtifacts(before, result.backup)
         this.applyRevisions(advanced.revisions)
         contentChanged = true
-        if (this.review === 'auto' && run.suppressReview !== true) void this.queueReview()
       }
       await this.adoptBaseArtifacts(before, result.backup)
       // The credential for the bytes now on screen. Withheld when the input moved:
       // an unprovable pair is exactly what must never be published later.
       this.trusted = stable ? await this.issueTrustFor(rootFile, compiled) : null
+      // Start the reviewer *last*. It can approve within a tick, and approving means
+      // promoting the current PDF to the baseline — which needs the credential
+      // issued on the line above. Starting it earlier let a fast reviewer reach
+      // `snapshotBaseFromCurrent()` while `trusted` still described the revision
+      // being replaced, so the promoted pair was refused and dropped.
+      if (contentChanged && this.review === 'auto' && run.suppressReview !== true) void this.queueReview()
     } else if (result.artifactState === 'unavailable') {
       // No artefact can be vouched for — a partial rollback, a backup that never
       // landed, or a first compile that failed. Withdraw every claim rather than
