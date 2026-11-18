@@ -27,6 +27,7 @@ import test from 'node:test'
 
 import { ArtifactStore } from '../../src/services/artifacts.ts'
 import { CompileService, compilePaths, type CompileOptions, type CompileRun } from '../../src/services/compile.ts'
+import { DiffDocService } from '../../src/services/diffdoc.ts'
 import { LatexPreviewService } from '../../src/services/latex-preview-service.ts'
 import type { PreviewState } from '../../src/types.ts'
 import { fakeBinaries } from './support.ts'
@@ -62,6 +63,8 @@ interface Harness {
   readonly service: LatexPreviewService
   readonly behaviour: Behaviour
   stop(): Promise<void>
+  /** Set once the fake diff build has started (and parked, if armed). */
+  diffStarted: { started: boolean }
 }
 
 /** How a test wants the service booted. */
@@ -70,6 +73,8 @@ interface BootOptions {
   onRunReturned?: (workspace: { id: string; generation: number }) => Promise<void>
   /** Pause inside the compiler, *before* it writes any bytes. */
   beforeWrite?: () => Promise<void>
+  /** Pause inside the diff build, before it writes the diff PDF. */
+  beforeDiffWrite?: () => Promise<void>
   /** Output directory for the first workspace; omitted means the default one. */
   outDir?: string
 }
@@ -83,9 +88,22 @@ interface BootOptions {
  */
 async function boot(workDir: string, options: BootOptions = {}): Promise<Harness> {
   const behaviour: Behaviour = { runs: 0 }
+  const diffStartedRef: { current: { started: boolean } } = { current: { started: false } }
   const service = new LatexPreviewService(new Context(), {
     binaryProbe: async () => fakeBinaries(),
     onRunReturned: options.onRunReturned,
+    diffDocFactory: (diffOptions) => {
+      void diffOptions
+      return {
+        build: async (base: string, head: string): Promise<unknown> => {
+          diffStartedRef.current.started = true
+          void base
+          void head
+          await options.beforeDiffWrite?.()
+          return { ok: true, pdfPath: join(diffOptions.outDir, `${basename(diffOptions.rootFile, '.tex')}.diff.pdf`), message: 'fake diff' }
+        },
+      } as unknown as DiffDocService
+    },
     compileFactory: (compileOptions: CompileOptions) =>
       new CompileService({
         ...compileOptions,
@@ -110,10 +128,12 @@ async function boot(workDir: string, options: BootOptions = {}): Promise<Harness
   const stop = async (): Promise<void> => {
     await (service as unknown as { watcher: { stop(): Promise<void> } | null }).watcher?.stop()
   }
+  const diffStarted = { started: false }
+  diffStartedRef.current = diffStarted
   const request = { rootFile: join(workDir, 'main.tex'), review: 'manual' as const }
   await service.configure(options.outDir ? { ...request, outDir: options.outDir } : request, signal())
   await stop()
-  return { service, behaviour, stop }
+  return { service, behaviour, stop, diffStarted: diffStartedRef.current }
 }
 
 /** A fresh workspace with `main.tex` holding `source`. */
@@ -573,6 +593,63 @@ test('a lease is released by a crash and never conflicts with a queued peer', as
     await h.stop()
     rmSync(a, { recursive: true, force: true })
     rmSync(b, { recursive: true, force: true })
+    rmSync(shared, { recursive: true, force: true })
+  }
+})
+
+test('a configure colliding with a diff build waits for the reader instead of refusing', async () => {
+  const a = workspaceSource(A1)
+  const c = workspaceSource(C1)
+  const shared = mkdtempSync(join(tmpdir(), 'dsh-latex-lease-read-'))
+  let gate: Promise<void> | null = null
+  const hold: { release?: () => void } = {}
+  const h = await boot(a, {
+    outDir: shared,
+    beforeDiffWrite: async () => {
+      if (!gate) return
+      const held = gate
+      gate = null
+      await held
+    },
+  })
+  const pathsA = compilePaths(join(a, 'main.tex'), shared)
+  try {
+    await until(() => h.behaviour.runs >= 1, 'A’s first compile')
+    await delay(150)
+    // A pending change, so a diff build has something to build.
+    writeFileSync(join(a, 'main.tex'), A2)
+    await h.service.compileNow(signal())
+
+    // The reader takes the paths and parks inside its build — outside the lifecycle
+    // queue, which is exactly why the queue alone could never order this.
+    gate = new Promise<void>((resolve) => {
+      hold.release = resolve
+    })
+    const building = h.service.buildDiffDoc(signal())
+    await until(() => h.diffStarted.started, 'the diff build to park inside its read lease')
+
+    // C claims the paths the reader holds. The old behaviour refused the restore with
+    // `artifact-busy` (a reader is "running"); the lock makes the writer wait instead.
+    const configured = h.service.configure({ rootFile: join(c, 'main.tex'), outDir: shared, review: 'manual' }, signal())
+    const early = await Promise.race([
+      configured.then(() => 'done' as const),
+      delay(300).then(() => 'pending' as const),
+    ])
+    assert.equal(early, 'pending', 'C waits for the reader — it does not refuse, and does not restore')
+    assert.equal(existsSync(pathsA.recentPdf), true, 'and nothing was deleted under the reader')
+
+    hold.release?.()
+    const build = await building
+    assert.equal(build.ok, true)
+    const state = await configured
+    assert.equal(state.rootFile, join(c, 'main.tex'), 'the restore then runs, on paths nobody is reading')
+    await until(() => h.behaviour.runs >= 3, 'C’s own compile to start')
+  } finally {
+    hold.release?.()
+    await delay(100)
+    await h.stop()
+    rmSync(a, { recursive: true, force: true })
+    rmSync(c, { recursive: true, force: true })
     rmSync(shared, { recursive: true, force: true })
   }
 })

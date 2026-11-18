@@ -45,6 +45,7 @@ import {
   type Revisions,
 } from './revisions.ts'
 import { DiffDocService } from './diffdoc.ts'
+import { PathLeaseRegistry } from './path-lease.ts'
 import { FileWatcher } from './watcher.ts'
 import { lineDiff, normalizeLatexLine } from './diff.ts'
 import { bandsFromHits, diffHunks, insertionAnchor, type DiffHunk } from './diff-regions.ts'
@@ -140,6 +141,20 @@ export interface ServiceOptions {
    * the seam is a position in time, and nothing else can produce it on demand.
    */
   readonly onRunReturned?: (workspace: { id: string; generation: number }) => Promise<void>
+  /**
+   * Builds the diff-document service for a workspace.
+   *
+   * Same rationale as {@link compileFactory}: a test has to hold a diff *build* —
+   * which reads the live pair for up to two minutes — in a chosen instant, and no
+   * other seam can park it. It is also the reader the path lease's read mode exists
+   * for, so the lease tests need to be able to make it slow.
+   */
+  readonly diffDocFactory?: (options: {
+    rootFile: string
+    outDir: string
+    timeoutMs: number
+    firstRunTimeoutMs: number
+  }) => DiffDocService
 }
 
 /**
@@ -384,6 +399,13 @@ export class LatexPreviewService extends TypertRemoteService {
   private readonly binaryProbe: () => Promise<BinaryReport>
   /** Optional pause between the compiler returning and the first publish. */
   private readonly onRunReturned?: (workspace: { id: string; generation: number }) => Promise<void>
+  /** Builds the diff-document service; injectable so tests can hold a build mid-read. */
+  private readonly diffDocFactory: (options: {
+    rootFile: string
+    outDir: string
+    timeoutMs: number
+    firstRunTimeoutMs: number
+  }) => DiffDocService
   /** Tail of the lifecycle queue: compiles, 接受, 撤销 and reviewer verdicts. */
   private lifecycleQueue: Promise<void> = Promise.resolve()
   /**
@@ -396,6 +418,16 @@ export class LatexPreviewService extends TypertRemoteService {
    * registry is keyed by resolved PDF path; see {@link PathLease}.
    */
   private readonly leases = new Map<string, Set<PathLease>>()
+  /**
+   * The lock behind the registry: this is what *waits*.
+   *
+   * The registry above only answers "are these paths spoken for" — it made a writer
+   * meeting a reader refuse outright (`artifact-busy`) and a reader meeting a writer
+   * read bytes that were mid-flight. This lock is FIFO, reader-writer: writers wait
+   * for readers to drain, readers wait for writers, and both are granted in arrival
+   * order so neither side can starve the other.
+   */
+  private readonly ioLock = new PathLeaseRegistry()
   /** Tail of the configure queue; see {@link applyConfigure}. */
   private configureQueue: Promise<unknown> = Promise.resolve()
   /** The configured workspace; null until `configure` has run. */
@@ -420,6 +452,9 @@ export class LatexPreviewService extends TypertRemoteService {
     this.compileFactory = options.compileFactory ?? ((compileOptions) => new CompileService(compileOptions))
     this.binaryProbe = options.binaryProbe ?? checkBinaries
     this.onRunReturned = options.onRunReturned
+    this.diffDocFactory =
+      options.diffDocFactory ??
+      ((diffOptions) => new DiffDocService(diffOptions))
 
     // Lazy lookups: neither service is guaranteed to exist in every profile.
     this.bridge = new AgentBridge(() => this.agents)
@@ -616,7 +651,7 @@ export class LatexPreviewService extends TypertRemoteService {
       timeoutMs: DEFAULT_TIMEOUT_MS,
       firstRunTimeoutMs: DEFAULT_FIRST_RUN_TIMEOUT_MS,
     })
-    const diffDoc = new DiffDocService({
+    const diffDoc = this.diffDocFactory({
       rootFile,
       outDir,
       timeoutMs: DEFAULT_TIMEOUT_MS,
@@ -1098,12 +1133,16 @@ export class LatexPreviewService extends TypertRemoteService {
     // A **read** lease: the build reads the live pair and both sync maps, so a compile
     // or a restore must not run beside it — but another reader may. It is not a writer,
     // and treating it as one would serialise every diff build behind every compile.
+    // The lock is what waits: this call sits outside the lifecycle queue, so a writer
+    // that arrives first is waited for, not raced and not refused.
     const held = this.holdLease(ctx.paths, 'read')
+    const ticket = await this.ioLock.acquire(held.lease.key, 'read')
     held.begin()
     let build: Awaited<ReturnType<DiffDocService['build']>>
     try {
       build = await this.diffDoc.build(base, head)
     } finally {
+      ticket.release()
       held.release()
     }
     // Path leases keep two tasks off the same files; they say nothing about *whose*
@@ -2271,10 +2310,17 @@ export class LatexPreviewService extends TypertRemoteService {
   ): Promise<T> {
     const held = this.holdLease(paths, mode)
     return this.enqueue(async () => {
+      // The reservation said "these paths are spoken for"; the lock is what actually
+      // waits for the speakers to finish. A writer waits for readers to drain (a diff
+      // build reads the live pair for minutes, outside this queue) and a reader waits
+      // for the writer. Waiting here is safe: readers never enter this queue, so no
+      // queue task can wait on another queue task's lock.
+      const ticket = held.lease.key === '' ? null : await this.ioLock.acquire(held.lease.key, mode)
       held.begin()
       try {
         return await operation(held.lease)
       } finally {
+        ticket?.release()
         held.release()
       }
     })
@@ -2587,6 +2633,9 @@ export class LatexPreviewService extends TypertRemoteService {
   async [Symbol.dispose](): Promise<void> {
     this.unmountRoutes()
     await this.stopWatching()
+    // A held ticket is released by its own `finally`; what must not survive the service
+    // is a waiter — nobody would ever wake it.
+    this.ioLock.dispose('latex-preview service unloaded')
   }
 }
 
