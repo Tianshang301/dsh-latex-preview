@@ -20,7 +20,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
-import { basename, dirname, extname, join } from 'node:path'
+import { basename, dirname, extname, join, resolve } from 'node:path'
 import { readFile, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { checkBinaries, type BinaryReport } from '../utils/binaries.ts'
@@ -220,8 +220,14 @@ interface PreparedWorkspace {
   readonly workspace: Workspace
   readonly initial: string | null
   readonly resolution: RootResolution | null
-  /** State fields for the accepted pair; empty on a settings refresh. */
-  readonly restored: Partial<PreviewState>
+  /**
+   * State fields for the accepted pair; empty on a settings refresh.
+   *
+   * `null` means the restore was **deferred**: the candidate writes over the file
+   * names the active workspace is using right now, so its restore has to wait until
+   * no compile can be writing there (see {@link outputPathsClash}).
+   */
+  readonly restored: Partial<PreviewState> | null
   readonly diffDoc: DiffDocService
   /** Same workspace, same source: keep the PDF, the pairs and the revisions. */
   readonly refresh: boolean
@@ -586,20 +592,36 @@ export class LatexPreviewService extends TypertRemoteService {
     if (refresh) {
       return { workspace, initial, resolution, restored: {}, diffDoc, refresh, explicitOutDir }
     }
-    // Restore against the candidate's own paths only; nothing here reads `this`.
+    // Restore against the candidate's own paths — but only while nothing else is
+    // writing to them. A different `outDir`, or a different root file in the same
+    // `outDir`, produces a different file name, and then the prepare step is genuinely
+    // isolated. When the names *do* collide (two roots called `main.tex` sharing an
+    // explicit `outDir`), a restore now would delete pairs under a compile that is
+    // about to publish to the same names, so it moves behind the lifecycle queue.
+    if (this.outputPathsClash(workspace)) {
+      return { workspace, initial, resolution, restored: null, diffDoc, refresh: false, explicitOutDir }
+    }
     const restored = await this.restoreArtifacts(rootFile, outDir, initial)
     return { workspace, initial, resolution, restored, diffDoc, refresh: false, explicitOutDir }
   }
 
   /**
-   * Make a prepared workspace the active one.
+   * Whether a candidate would write over the files the active workspace uses.
    *
-   * The assignment block has no `await` in it, so no compile can observe half a
-   * switch: either the old workspace is current or the new one is.
-   * @param prepared - the candidate from {@link prepareWorkspace}.
-   * @param options - the switches that were only committed because preparation worked.
-   * @returns the state after activation.
+   * The test is the PDF path itself rather than the directory: two roots with
+   * different names in one output directory never touch each other's files, while the
+   * same name in one directory is a real collision on every artefact the compile
+   * publishes — and `restoreArtifacts` deletes by name.
+   * @param candidate - the workspace about to be activated.
+   * @returns true when the two share an artefact path.
    */
+  private outputPathsClash(candidate: Workspace): boolean {
+    const current = this.pathsOf()
+    if (!current) return false
+    const next = this.pathsOf(candidate)
+    return next !== null && resolve(current.pdf) === resolve(next.pdf)
+  }
+
   /**
    * Make a prepared workspace the active one.
    *
@@ -613,7 +635,31 @@ export class LatexPreviewService extends TypertRemoteService {
     prepared: PreparedWorkspace,
     options: { redact: boolean; review: ReviewMode; debounceMs: number },
   ): Promise<PreviewState> {
-    const { workspace, initial, restored, diffDoc, resolution } = prepared
+    if (prepared.restored === null) {
+      // The candidate shares artefact names with the active workspace, so its restore
+      // — which deletes both pairs by name — must not run while a compile is writing
+      // there. `configure` stays out of the queue in general (a first compile takes
+      // minutes), but a colliding restore joins it: the switch is then ordered
+      // against the compile instead of racing it over the same files.
+      return this.enqueue(() => this.commitActivation(prepared, options))
+    }
+    return this.commitActivation(prepared, options)
+  }
+
+  /**
+   * Make a prepared workspace the active one, restoring its artefacts first.
+   *
+   * The assignment block has no `await` in it, so no compile can observe half a
+   * switch: either the old workspace is current or the new one is.
+   * @param prepared - the candidate from {@link prepareWorkspace}.
+   * @param options - the switches that were only committed because preparation worked.
+   * @returns the state after activation.
+   */
+  private async commitActivation(
+    prepared: PreparedWorkspace,
+    options: { redact: boolean; review: ReviewMode; debounceMs: number },
+  ): Promise<PreviewState> {
+    const { workspace, initial, diffDoc, resolution } = prepared
     this.redact = options.redact
     this.review = options.review
     this.debounceMs = options.debounceMs
@@ -622,6 +668,9 @@ export class LatexPreviewService extends TypertRemoteService {
     // Before the assignment block, because stopping is asynchronous and the old
     // watcher must not be able to fire once the new workspace is live.
     await this.stopWatching()
+    // Deferred restores run here, with the lifecycle queue held, so nothing is
+    // compiling into these paths while both pairs are being deleted.
+    const restored = prepared.restored ?? (await this.restoreArtifacts(workspace.rootFile, workspace.outDir, initial))
 
     // Read before the assignment below, or it compares the new workspace with itself.
     const sameWorkspace = this.workspace?.id === workspace.id
