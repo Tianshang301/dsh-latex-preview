@@ -34,6 +34,8 @@
 | **B22** | 在旧版 PDF 上标删除 | 旧行号 + 旧 SyncTeX 才能拿到被删文字的真实盒子（`kind: 'removed'` 红带 + 中线删除线）；该视图必须只读 | 已实现并真机验证（`main.prev.pdf` 加载、红带压在第二段、选区不起浮条） |
 | **B26** | 撤下 ≠ 不可达 | 只清 URL 不够：`unavailable` 的 PDF/同步表必须从 `outDir` 删掉（否则静态路由按名服务、下次备份还会采纳）；`CompileResult.pdfUrl` 也要随 `showable` 走；路由用 `accept` 收窄到 `.pdf` | 已实现，单测覆盖（真 HTTP：撤下后 404、切工作区后取到新字节） |
 | **B27** | 工作区不是"进入时检查一次"，而是一条贯穿到 state 提交的边界 | `WorkspaceContext`（workspace + 已解析 paths）随任务传递，发布/凭据/落盘一律不再读 `this.workDir`/`this.workspace.id`；每个 `await` 后复核身份，state 写入走 `commit(ctx, …)`；`configure` 串行化 | 已实现，测试在去掉守卫时失败（`result.pdfUrl` 变回非空） |
+| **B28** | 工作区切换是状态机 | `prepareWorkspace`（只动候选目录）→ `activateWorkspace`（无 await 的赋值块）；`configure` 不进入编译队列（首次编译可达数分钟）；`BuildContext` 带三版本/审核模式/凭据快照；helper 每次 `await` 后复核并返回 `published/withdrawn/stale`；接受/撤销/审核裁决与编译同队列 | 已实现，测试在还原旧行为时红（两个切换用例） |
+| **B29** | 变更入口也是生命周期的一部分 | 接受/撤销的 HTTP 路由必须与 Remote 走同一个 `acceptQueued`/`revertQueued`（否则面板一点就能在编译窗口里提升基线并删掉已接受对）；陈旧任务不写状态；`restoreArtifacts` 按名删对，**与活动工作区同路径候选**的恢复进队列，其余照旧不排队 | 已实现，71 例；去掉任一条守卫，对应用例都在最早的信号处变红 |
 
 ---
 
@@ -879,7 +881,7 @@ interface TrustedArtifacts { workspaceId; sourceDigest; pdfSha256; synctexSha256
 | 改坏 `main.recent.pdf` | 拒绝出图 | "未能成对校验"、`regions: 0`、URL 置空 ✔ |
 | 重启后（清单仍描述当前源码） | 恢复已接受对 | ✔ |
 
-测试：`test/unit/service-provenance.test.ts` 13 例，用真实 `LatexPreviewService` + 真实 Cordis 上下文 + 真实 `CompileService`（只把进程换成假实现，`ServiceOptions.compileFactory`）。覆盖：残留 PDF 不发布、第二次编译后才可发布、重启恢复、备份失败不发布且撤下、撤销的版本推进、`side` 元数据、编译期间改源码、并发编译、审核时序、工作区隔离。全套 65 例（含 `service-route.test.ts` 的 3 例真 HTTP）；`.github/workflows/ci.yml` 跑 `typecheck` / `typecheck:test` / `test`。
+测试：`test/unit/service-provenance.test.ts` 13 例，用真实 `LatexPreviewService` + 真实 Cordis 上下文 + 真实 `CompileService`（只把进程换成假实现，`ServiceOptions.compileFactory`）。覆盖：残留 PDF 不发布、第二次编译后才可发布、重启恢复、备份失败不发布且撤下、撤销的版本推进、`side` 元数据、编译期间改源码、并发编译、审核时序、工作区隔离。全套 71 例（含 `service-route.test.ts` 的 4 例真 HTTP）；`.github/workflows/ci.yml` 跑 `typecheck` / `typecheck:test` / `test`。
 
 ---
 
@@ -893,7 +895,24 @@ interface TrustedArtifacts { workspaceId; sourceDigest; pdfSha256; synctexSha256
 
 **4. 一次编译只认一个工作区。** `compileOnce` 逐处读 `state.rootFile` / `outDir` / `compiler`，`configure` 落在中间就会"用旧源码编译、把产物发布到新工作区"，甚至能观察到半应用状态（新编译器 + 旧根文件）。现在 `Workspace`（generation / id / rootFile / outDir / compiler）一次性替换、整轮捕获；进程返回时若已不是当前工作区，则不 patch、不发布、不签发。测试：A 的编译被卡在编译器里 → 配置 B → 放行 A，B 的文件不被污染、两个工作区都没有被误发布的清单、凭据指向 B。
 
-| **B28** | 工作区切换是状态机 | `prepareWorkspace`（只动候选目录）→ `activateWorkspace`（无 await 的赋值块）；`configure` 不进入编译队列（首次编译可达数分钟）；`BuildContext` 带三版本/审核模式/凭据快照；helper 每次 `await` 后复核并返回 `published/withdrawn/stale`；接受/撤销/审核裁决与编译同队列 | 已实现，68 例；还原旧行为时两个切换用例都红 |
+---
+
+## B29 · 变更入口、共享输出目录：两处"以为堵住了"的口子
+
+§B28 之后，`build` 与 `publish` 都认上下文了。外部评审接着指出两类仍能被外部动作触发的问题，复查都成立。
+
+**1. HTTP 路由绕过了队列。** `httpHost()` 里写的是 `accept: () => this.applyAccept()`、`revert: () => this.applyRevert()` —— 直接进函数体，而 `@Remote` 那两个是 `enqueue(...)`。于是面板点「接受」落在编译**中间**：接受要读磁盘上的 `main.pdf` 去提升基线，而一个"已经写完字节、还没发布"的编译给出的正是这一版，凭据却还描述着上一版 → `claimCovers` 不成立 → `snapshotBaseFromCurrent` 掉进 `dropBaseArtifacts()`，已接受对被删，面板还显示"已接受这次改动"。
+
+改法：两个面共用 `acceptQueued` / `revertQueued`。同时把"陈旧就别写"补全 —— 接受的 revision 由调用方显式传参而不是让 helper 读 `this.acceptedSource`（那个字段是本次调用的**结果**，先写它正是"旧任务给新工作区改标签"的形态），状态提交走 `commit(ctx, …)`；撤销在重编译之后复核上下文，切换了就抛 `switchedDuringRevert`（文件确实写回了，所以不能说成功，也不能说没发生）；审核裁决的接受分支与"审核出错"文案同样按 workspace 收口。
+
+**2. 共享 `outDir` 下的恢复与编译并发。** `restoreArtifacts` 按名字**删除**两对产物，而 `prepareWorkspace` 在激活前就调用它。当候选与活动工作区写同一批名字（两个都叫 `main.tex` 的根文件 + 显式同一个 `outDir`）时，删除发生在编译正在发布的那批文件上：编译刚发布的「上次编译版」被删、`backupPair` 复制到的是已经不存在的字节、目录里同时描述两个项目，日志里一个字都没有。
+
+判据取 **PDF 路径**而非目录：同一目录下不同名的根文件互不触碰，那条常见路径保持不排队。冲突时 `prepareWorkspace` 返回 `restored: null`，`activateWorkspace` 把 `commitActivation` 交给 `enqueue` —— 排队的只有"会删文件的那半步"，而不是整个 `configure`（首次编译可达 300 s，切项目不能等它）。
+
+**证据（有齿验证）**
+
+- 真 HTTP：编译停在"编译器已返回、尚未发布"（`main.pdf` 是 C 的字节、凭据还是 B 的），此时 `POST /api/accept`。修前立即返回 `done` 且基线被删；修后 `pending`，放行后基线是 C 且 `/pdf/main.pdf.prev` 的字节就是 C。
+- 共享目录：把冲突判定改成恒 `false` → 该用例红在 `expected 'pending' actual 'done'`；改成恒 `true`（过度串行）→ 反向用例红在 `expected 'done' actual 'pending'`。两条方向都钉住，规则不会漂。
 
 ---
 
@@ -992,7 +1011,7 @@ interface TrustedArtifacts { workspaceId; sourceDigest; pdfSha256; synctexSha256
 
 **3. 路由从"一个目录"收窄成"一类文件"。** `outDir` 里不只有 PDF：`main.log`、两份 manifest、`main.pdf.prev`、`main.diff.tex`。原挂载把这些一起服务出去，等于给构建目录开了个文件浏览器，而其中 `.prev` 恰好是面板刚刚撤下的那一版。`StaticMount.accept?(fileName)` 由调用方决定哪些名字属于自己；服务侧只放行 `extname === '.pdf'`（`main.diff.pdf` 这类 latexdiff 产物仍然是 PDF，不受影响）。判定发生在 `stat` 之前，被拒的名字是纯 404，连"存不存在"都不泄露。
 
-**测试**（新增 3 例，全 65 例）：
+**测试**（新增 3 例，全 71 例）：
 
 | 断言 | 位置 |
 |---|---|
