@@ -176,14 +176,57 @@ interface WorkspaceContext {
 }
 
 /**
- * One compile, as a value: which workspace, where its files are, and what was on
- * disk and in the editor when the process started.
+ * One compile, as a value: which workspace, where its files are, what was on disk
+ * and in the editor when the process started, and the version state it must not read
+ * again.
+ *
+ * The three extra fields are snapshots, not conveniences. `revisions` is what the
+ * compile is allowed to advance from; reading `this.revisions()` after the process
+ * returns means a 接受 that landed in between is silently overwritten by an older
+ * view. `review` decides whether a change is auto-reviewed. `trusted` is the
+ * credential for the bytes being replaced — the one this run's publish is allowed to
+ * rely on, even if a later compile has already replaced `this.trusted`.
  */
 interface BuildContext extends WorkspaceContext {
   /** Source that produced the artefacts this run is about to overwrite. */
   readonly before: string | null
   /** Source the compiler read, as re-read just before it started. */
   readonly input: string | null
+  /** The three revisions as they stood when the run started. */
+  readonly revisions: Revisions
+  /** The review gate in force when the run started. */
+  readonly review: ReviewMode
+  /** Credential for `before`'s bytes, as it stood when the run started. */
+  readonly trusted: TrustedArtifacts | null
+}
+
+/**
+ * What one artefact operation achieved.
+ *
+ * `null` used to mean all three of "nothing to publish", "the pair was withdrawn" and
+ * "the workspace is gone", and the caller could not tell them apart — which is how a
+ * stale run kept working after its workspace had been replaced.
+ */
+type StoreOutcome =
+  /** A pair is published and its URLs are in the state. */
+  | 'published'
+  /** Nothing could be vouched for, so the pair was withdrawn. */
+  | 'withdrawn'
+  /** The workspace changed; no further operation may start. */
+  | 'stale'
+
+/** A workspace that is ready to become the active one, and nothing else. */
+interface PreparedWorkspace {
+  readonly workspace: Workspace
+  readonly initial: string | null
+  readonly resolution: RootResolution | null
+  /** State fields for the accepted pair; empty on a settings refresh. */
+  readonly restored: Partial<PreviewState>
+  readonly diffDoc: DiffDocService
+  /** Same workspace, same source: keep the PDF, the pairs and the revisions. */
+  readonly refresh: boolean
+  /** Whether the caller named the output directory. */
+  readonly explicitOutDir: boolean
 }
 
 /** The two revision pairs that live in one path set. */
@@ -297,8 +340,8 @@ export class LatexPreviewService extends TypertRemoteService {
   private readonly binaryProbe: () => Promise<BinaryReport>
   /** Optional pause between the compiler returning and the first publish. */
   private readonly onRunReturned?: (workspace: { id: string; generation: number }) => Promise<void>
-  /** Tail of the compile queue; see {@link runCompile}. */
-  private compileQueue: Promise<void> = Promise.resolve()
+  /** Tail of the lifecycle queue: compiles, 接受, 撤销 and reviewer verdicts. */
+  private lifecycleQueue: Promise<void> = Promise.resolve()
   /** Tail of the configure queue; see {@link applyConfigure}. */
   private configureQueue: Promise<unknown> = Promise.resolve()
   /** The configured workspace; null until `configure` has run. */
@@ -432,14 +475,37 @@ export class LatexPreviewService extends TypertRemoteService {
 
   /** The configure body itself; {@link applyConfigure} serialises it. */
   private async configureOnce(request: ConfigureRequest): Promise<PreviewState> {
-    if (typeof request.redact === 'boolean') this.redact = request.redact
-    if (request.review === 'manual' || request.review === 'auto' || request.review === 'open') {
-      this.review = request.review
-    }
-    if (typeof request.debounceMs === 'number' && request.debounceMs >= 0) {
-      this.debounceMs = Math.min(5000, Math.max(0, request.debounceMs))
-    }
+    // The switches land in locals first: a configuration that fails while resolving
+    // or restoring must not have changed how the *running* workspace behaves.
+    const redact = typeof request.redact === 'boolean' ? request.redact : this.redact
+    const review =
+      request.review === 'manual' || request.review === 'auto' || request.review === 'open'
+        ? request.review
+        : this.review
+    const debounceMs =
+      typeof request.debounceMs === 'number' && request.debounceMs >= 0
+        ? Math.min(5000, Math.max(0, request.debounceMs))
+        : this.debounceMs
 
+    // Nothing is assigned to `this` until the candidate is fully prepared, so there is
+    // no moment at which the service holds a half-initialised workspace — the state
+    // that used to be reachable while `restoreArtifacts` was still running.
+    const prepared = await this.prepareWorkspace(request)
+    if (!prepared) return this.state
+    return this.activateWorkspace(prepared, { redact, review, debounceMs })
+  }
+
+  /**
+   * Resolve, read and restore a candidate workspace without touching the active one.
+   *
+   * Every write here is confined to the candidate's own `outDir`. If anything throws
+   * or the root cannot be resolved, the workspace on screen is untouched — the
+   * previous version assigned `this.workspace` first and restored afterwards, so a
+   * failed restore left a live workspace whose artefacts nobody had verified.
+   * @param request - what the caller asked for.
+   * @returns the candidate, or null when the request resolved to "no workspace".
+   */
+  private async prepareWorkspace(request: ConfigureRequest): Promise<PreparedWorkspace | null> {
     let rootFile = request.rootFile ?? null
     let resolution: RootResolution | null = null
     if (!rootFile && !request.file) {
@@ -463,7 +529,7 @@ export class LatexPreviewService extends TypertRemoteService {
               ? `当前工作目录没有含 \\documentclass 的 .tex：${process.cwd()}`
               : `工作目录有 ${candidates.length} 个候选主文件，请指定 rootFile`,
         })
-        return this.state
+        return null
       }
     }
     if (!rootFile && request.file) {
@@ -477,7 +543,7 @@ export class LatexPreviewService extends TypertRemoteService {
           rootCandidates: resolution.candidates,
           redact: this.redact,
         })
-        return this.state
+        return null
       }
     }
 
@@ -487,16 +553,16 @@ export class LatexPreviewService extends TypertRemoteService {
       })
     }
 
+    const explicitOutDir = Boolean(request.outDir)
     const outDir =
       request.outDir ?? (this.outDirExplicit ? this.workDir : join(dirname(rootFile), '.latex-preview'))
-    if (request.outDir) this.outDirExplicit = true
     const compiler = this.compileFactory({
       rootFile,
       outDir,
       timeoutMs: DEFAULT_TIMEOUT_MS,
       firstRunTimeoutMs: DEFAULT_FIRST_RUN_TIMEOUT_MS,
     })
-    this.diffDoc = new DiffDocService({
+    const diffDoc = new DiffDocService({
       rootFile,
       outDir,
       timeoutMs: DEFAULT_TIMEOUT_MS,
@@ -504,46 +570,73 @@ export class LatexPreviewService extends TypertRemoteService {
     })
     const initial = await this.readSource(rootFile)
     const id = workspaceIdOf(rootFile, outDir)
-    // A credential names the workspace it was issued in: the same source digest in
-    // another project says nothing about these bytes.
-    if (this.workspace?.id !== id) this.trusted = null
-    // One assignment, so a compile starting now sees either the old workspace or the
-    // new one — never a new compiler next to an old root file.
-    this.workspaceGeneration += 1
     const workspace: Workspace = {
-      generation: this.workspaceGeneration,
+      generation: this.workspaceGeneration + 1,
       id,
       rootFile,
       outDir,
       compiler,
     }
+
+    // A repeat configure of the same workspace with the same source is a settings
+    // refresh, not a new revision: the PDF, both published pairs and the three
+    // revisions stay. Restoring artefacts here would delete the previous-compile
+    // pair, whose wording nobody could recover (the text behind it is not stored).
+    const refresh = this.workspace?.id === id && initial !== null && initial === this.currentSource
+    if (refresh) {
+      return { workspace, initial, resolution, restored: {}, diffDoc, refresh, explicitOutDir }
+    }
+    // Restore against the candidate's own paths only; nothing here reads `this`.
+    const restored = await this.restoreArtifacts(rootFile, outDir, initial)
+    return { workspace, initial, resolution, restored, diffDoc, refresh: false, explicitOutDir }
+  }
+
+  /**
+   * Make a prepared workspace the active one.
+   *
+   * The assignment block has no `await` in it, so no compile can observe half a
+   * switch: either the old workspace is current or the new one is.
+   * @param prepared - the candidate from {@link prepareWorkspace}.
+   * @param options - the switches that were only committed because preparation worked.
+   * @returns the state after activation.
+   */
+  private async activateWorkspace(
+    prepared: PreparedWorkspace,
+    options: { redact: boolean; review: ReviewMode; debounceMs: number },
+  ): Promise<PreviewState> {
+    const { workspace, initial, restored, diffDoc, resolution } = prepared
+    this.redact = options.redact
+    this.review = options.review
+    this.debounceMs = options.debounceMs
+    if (prepared.explicitOutDir) this.outDirExplicit = true
+
+    // Before the assignment block, because stopping is asynchronous and the old
+    // watcher must not be able to fire once the new workspace is live.
+    await this.stopWatching()
+
+    // Read before the assignment below, or it compares the new workspace with itself.
+    const sameWorkspace = this.workspace?.id === workspace.id
+    this.workspaceGeneration = workspace.generation
     this.workspace = workspace
-    // A fresh configure starts from "what is on disk is the accepted revision and
-    // the current one"; the previous-compile revision is unknown until we compile.
+    this.diffDoc = diffDoc
+    if (prepared.refresh) {
+      // Nothing about the document changed; only the settings and the watcher.
+      this.patch({ watching: true, redact: this.redact, message: '配置已更新（同一工作区）' })
+      this.startWatcher(workspace)
+      return this.state
+    }
+
     this.acceptedSource = initial
     this.currentSource = initial
     this.previousCompileSource = null
-    // Restore before the single state commit: the restore needs a root file that is
-    // not in `state` yet, and letting it patch `state` itself is what allowed the
-    // commit below to erase the result again. It returns the fields instead.
-    const restored = await this.restoreArtifacts(rootFile, outDir, initial)
-
-    await this.stopWatching()
-    this.watcher = new FileWatcher({
-      dirs: [dirname(rootFile)],
-      outDir,
-      debounceMs: this.debounceMs,
-      onChange: () => {
-        void this.runCompile().catch(() => undefined)
-      },
-    })
-    this.watcher.start()
-
+    // A credential names the workspace it was issued in: the same source digest in
+    // another project says nothing about these bytes.
+    if (!sameWorkspace) this.trusted = null
     this.patch({
-      rootFile,
+      rootFile: workspace.rootFile,
       status: 'idle',
-      message: resolution?.message ?? `已配置主文件：${rootFile}`,
-      rootCandidates: resolution?.candidates ?? [rootFile],
+      message: resolution?.message ?? `已配置主文件：${workspace.rootFile}`,
+      rootCandidates: resolution?.candidates ?? [workspace.rootFile],
       watching: true,
       redact: this.redact,
       // A workspace switch must not inherit the previous project's PDF: the panel
@@ -557,13 +650,35 @@ export class LatexPreviewService extends TypertRemoteService {
       ...restored,
     })
 
+    this.startWatcher(workspace)
+
     // First view of a workspace has no PDF yet; without this the panel stays
     // empty until the user presses 编译. Failures are already surfaced through
     // `runCompile`'s state patch, so a rejected promise here adds nothing.
     if (!this.state.pdfUrl) {
-      void this.runCompile().catch(() => undefined)
+      void this.runCompile({}, workspace).catch(() => undefined)
     }
     return this.state
+  }
+
+  /**
+   * Watch the workspace that is being activated.
+   *
+   * The handler passes *its* workspace, so a change event queued before a switch
+   * cannot compile the workspace that replaced it.
+   * @param workspace - the workspace this watcher belongs to.
+   */
+  private startWatcher(workspace: Workspace): void {
+    this.watcher = new FileWatcher({
+      dirs: [dirname(workspace.rootFile)],
+      outDir: workspace.outDir,
+      debounceMs: this.debounceMs,
+      onChange: () => {
+        if (this.workspace !== workspace) return
+        void this.runCompile({}, workspace).catch(() => undefined)
+      },
+    })
+    this.watcher.start()
   }
 
   /**
@@ -903,7 +1018,9 @@ export class LatexPreviewService extends TypertRemoteService {
   @Remote
   async acceptChanges(signal: AbortSignal): Promise<PreviewState> {
     signal.throwIfAborted()
-    return this.applyAccept()
+    // Queued with compiles: accepting moves the accepted revision, which is exactly
+    // what a compile is about to advance from.
+    return this.enqueue(() => this.applyAccept())
   }
 
   /** Shared acceptance body. */
@@ -911,11 +1028,13 @@ export class LatexPreviewService extends TypertRemoteService {
     if (!hasPendingChanges(this.revisions())) {
       throw new RemoteError('latex-preview/nothing-to-review', '没有待审核的改动', {})
     }
+    const ctx = this.currentContext()
+    if (!ctx) throw new RemoteError('latex-preview/nothing-to-review', '尚未配置主文件', {})
     this.acceptedSource = this.currentSource
     // The revision being accepted is the one on screen, so its artifacts can be
     // copied straight from disk — no second compile, and the pair now belongs to
     // the baseline the diff will use.
-    await this.snapshotBaseFromCurrent()
+    await this.snapshotBaseFromCurrent(ctx)
     this.patch({ message: '已接受这次改动', diffDocUrl: null })
     return this.state
   }
@@ -931,12 +1050,19 @@ export class LatexPreviewService extends TypertRemoteService {
   @Remote
   async revertChanges(signal: AbortSignal): Promise<PreviewState> {
     signal.throwIfAborted()
-    return this.applyRevert()
+    return this.enqueue(() => this.applyRevert())
   }
 
-  /** Shared revert body. */
+  /**
+   * Shared revert body.
+   *
+   * Called from inside a queue task, so it runs the compile directly instead of
+   * re-entering {@link runCompile} — the task would then be waiting for a job that is
+   * queued behind itself.
+   */
   private async applyRevert(): Promise<PreviewState> {
-    const rootFile = this.state.rootFile
+    const workspace = this.workspace
+    const rootFile = workspace?.rootFile ?? null
     const target = this.acceptedSource
     if (!rootFile || target === null || !hasPendingChanges(this.revisions())) {
       throw new RemoteError('latex-preview/nothing-to-review', '没有可撤回的改动', {})
@@ -951,7 +1077,7 @@ export class LatexPreviewService extends TypertRemoteService {
     const discarded = this.currentSource
     let result: CompileResult
     try {
-      result = await this.runCompile({ beforeOverride: discarded, suppressReview: true })
+      result = await this.compileOnce({ beforeOverride: discarded, suppressReview: true }, workspace ?? undefined)
     } catch (error) {
       throw new RemoteError('latex-preview/revert-failed', '源码已回滚，但重新编译没有启动', {
         detail: error instanceof Error ? error.message : String(error),
@@ -986,12 +1112,13 @@ export class LatexPreviewService extends TypertRemoteService {
   /**
    * Send the change just compiled to an independent reviewer.
    *
-   * Runs detached: compiling must not wait on a model call. The reviewer's verdict
-   * decides — accept moves the reference, reject rolls the source back — and a
-   * failed or unreadable review deliberately degrades to manual rather than
-   * passing the change through.
+   * Runs detached: compiling must not wait on a model call — and neither must the
+   * queue. The call itself stays outside {@link enqueue}; only the verdict's effects
+   * (a baseline promotion, a rollback) go back in, re-checked against the workspace
+   * and revision they were produced for.
+   * @param workspace - the workspace the change belongs to.
    */
-  private async queueReview(): Promise<void> {
+  private async queueReview(workspace: Workspace): Promise<void> {
     const target = this.currentSource
     const base = this.acceptedSource
     if (this.reviewing || target === null || base === null || target === base) return
@@ -1000,23 +1127,7 @@ export class LatexPreviewService extends TypertRemoteService {
     this.patch({ message: '自动审核中：正在请独立 AI 审这次改动…' })
     try {
       const verdict = await this.runReview(base, target)
-      // Another compile landed while the reviewer was thinking; that change gets
-      // its own review, and applying this verdict to it would be wrong.
-      if (this.currentSource !== target) return
-
-      if (verdict.verdict === 'unavailable') {
-        this.patch({ message: `自动审核不可用（${verdict.reason}），已转手动：请点「接受」或「撤销」` })
-        return
-      }
-      if (verdict.verdict === 'accept') {
-        this.acceptedSource = target
-        // Same reason as 接受: the approved revision is the one on screen.
-        await this.snapshotBaseFromCurrent()
-        this.patch({ message: `自动审核通过：${verdict.reason}`, diffDocUrl: null })
-        return
-      }
-      await this.applyRevert()
-      this.patch({ message: `自动审核未通过，已回滚：${verdict.reason}`, diffDocUrl: null })
+      await this.enqueue(() => this.applyVerdict(workspace, target, verdict))
     } catch (error) {
       this.patch({
         message: `自动审核出错（${error instanceof Error ? error.message : String(error)}），已转手动`,
@@ -1024,6 +1135,39 @@ export class LatexPreviewService extends TypertRemoteService {
     } finally {
       this.reviewing = false
     }
+  }
+
+  /**
+   * Apply a verdict, if it still describes what is on screen.
+   *
+   * The reviewer can take 25 s, which is long enough for another compile, a
+   * 接受/撤销, or a workspace switch to land. All three make the verdict about a
+   * document that is no longer current, so it is dropped rather than applied.
+   * @param workspace - the workspace the reviewed change belonged to.
+   * @param target - the revision that was reviewed.
+   * @param verdict - what the reviewer decided.
+   */
+  private async applyVerdict(workspace: Workspace, target: string, verdict: ReviewVerdict): Promise<void> {
+    if (this.workspace !== workspace) return
+    // Another compile landed while the reviewer was thinking; that change gets its
+    // own review, and applying this verdict to it would be wrong.
+    if (this.currentSource !== target) return
+
+    if (verdict.verdict === 'unavailable') {
+      this.patch({ message: `自动审核不可用（${verdict.reason}），已转手动：请点「接受」或「撤销」` })
+      return
+    }
+    if (verdict.verdict === 'accept') {
+      const ctx = this.currentContext()
+      if (!ctx) return
+      this.acceptedSource = target
+      // Same reason as 接受: the approved revision is the one on screen.
+      await this.snapshotBaseFromCurrent(ctx)
+      this.patch({ message: `自动审核通过：${verdict.reason}`, diffDocUrl: null })
+      return
+    }
+    await this.applyRevert()
+    this.patch({ message: `自动审核未通过，已回滚：${verdict.reason}`, diffDocUrl: null })
   }
 
   /**
@@ -1179,6 +1323,23 @@ export class LatexPreviewService extends TypertRemoteService {
   }
 
   /**
+   * Replace the three revisions, but only for the run that owns them.
+   *
+   * Revisions are the one piece of state a compile *writes* rather than derives, and
+   * they are what 接受 and 撤销 write too. Both run on the same queue, so a snapshot
+   * taken at the start of a run is still the truth when it finishes — this guard is
+   * what makes the snapshot safe to use instead of re-reading `this.revisions()`.
+   * @param ctx - the run that computed these revisions.
+   * @param next - the three revisions to install.
+   * @returns true when the run was still current.
+   */
+  private commitRevisions(ctx: BuildContext, next: Revisions): boolean {
+    if (!this.isCurrent(ctx)) return false
+    this.applyRevisions(next)
+    return true
+  }
+
+  /**
    * The result a run reports when its workspace is gone.
    *
    * Deliberately not an error: the user switched projects, and the panel they are
@@ -1224,15 +1385,18 @@ export class LatexPreviewService extends TypertRemoteService {
    * @param ctx - workspace the claim is made about, not the current one.
    * @param source - revision the caller wants to name.
    * @param hashes - hashes of the files as they sit on disk right now.
+   * @param trusted - the credential to test against; a run passes the one it captured
+   * when it started, because that is the only one that can describe `before`.
    * @returns true only for an exact match.
    */
   private claimCovers(
     ctx: WorkspaceContext,
     source: string | null,
     hashes: { pdfSha256: string; synctexSha256: string },
+    trusted: TrustedArtifacts | null,
   ): boolean {
     if (source === null) return false
-    return trustCovers(this.trusted, {
+    return trustCovers(trusted, {
       workspaceId: ctx.workspace.id,
       sourceDigest: this.digestOf(source),
       pdfSha256: hashes.pdfSha256,
@@ -1273,21 +1437,24 @@ export class LatexPreviewService extends TypertRemoteService {
    * @param before - source that produced the artefacts now sitting in `prev`.
    * @param backup - what the compile's backup step reported.
    */
-  private async publishCompileArtifacts(ctx: BuildContext, before: string | null, backup: BackupResult): Promise<void> {
+  private async publishCompileArtifacts(ctx: BuildContext, before: string | null, backup: BackupResult): Promise<StoreOutcome> {
+    if (!this.isCurrent(ctx)) return 'stale'
     const stores = this.storesOf(ctx.paths)
     if (before === null || backup.status !== 'complete') {
-      await this.dropRecentArtifacts(ctx)
-      return
+      return this.dropRecentArtifacts(ctx)
     }
     const hashes = await pairHashes(stores.paths.prev, stores.paths.prevSynctex)
+    // First asynchronous boundary inside the helper: the workspace may have been
+    // replaced while the pair was being hashed, and starting a publish now would
+    // touch files nobody asked about.
+    if (!this.isCurrent(ctx)) return 'stale'
     if (
       hashes === null ||
       hashes.pdfSha256 !== backup.pdfSha256 ||
       hashes.synctexSha256 !== backup.synctexSha256 ||
-      !this.claimCovers(ctx, before, hashes)
+      !this.claimCovers(ctx, before, hashes, ctx.trusted)
     ) {
-      await this.dropRecentArtifacts(ctx)
-      return
+      return this.dropRecentArtifacts(ctx)
     }
     const id = this.digestOf(before)
     const ok = await stores.recent.publish({
@@ -1295,11 +1462,12 @@ export class LatexPreviewService extends TypertRemoteService {
       pdf: stores.paths.prev,
       synctex: stores.paths.prevSynctex,
     })
-    if (!ok) {
-      await this.dropRecentArtifacts(ctx)
-      return
-    }
+    // The publish itself is already on disk and cannot be undone; what must not
+    // happen is a URL for it appearing in a workspace that has moved on.
+    if (!this.isCurrent(ctx)) return 'stale'
+    if (!ok) return this.dropRecentArtifacts(ctx)
     this.publishRecentUrls(ctx, id)
+    return 'published'
   }
 
   /**
@@ -1318,34 +1486,31 @@ export class LatexPreviewService extends TypertRemoteService {
    * @param expected - source that produced the artefacts in the `prev` copies.
    * @param backup - what the compile's backup step reported.
    */
-  private async adoptBaseArtifacts(ctx: BuildContext, expected: string | null, backup: BackupResult): Promise<void> {
+  private async adoptBaseArtifacts(ctx: BuildContext, expected: string | null, backup: BackupResult): Promise<StoreOutcome> {
+    if (!this.isCurrent(ctx)) return 'stale'
     const stores = this.storesOf(ctx.paths)
-    const accepted = this.acceptedSource
-    if (accepted === null) {
-      await this.dropBaseArtifacts(ctx)
-      return
-    }
+    const accepted = ctx.revisions.accepted
+    if (accepted === null) return this.dropBaseArtifacts(ctx)
     const id = this.digestOf(accepted)
 
     if (expected !== null && accepted === expected && backup.status === 'complete') {
       const hashes = await pairHashes(stores.paths.prev, stores.paths.prevSynctex)
+      if (!this.isCurrent(ctx)) return 'stale'
       const proven =
         hashes !== null &&
         hashes.pdfSha256 === backup.pdfSha256 &&
         hashes.synctexSha256 === backup.synctexSha256 &&
-        this.claimCovers(ctx, accepted, hashes)
+        this.claimCovers(ctx, accepted, hashes, ctx.trusted)
       if (proven) {
         const ok = await stores.accepted.publish({
           revisionId: id,
           pdf: stores.paths.prev,
           synctex: stores.paths.prevSynctex,
         })
-        if (!ok) {
-          await this.dropBaseArtifacts(ctx)
-          return
-        }
+        if (!this.isCurrent(ctx)) return 'stale'
+        if (!ok) return this.dropBaseArtifacts(ctx)
         this.publishBaseUrls(ctx, id)
-        return
+        return 'published'
       }
       // Those bytes may still be the accepted revision even though this process
       // cannot re-attest them — it is a restart, and the pair was published by the
@@ -1354,8 +1519,12 @@ export class LatexPreviewService extends TypertRemoteService {
     }
 
     const manifest = await stores.accepted.verify()
-    if (manifestStillDescribes(manifest, id)) this.publishBaseUrls(ctx, id)
-    else await this.dropBaseArtifacts(ctx)
+    if (!this.isCurrent(ctx)) return 'stale'
+    if (manifestStillDescribes(manifest, id)) {
+      this.publishBaseUrls(ctx, id)
+      return 'published'
+    }
+    return this.dropBaseArtifacts(ctx)
   }
 
   /**
@@ -1368,45 +1537,50 @@ export class LatexPreviewService extends TypertRemoteService {
    * @param ctx - the workspace whose accepted pair is being promoted; defaults to
    * the configured one, which is what 接受 and the reviewer use.
    */
-  private async snapshotBaseFromCurrent(ctx: WorkspaceContext | null = this.currentContext()): Promise<void> {
+  private async snapshotBaseFromCurrent(ctx: WorkspaceContext | null = this.currentContext()): Promise<StoreOutcome> {
+    if (!ctx) return 'stale'
     const source = this.acceptedSource
-    if (!ctx || source === null) {
-      if (ctx) await this.dropBaseArtifacts(ctx)
-      return
-    }
+    if (source === null) return this.dropBaseArtifacts(ctx)
     const stores = this.storesOf(ctx.paths)
     const hashes = await pairHashes(stores.paths.pdf, stores.paths.synctex)
-    if (hashes === null || !this.claimCovers(ctx, source, hashes)) {
+    if (!this.isCurrent(ctx)) return 'stale'
+    if (hashes === null || !this.claimCovers(ctx, source, hashes, this.trusted)) {
       // The PDF is on screen but nobody can say which revision produced it, so it
       // must not be promoted to a baseline that later line-number lookups trust.
-      await this.dropBaseArtifacts(ctx)
-      return
+      return this.dropBaseArtifacts(ctx)
     }
     const id = this.digestOf(source)
     const ok = await stores.accepted.publish({ revisionId: id, pdf: stores.paths.pdf, synctex: stores.paths.synctex })
-    if (!ok) {
-      await this.dropBaseArtifacts(ctx)
-      return
-    }
+    if (!this.isCurrent(ctx)) return 'stale'
+    if (!ok) return this.dropBaseArtifacts(ctx)
     this.publishBaseUrls(ctx, id)
+    return 'published'
   }
 
   /**
    * Forget the accepted pair: its revision can no longer be mapped honestly.
    * @param ctx - whose pair to drop; a stale run drops only its own.
+   * @returns what happened, so a caller can stop instead of continuing.
    */
-  private async dropBaseArtifacts(ctx: WorkspaceContext): Promise<void> {
+  private async dropBaseArtifacts(ctx: WorkspaceContext): Promise<StoreOutcome> {
+    if (!this.isCurrent(ctx)) return 'stale'
     await this.storesOf(ctx.paths).accepted.drop()
+    if (!this.isCurrent(ctx)) return 'stale'
     this.commit(ctx, { basePdfUrl: null, baseViewerUrl: null, baseRevisionId: null })
+    return 'withdrawn'
   }
 
   /**
    * Forget the previous-compile pair.
    * @param ctx - whose pair to drop; a stale run must not take the new workspace's.
+   * @returns what happened, so a caller can stop instead of continuing.
    */
-  private async dropRecentArtifacts(ctx: WorkspaceContext): Promise<void> {
+  private async dropRecentArtifacts(ctx: WorkspaceContext): Promise<StoreOutcome> {
+    if (!this.isCurrent(ctx)) return 'stale'
     await this.storesOf(ctx.paths).recent.drop()
+    if (!this.isCurrent(ctx)) return 'stale'
     this.commit(ctx, { recentPdfUrl: null, recentViewerUrl: null, recentRevisionId: null })
+    return 'withdrawn'
   }
 
   /**
@@ -1750,7 +1924,7 @@ export class LatexPreviewService extends TypertRemoteService {
   }
 
   /**
-   * Serialise compiles, then run one.
+   * Serialise the operations that move workspace state, then run one.
    *
    * `CompileService.run` already single-flights the *process*, but this method also
    * moves the revision snapshots and publishes artefacts — and two interleaved
@@ -1759,15 +1933,17 @@ export class LatexPreviewService extends TypertRemoteService {
    * just written, published it under the older revision, and the first run's publish
    * was then dropped as stale. One at a time is the only way the snapshots and the
    * pairs stay in step.
-   * @param run - caller overrides; see {@link RunOptions}.
-   * @returns the compile result, with its URL filled in.
+   *
+   * 接受 and 撤销 go through the same queue, because they rewrite the very revisions a
+   * compile advances from; `configure` does not, because a first compile can take
+   * minutes and switching projects must not wait for it (prepare-then-activate is
+   * what makes that safe).
+   * @param operation - the body to serialise.
+   * @returns its result.
    */
-  private runCompile(run: RunOptions = {}): Promise<CompileResult> {
-    const next = this.compileQueue.then(
-      () => this.compileOnce(run),
-      () => this.compileOnce(run),
-    )
-    this.compileQueue = next.then(
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.lifecycleQueue.then(operation, operation)
+    this.lifecycleQueue = next.then(
       () => undefined,
       () => undefined,
     )
@@ -1775,19 +1951,39 @@ export class LatexPreviewService extends TypertRemoteService {
   }
 
   /**
+   * Queue one compile.
+   * @param run - caller overrides; see {@link RunOptions}.
+   * @param expected - the workspace the caller believes is active; a watcher or a
+   * configure passes the one it captured, so a queued event cannot compile the
+   * workspace that replaced it. Omitted means "whatever is active when the task runs".
+   * @returns the compile result, with its URL filled in.
+   */
+  private runCompile(run: RunOptions = {}, expected?: Workspace): Promise<CompileResult> {
+    return this.enqueue(async () => {
+      const workspace = expected ?? this.workspace
+      if (!workspace) {
+        throw new RemoteError('latex-preview/no-root-file', 'nothing configured', { hint: '先调用 configure' })
+      }
+      if (this.workspace !== workspace) return this.discarded()
+      return this.compileOnce(run, workspace)
+    })
+  }
+
+  /**
    * One compile, with state transitions around it.
    *
-   * The whole run hangs off one {@link BuildContext}: the workspace, its paths, and
-   * what was on disk when it started. Every window that used to be unguarded — the
-   * two `readSource` calls, the two publishes, the credential — is followed by an
+   * The whole run hangs off one {@link BuildContext}: the workspace, its paths, the
+   * three revisions, the review mode and the credential — all captured before the
+   * process starts. Every window that used to be unguarded is followed by an
    * {@link isCurrent} check, because a `configure` can land during any of them and
    * the state it moves is not the state this run may touch. A stale run returns
    * `pdfUrl: null` and performs no store operation at all.
    * @param run - caller overrides; see {@link RunOptions}.
+   * @param active - the workspace this run belongs to, already verified by the queue.
    * @returns the compile result, with its URL filled in.
    */
-  private async compileOnce(run: RunOptions = {}): Promise<CompileResult> {
-    const workspace = this.workspace
+  private async compileOnce(run: RunOptions = {}, active?: Workspace): Promise<CompileResult> {
+    const workspace = active ?? this.workspace
     const paths = this.pathsOf(workspace)
     if (!workspace || !paths) {
       throw new RemoteError('latex-preview/no-root-file', 'nothing configured', { hint: '先调用 configure' })
@@ -1805,7 +2001,15 @@ export class LatexPreviewService extends TypertRemoteService {
     // run is the only way to notice an edit that landed mid-compile: the PDF then
     // belongs to neither snapshot, and must not be given a credential.
     const input = await this.readSource(rootFile)
-    const ctx: BuildContext = { workspace, paths, before, input }
+    const ctx: BuildContext = {
+      workspace,
+      paths,
+      before,
+      input,
+      revisions: this.revisions(),
+      review: this.review,
+      trusted: this.trusted,
+    }
     if (!this.isCurrent(ctx)) return this.discarded()
 
     this.commit(ctx, { status: 'compiling', message: '正在编译…' })
@@ -1856,18 +2060,23 @@ export class LatexPreviewService extends TypertRemoteService {
       // marks they are looking at, and it must not republish "上次编译" either: the
       // last compile before the current one is still the answer, and overwriting it
       // with the revision that is already on screen loses the comparison.
-      const advanced = stable && compiled !== null ? advanceRevisions(this.revisions(), compiled, this.review) : null
+      //
+      // The three revisions come from the context, not from `this`: 接受 and 撤销 run
+      // on the same queue, so nothing could have changed them mid-run, and reading
+      // them again afterwards is how an older view used to overwrite a newer one.
+      const advanced =
+        stable && compiled !== null ? advanceRevisions(ctx.revisions, compiled, ctx.review) : null
       if (advanced?.changed) {
         // Publish before advancing: the credential that authorises the pre-compile
         // copies describes the bytes that were on screen a moment ago, and the
         // advance is what decides whether those bytes also become a baseline.
-        await this.publishCompileArtifacts(ctx, before, result.backup)
-        if (!this.isCurrent(ctx)) return this.discarded(result)
-        this.applyRevisions(advanced.revisions)
+        const published = await this.publishCompileArtifacts(ctx, before, result.backup)
+        if (published === 'stale') return this.discarded(result)
+        this.commitRevisions(ctx, advanced.revisions)
         contentChanged = true
       }
-      await this.adoptBaseArtifacts(ctx, before, result.backup)
-      if (!this.isCurrent(ctx)) return this.discarded(result)
+      const adopted = await this.adoptBaseArtifacts(ctx, before, result.backup)
+      if (adopted === 'stale') return this.discarded(result)
       // The credential for the bytes now on screen. Withheld when the input moved:
       // an unprovable pair is exactly what must never be published later.
       const credential = stable && compiled !== null ? await this.issueTrustFor(ctx, compiled) : null
@@ -1880,20 +2089,21 @@ export class LatexPreviewService extends TypertRemoteService {
       // issued on the line above. Starting it earlier let a fast reviewer reach
       // `snapshotBaseFromCurrent()` while `trusted` still described the revision
       // being replaced, so the promoted pair was refused and dropped.
-      if (contentChanged && this.review === 'auto' && run.suppressReview !== true) void this.queueReview()
+      if (contentChanged && ctx.review === 'auto' && run.suppressReview !== true) void this.queueReview(workspace)
     } else if (result.artifactState === 'unavailable') {
       // No artefact can be vouched for — a partial rollback, a backup that never
       // landed, or a first compile that failed. Withdraw every claim rather than
       // leave the panel pointing at bytes of unknown origin.
       this.trusted = null
-      await this.dropBaseArtifacts(ctx)
+      const droppedBase = await this.dropBaseArtifacts(ctx)
+      if (droppedBase === 'stale') return this.discarded(result)
       await this.dropRecentArtifacts(ctx)
     }
 
     if (result.ok && !stable && this.isCurrent(ctx)) {
       // Converge: the edit that landed mid-compile is now on disk, and the PDF on
       // screen predates it.
-      void this.runCompile().catch(() => undefined)
+      void this.runCompile({}, workspace).catch(() => undefined)
     }
 
     // `restored` keeps showing the previous revision (the compile failed but put it
