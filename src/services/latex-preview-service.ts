@@ -1713,7 +1713,8 @@ export class LatexPreviewService extends TypertRemoteService {
   private mountRoutes(): void {
     if (!this.webServer || this.disposeRoute) return
     const mounts: StaticMount[] = [
-      { prefix: '/pdf', dir: this.outDir, cacheable: false },
+      // A getter, not a snapshot: `outDir` follows the configured workspace.
+      { prefix: '/pdf', dir: () => this.outDir, cacheable: false },
       // Packaged assets, not `process.cwd()/assets`: the viewer must be found
       // wherever DSH happens to be started from (see utils/assets.ts).
       { prefix: '/assets', dir: assetsRoot(), cacheable: true },

@@ -51,8 +51,16 @@ const MIME: Record<string, string> = {
 export interface StaticMount {
   /** URL path prefix, e.g. `/pdf`; appended to {@link ROUTE_PREFIX}. */
   readonly prefix: string
-  /** Absolute directory served under that prefix. */
-  readonly dir: string
+  /**
+   * Absolute directory served under that prefix, or a getter for it.
+   *
+   * The getter exists because compiled output follows the *configured* workspace,
+   * and configuration happens after this mount is registered: a captured string
+   * would keep serving the directory DSH was started in, so a workspace elsewhere
+   * would 404 on every PDF (or, worse, serve another project's file of the same
+   * name). Resolved per request, and only then joined and checked.
+   */
+  readonly dir: string | (() => string)
   /** Whether browser caching is allowed (assets yes, compiled output no). */
   readonly cacheable: boolean
 }
@@ -82,7 +90,11 @@ export function createStaticHandler(
     }
 
     const subPath = relative.slice(mount.prefix.length).replace(/^\/+/, '')
-    const target = safeJoin(mount.dir, subPath)
+    // Resolve the directory first, then normalise the request against *it*: a
+    // trailing-slash or `..` must be judged against the directory that is current
+    // for this request, not the one that was current at mount time.
+    const root = typeof mount.dir === 'function' ? mount.dir() : mount.dir
+    const target = safeJoin(root, subPath)
     if (!target) {
       res.writeHead(403).end('forbidden')
       return
