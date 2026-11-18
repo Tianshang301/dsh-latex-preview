@@ -33,6 +33,7 @@
 | **B24** | 来源证明 | 清单只证明完整性；凭据（workspace + 源码摘要 + 两份哈希）只在「本进程编译且输入未变」时签发，三个发布入口都要它 | 已实现并真机验证（残留 PDF 不发布、撤销后 recent=C、重启恢复已接受对） |
 | **B22** | 在旧版 PDF 上标删除 | 旧行号 + 旧 SyncTeX 才能拿到被删文字的真实盒子（`kind: 'removed'` 红带 + 中线删除线）；该视图必须只读 | 已实现并真机验证（`main.prev.pdf` 加载、红带压在第二段、选区不起浮条） |
 | **B26** | 撤下 ≠ 不可达 | 只清 URL 不够：`unavailable` 的 PDF/同步表必须从 `outDir` 删掉（否则静态路由按名服务、下次备份还会采纳）；`CompileResult.pdfUrl` 也要随 `showable` 走；路由用 `accept` 收窄到 `.pdf` | 已实现，单测覆盖（真 HTTP：撤下后 404、切工作区后取到新字节） |
+| **B27** | 工作区不是"进入时检查一次"，而是一条贯穿到 state 提交的边界 | `WorkspaceContext`（workspace + 已解析 paths）随任务传递，发布/凭据/落盘一律不再读 `this.workDir`/`this.workspace.id`；每个 `await` 后复核身份，state 写入走 `commit(ctx, …)`；`configure` 串行化 | 已实现，测试在去掉守卫时失败（`result.pdfUrl` 变回非空） |
 
 ---
 
@@ -893,6 +894,42 @@ interface TrustedArtifacts { workspaceId; sourceDigest; pdfSha256; synctexSha256
 **4. 一次编译只认一个工作区。** `compileOnce` 逐处读 `state.rootFile` / `outDir` / `compiler`，`configure` 落在中间就会"用旧源码编译、把产物发布到新工作区"，甚至能观察到半应用状态（新编译器 + 旧根文件）。现在 `Workspace`（generation / id / rootFile / outDir / compiler）一次性替换、整轮捕获；进程返回时若已不是当前工作区，则不 patch、不发布、不签发。测试：A 的编译被卡在编译器里 → 配置 B → 放行 A，B 的文件不被污染、两个工作区都没有被误发布的清单、凭据指向 B。
 
 ---
+
+## B27 · 工作区隔离：一次检查守不住一条异步长链
+
+§B25 第 4 条把 `Workspace` 做成不可变值、整轮捕获，并在 `compiler.run()` 返回后比对 —— 那是**进入编译器期间**的隔离。外部评审指出：**编译完成之后**还有一段没人看管的窗口，而这一段里做的恰好是最危险的事（发布、签发、改三版本）。
+
+**实测确认的时间窗**：`compileOnce` 里 `this.workspace !== workspace` 只出现一次（编译器返回之后）。此后每一步都是裸 `await`：
+
+| 步骤 | 原本读的是 | 切换 B 之后 |
+|---|---|---|
+| `readSource(rootFile)` | A 的 rootFile | 读 A 的文件，写 B 的变量 |
+| `publishCompileArtifacts()` | `artifactPathsNow()` 无参 → `this.state.rootFile` + `this.workDir` | 用 **B 的目录**发布 A 的字节 |
+| `applyRevisions(advanceRevisions(this.revisions(), …))` | 这一刻的 `this.revisions()` | 把 **A 的正文**写进 **B 的三版本**（最严重） |
+| `issueTrustFor(rootFile, …)` | A 的 rootFile + `this.workspace?.id` | **A 的摘要 + B 的 workspaceId** |
+| 末尾 `patch()` | `this.state.version` 等 | A 的结果覆盖 B 的 state |
+
+最阴的一条是第二条的副作用：`publishCompileArtifacts` 拿 B 的 `.prev` 哈希去比 A 的 `backup.pdfSha256`，必然不等 → 走 `dropRecentArtifacts()`，把 B 刚发布好的「上次编译版」删掉。日志上只表现为"上次编译版没了"，与切工作区毫无关联。
+
+**做法**：
+
+1. **身份成为值。** `WorkspaceContext { workspace, paths }`、`BuildContext extends WorkspaceContext { before, input }`。`paths` 在任务开始时用 `compilePaths(workspace.rootFile, workspace.outDir)` 解析一次，之后 `issueTrustFor / publishCompileArtifacts / adoptBaseArtifacts / snapshotBaseFromCurrent / drop*Artifacts` 全部按它走。`artifactPathsNow()`（默认参数读 `this.*`）删除，换成 `pathsOf(workspace)` + `storesOf(paths)` + `storesNow()`。判据：**发布路径上不再出现 `this.workDir` / `this.state.rootFile` / `this.workspace.id`**。
+2. **守卫落在写上，不落在块首。** `commit(ctx, next)` = `if (this.workspace !== ctx.workspace) return false; this.patch(next)`。`isCurrent(ctx)` 用**对象同一性**（`Workspace` 只整体替换、从不修改，所以身份就是最省的判据；generation 只用于日志与测试的可读性）。每个 `await` 之后各判一次；凭据先算到局部变量、判完再赋值 —— 否则 A 的凭据会成为 B 的 `trusted`。
+3. **stale 的结果要能交差。** `discarded(result?)` 返回 `{…, pdfUrl: null}`，编译没走到就返回一个全空的 `CompileResult`。不抛错：用户切了项目，报错会出现在一个与本次运行无关的面板上。
+4. **`configure` 串行化。** 它的函数体在 `this.workspace = workspace` 之后还有 `await restoreArtifacts()`，两个并发 configure 能交错成「workspace = B、state.rootFile = A」—— 正是 `Workspace` 值本身想消灭的半应用状态。`configureQueue` 与 `compileQueue` 同构。
+
+**测试**（`test/unit/service-workspace.test.ts`，2 例）：
+
+- 核心用例需要一个"编译器返回之后、发布之前"的挂起点。`ServiceOptions.onRunReturned` 就是那个位置 —— 和 `compileFactory` 同一个理由：它是一个时间点，没有别的东西能按需制造。时序：A 跑到挂起点 → `configure(B)` → 让 B 的那次编译失败（`failFromRun`，这样它不会覆盖 A 的污染痕迹）→ 放行 A → 断言 A 的 `pdfUrl` 为 null、`currentSource`/`acceptedSource` 仍是 B 的正文、`trusted` 仍是 null、B 的目录里没有任何 A 的产物。
+- **有齿**：把 `isCurrent` 临时改成恒真，该用例立刻红在 `result.pdfUrl` 应为 null（实测 `'/.latex-preview/pdf/main.pdf?v=12'`）。这一条很重要 —— 上一轮的 `a compile that outlives its workspace` 是在编译器内部挂起，正好落在旧守卫覆盖的窗口里，所以它是绿的但没有覆盖力。
+- `configure` 串行化：并发两次 configure 后断言 `state.rootFile === workspace.rootFile`、`outDir` 与胜者一致。这条只保证不变量，不保证复现交错（复现需要竞态）。
+
+**顺带修掉的测试竞态**：`trustFakeBinaries` 原先靠"连续两次读到 true"猜探测已结束，而 `binaries.ts` 的 `PROBE_TIMEOUT_MS` 是 10 s —— 两次读到的都是测试自己 patch 的值，证明不了探测返回。改为 `ServiceOptions.binaryProbe` 注入确定性结果，删掉那个辅助函数与所有 `await delay` 猜测。
+
+**未做**：多文件输入证明（`\input` / `.bib` / `.sty` 仍不参与 `stable` 判定，`BuildInputManifest` 见评审 §3），以及真机复跑（本轮可观察面都由单测覆盖）。
+
+---
+
 
 ## B26 · 撤下 ≠ 不可达：产物要删，路由要收窄
 
