@@ -90,6 +90,7 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
     'latex-preview/no-source-map': Record<string, never>
     'latex-preview/nothing-to-review': Record<string, never>
     'latex-preview/revert-failed': { readonly detail: string }
+    'latex-preview/artifact-busy': { readonly detail: string }
   }
 }
 
@@ -215,6 +216,43 @@ type StoreOutcome =
   /** The workspace changed; no further operation may start. */
   | 'stale'
 
+/**
+ * A claim on one artifact path set, held for the life of a task.
+ *
+ * The key is the resolved `main.pdf`; every other name in the set (`prev`, `recent`,
+ * the sync maps, the manifests) derives from the same stem and directory, so one key
+ * covers all of them.
+ *
+ * `mode` is what the task does with those files, and it matters: two diff builds may
+ * read the live PDF at once, but nothing may write while anything reads. `running`
+ * separates a **reservation** — a task sitting in the queue, which will write later —
+ * from a task that is inside its I/O right now. The two questions the registry answers
+ * need exactly that distinction:
+ *
+ * - "may a configure restore here?" — no if *any* lease exists, because a queued task
+ *   will write and a running one is reading;
+ * - "is anyone touching these files this instant?" — only running leases count, and a
+ *   task comparing against them must exclude its own.
+ */
+interface PathLease {
+  /** `resolve(paths.pdf)`. */
+  readonly key: string
+  /** Identity, so a task can exclude itself rather than deadlocking on its own lease. */
+  readonly owner: symbol
+  readonly mode: 'read' | 'write'
+  /** False while the task is still queued: a reservation, not I/O. */
+  running: boolean
+}
+
+/** A lease plus the two operations its holder needs. */
+interface HeldLease {
+  readonly lease: PathLease
+  /** Declare that this task's I/O is starting (it has left the queue). */
+  begin(): void
+  /** Drop the claim; idempotent, and safe to call from a `finally`. */
+  release(): void
+}
+
 /** A workspace that is ready to become the active one, and nothing else. */
 interface PreparedWorkspace {
   readonly workspace: Workspace
@@ -225,7 +263,7 @@ interface PreparedWorkspace {
    *
    * `null` means the restore was **deferred**: the candidate writes over the file
    * names the active workspace is using right now, so its restore has to wait until
-   * no compile can be writing there (see {@link outputPathsClash}).
+   * no compile can be writing there (see {@link artifactPathsBusy}).
    */
   readonly restored: Partial<PreviewState> | null
   readonly diffDoc: DiffDocService
@@ -348,6 +386,16 @@ export class LatexPreviewService extends TypertRemoteService {
   private readonly onRunReturned?: (workspace: { id: string; generation: number }) => Promise<void>
   /** Tail of the lifecycle queue: compiles, 接受, 撤销 and reviewer verdicts. */
   private lifecycleQueue: Promise<void> = Promise.resolve()
+  /**
+   * Who holds which artifact paths, queued or running.
+   *
+   * The queue serialises the *bookkeeping*, but `configure` is not in it, so a
+   * restore could otherwise delete pairs under a compile that is still writing to the
+   * same names — and the window that mattered was not "is the active workspace using
+   * this path" but "is any task, current or stale, still going to write it". The
+   * registry is keyed by resolved PDF path; see {@link PathLease}.
+   */
+  private readonly leases = new Map<string, Set<PathLease>>()
   /** Tail of the configure queue; see {@link applyConfigure}. */
   private configureQueue: Promise<unknown> = Promise.resolve()
   /** The configured workspace; null until `configure` has run. */
@@ -595,31 +643,22 @@ export class LatexPreviewService extends TypertRemoteService {
     // Restore against the candidate's own paths — but only while nothing else is
     // writing to them. A different `outDir`, or a different root file in the same
     // `outDir`, produces a different file name, and then the prepare step is genuinely
-    // isolated. When the names *do* collide (two roots called `main.tex` sharing an
-    // explicit `outDir`), a restore now would delete pairs under a compile that is
-    // about to publish to the same names, so it moves behind the lifecycle queue.
-    if (this.outputPathsClash(workspace)) {
+    // isolated. When the names *are* spoken for — by the active workspace, by a
+    // compile that is still writing, or by a task still queued for those names — a
+    // restore now would delete pairs under that writer, so it moves behind the queue.
+    if (this.artifactPathsBusy(workspace)) {
       return { workspace, initial, resolution, restored: null, diffDoc, refresh: false, explicitOutDir }
     }
-    const restored = await this.restoreArtifacts(rootFile, outDir, initial)
-    return { workspace, initial, resolution, restored, diffDoc, refresh: false, explicitOutDir }
-  }
-
-  /**
-   * Whether a candidate would write over the files the active workspace uses.
-   *
-   * The test is the PDF path itself rather than the directory: two roots with
-   * different names in one output directory never touch each other's files, while the
-   * same name in one directory is a real collision on every artefact the compile
-   * publishes — and `restoreArtifacts` deletes by name.
-   * @param candidate - the workspace about to be activated.
-   * @returns true when the two share an artefact path.
-   */
-  private outputPathsClash(candidate: Workspace): boolean {
-    const current = this.pathsOf()
-    if (!current) return false
-    const next = this.pathsOf(candidate)
-    return next !== null && resolve(current.pdf) === resolve(next.pdf)
+    // Hold the candidate's paths for the duration: a compile queued while this restore
+    // runs must see the claim rather than start writing into files being deleted.
+    const held = this.holdLease(compilePaths(rootFile, outDir), 'write')
+    held.begin()
+    try {
+      const restored = await this.restoreArtifacts(rootFile, outDir, initial, held.lease)
+      return { workspace, initial, resolution, restored, diffDoc, refresh: false, explicitOutDir }
+    } finally {
+      held.release()
+    }
   }
 
   /**
@@ -636,12 +675,14 @@ export class LatexPreviewService extends TypertRemoteService {
     options: { redact: boolean; review: ReviewMode; debounceMs: number },
   ): Promise<PreviewState> {
     if (prepared.restored === null) {
-      // The candidate shares artefact names with the active workspace, so its restore
-      // — which deletes both pairs by name — must not run while a compile is writing
-      // there. `configure` stays out of the queue in general (a first compile takes
-      // minutes), but a colliding restore joins it: the switch is then ordered
-      // against the compile instead of racing it over the same files.
-      return this.enqueue(() => this.commitActivation(prepared, options))
+      // The candidate's artifact names are spoken for, so its restore — which deletes
+      // both pairs by name — must not run while something is writing there.
+      // `configure` stays out of the queue in general (a first compile takes minutes),
+      // but a colliding restore joins it: the switch is then ordered against the writer
+      // instead of racing it over the same files. The lease is taken here, before the
+      // task is queued, so the claim covers the waiting period too.
+      const paths = this.pathsOf(prepared.workspace)
+      return this.enqueueLeased(paths, 'write', (lease) => this.commitActivation(prepared, options, lease))
     }
     return this.commitActivation(prepared, options)
   }
@@ -658,6 +699,7 @@ export class LatexPreviewService extends TypertRemoteService {
   private async commitActivation(
     prepared: PreparedWorkspace,
     options: { redact: boolean; review: ReviewMode; debounceMs: number },
+    self?: PathLease,
   ): Promise<PreviewState> {
     const { workspace, initial, diffDoc, resolution } = prepared
     this.redact = options.redact
@@ -668,9 +710,10 @@ export class LatexPreviewService extends TypertRemoteService {
     // Before the assignment block, because stopping is asynchronous and the old
     // watcher must not be able to fire once the new workspace is live.
     await this.stopWatching()
-    // Deferred restores run here, with the lifecycle queue held, so nothing is
-    // compiling into these paths while both pairs are being deleted.
-    const restored = prepared.restored ?? (await this.restoreArtifacts(workspace.rootFile, workspace.outDir, initial))
+    // Deferred restores run here, with the queue held and this task's own lease already
+    // in the registry: `self` is what keeps that claim from reading as a conflict.
+    const restored =
+      prepared.restored ?? (await this.restoreArtifacts(workspace.rootFile, workspace.outDir, initial, self))
 
     // Read before the assignment below, or it compares the new workspace with itself.
     const sameWorkspace = this.workspace?.id === workspace.id
@@ -1040,17 +1083,36 @@ export class LatexPreviewService extends TypertRemoteService {
 
   /** Shared diff-document body: the Remote method and the HTTP API land here. */
   private async applyDiffDoc(): Promise<DiffDocResult> {
-    const rootFile = this.state.rootFile
+    // A context, not a set of loose reads: the build can take two minutes, and the
+    // result must land in the workspace that asked for it or nowhere.
+    const ctx = this.currentContext()
     const base = this.acceptedSource
     const head = this.currentSource
-    if (!rootFile || !this.diffDoc || base === null || head === null) {
+    if (!ctx || !this.diffDoc || base === null || head === null) {
       return { ok: false, url: this.state.diffDocUrl, message: '尚未配置主文件，无法生成对比视图', version: this.state.version }
     }
     if (base === head) {
       return { ok: false, url: null, message: '没有可对比的改动（当前版与已接受版一致）', version: this.state.version }
     }
 
-    const build = await this.diffDoc.build(base, head)
+    // A **read** lease: the build reads the live pair and both sync maps, so a compile
+    // or a restore must not run beside it — but another reader may. It is not a writer,
+    // and treating it as one would serialise every diff build behind every compile.
+    const held = this.holdLease(ctx.paths, 'read')
+    held.begin()
+    let build: Awaited<ReturnType<DiffDocService['build']>>
+    try {
+      build = await this.diffDoc.build(base, head)
+    } finally {
+      held.release()
+    }
+    // Path leases keep two tasks off the same files; they say nothing about *whose*
+    // result this is. A switch during the build (or a 接受 that moved the baseline)
+    // makes this answer describe a document nobody is looking at, so it is dropped
+    // rather than written into the new workspace's state.
+    if (!this.isCurrent(ctx)) {
+      return { ok: false, url: this.state.diffDocUrl, message: '工作区已切换，本次对比视图未生成', version: this.state.version }
+    }
     if (!build.ok || !build.pdfPath) {
       this.patch({ diffDocUrl: null })
       return { ok: false, url: null, message: build.message, ...(build.detail ? { detail: build.detail } : {}), version: this.state.version }
@@ -1091,7 +1153,7 @@ export class LatexPreviewService extends TypertRemoteService {
    * @returns the state after acceptance.
    */
   private acceptQueued(): Promise<PreviewState> {
-    return this.enqueue(() => this.applyAccept())
+    return this.enqueueLeased(this.pathsOf(), 'write', () => this.applyAccept())
   }
 
   /**
@@ -1152,7 +1214,7 @@ export class LatexPreviewService extends TypertRemoteService {
    * @returns the state after the recompile.
    */
   private revertQueued(): Promise<PreviewState> {
-    return this.enqueue(() => this.applyRevert())
+    return this.enqueueLeased(this.pathsOf(), 'write', () => this.applyRevert())
   }
 
   /**
@@ -1248,7 +1310,11 @@ export class LatexPreviewService extends TypertRemoteService {
     this.patch({ message: '自动审核中：正在请独立 AI 审这次改动…' })
     try {
       const verdict = await this.runReview(base, target)
-      await this.enqueue(() => this.applyVerdict(workspace, target, verdict))
+      // The verdict publishes or rolls back, so it takes the same write lease a compile
+      // does — against the workspace it decided about.
+      await this.enqueueLeased(this.pathsOf(workspace), 'write', () =>
+        this.applyVerdict(workspace, target, verdict),
+      )
     } catch (error) {
       // A reviewer that failed for a project nobody is looking at any more must not
       // write its complaint into the new project's status line.
@@ -1420,6 +1486,103 @@ export class LatexPreviewService extends TypertRemoteService {
     const workspace = this.workspace
     const paths = this.pathsOf(workspace)
     return workspace && paths ? { workspace, paths } : null
+  }
+
+  /**
+   * Claim an artifact path set for one task.
+   *
+   * Taken when the task is *queued*, not when it starts: a task that is merely waiting
+   * in the queue will still write those files, and that is enough to make a configure
+   * into the same names wait. The claim is released in the task's `finally`, i.e. after
+   * its last I/O — never when a run is judged stale, because being stale changes
+   * whether the bytes may be *published*, not whether they are being *written*.
+   * @param paths - the path set the task will touch; null claims nothing.
+   * @param mode - what it does with them.
+   * @returns the lease and its two operations.
+   */
+  private holdLease(paths: CompilePaths | null, mode: PathLease['mode']): HeldLease {
+    const lease: PathLease = { key: paths ? resolve(paths.pdf) : '', owner: Symbol('latex-preview/lease'), mode, running: false }
+    if (!paths) return { lease, begin: () => undefined, release: () => undefined }
+    const set = this.leases.get(lease.key) ?? new Set<PathLease>()
+    set.add(lease)
+    this.leases.set(lease.key, set)
+    let released = false
+    return {
+      lease,
+      begin: () => {
+        lease.running = true
+      },
+      release: () => {
+        if (released) return
+        released = true
+        set.delete(lease)
+        if (set.size === 0) this.leases.delete(lease.key)
+      },
+    }
+  }
+
+  /**
+   * A lease on `key` that conflicts with a writer, or null.
+   *
+   * Read/write semantics: writers exclude everything, readers exclude writers. Two
+   * diff builds may read the live PDF together; nothing may write next to either.
+   * @param key - resolved PDF path.
+   * @param options - `self` to exclude the asking task's own lease, `runningOnly` to
+   * ignore tasks that are still queued.
+   * @returns the blocking lease, or null when the path is free.
+   */
+  private blockingLease(
+    key: string,
+    options: { self?: PathLease; runningOnly?: boolean } = {},
+  ): PathLease | null {
+    const set = this.leases.get(key)
+    if (!set) return null
+    for (const lease of set) {
+      if (lease === options.self) continue
+      if (options.runningOnly === true && !lease.running) continue
+      // A reader is only blocked by a writer; a writer is blocked by either.
+      if (lease.mode === 'write' || options.self?.mode !== 'read') return lease
+    }
+    return null
+  }
+
+  /**
+   * Whether a candidate would take over a path set someone else is using or about to.
+   *
+   * Deliberately not "does this equal the active workspace's path": a stale task keeps
+   * its lease until its I/O finishes, and that task is exactly the writer a restore
+   * must not delete files under. Any lease counts — a queued one will write, a running
+   * reader is reading — which is why the answer is about *resources*, not identity.
+   * @param candidate - the workspace about to be activated.
+   * @returns true when the candidate's artifacts are spoken for.
+   */
+  private artifactPathsBusy(candidate: Workspace): boolean {
+    const next = this.pathsOf(candidate)
+    if (!next) return false
+    const key = resolve(next.pdf)
+    const current = this.pathsOf()
+    if (current !== null && resolve(current.pdf) === key) return true
+    return this.blockingLease(key) !== null
+  }
+
+  /**
+   * Refuse to touch a path set that another task is inside right now.
+   *
+   * The last line of defence, not the mechanism: `restoreArtifacts` only runs when
+   * {@link artifactPathsBusy} said the set was free, so this must never fire. It
+   * exists because the recurring form of this bug is a new code path that forgets to
+   * look — a thrown error is far better than a directory describing two projects.
+   * @param paths - the set about to be deleted or overwritten.
+   * @param self - the caller's own lease, so holding one is not a conflict.
+   */
+  private assertArtifactPathsQuiet(paths: CompilePaths, self?: PathLease): void {
+    const key = resolve(paths.pdf)
+    const blocking = this.blockingLease(key, { self, runningOnly: true })
+    if (blocking) {
+      throw new RemoteError('latex-preview/artifact-busy', '这组产物正被另一个任务写入，本次操作已取消', {
+        detail: `${key} (${blocking.mode})`,
+      })
+    }
   }
 
   /**
@@ -1778,7 +1941,12 @@ export class LatexPreviewService extends TypertRemoteService {
    * @param source - the accepted revision.
    * @returns the publication fields for the configuration snapshot.
    */
-  private async restoreArtifacts(rootFile: string, outDir: string, source: string | null): Promise<Partial<PreviewState>> {
+  private async restoreArtifacts(
+    rootFile: string,
+    outDir: string,
+    source: string | null,
+    self?: PathLease,
+  ): Promise<Partial<PreviewState>> {
     const vanished: Partial<PreviewState> = {
       basePdfUrl: null,
       baseViewerUrl: null,
@@ -1787,7 +1955,11 @@ export class LatexPreviewService extends TypertRemoteService {
       recentViewerUrl: null,
       recentRevisionId: null,
     }
-    const stores = this.storesOf(compilePaths(rootFile, outDir))
+    const paths = compilePaths(rootFile, outDir)
+    // This deletes both pairs by name. Nobody else may be inside these paths right
+    // now; `self` is the caller's own claim, which is not a conflict with itself.
+    this.assertArtifactPathsQuiet(paths, self)
+    const stores = this.storesOf(paths)
     if (source === null) {
       await stores.accepted.drop()
       await stores.recent.drop()
@@ -2078,6 +2250,37 @@ export class LatexPreviewService extends TypertRemoteService {
   }
 
   /**
+   * Queue an operation that touches one artifact path set, holding its lease.
+   *
+   * The claim is taken **before** the operation is queued — that is the point: a task
+   * waiting in the queue is invisible to everything else, and a `configure` that ran
+   * during that wait would restore over files the task is about to write. `begin()`
+   * marks the transition from reservation to I/O, and the `finally` releases it after
+   * the last `await` of the task, including a rejection — a lease that leaks on an
+   * error path would block every later switch to those paths for the life of the
+   * process.
+   * @param paths - the path set the operation will touch.
+   * @param mode - what it does with them.
+   * @param operation - the body; receives the lease so a nested check can exclude it.
+   * @returns the operation's result.
+   */
+  private enqueueLeased<T>(
+    paths: CompilePaths | null,
+    mode: PathLease['mode'],
+    operation: (lease: PathLease) => Promise<T>,
+  ): Promise<T> {
+    const held = this.holdLease(paths, mode)
+    return this.enqueue(async () => {
+      held.begin()
+      try {
+        return await operation(held.lease)
+      } finally {
+        held.release()
+      }
+    })
+  }
+
+  /**
    * Queue one compile.
    * @param run - caller overrides; see {@link RunOptions}.
    * @param expected - the workspace the caller believes is active; a watcher or a
@@ -2086,11 +2289,17 @@ export class LatexPreviewService extends TypertRemoteService {
    * @returns the compile result, with its URL filled in.
    */
   private runCompile(run: RunOptions = {}, expected?: Workspace): Promise<CompileResult> {
-    return this.enqueue(async () => {
-      const workspace = expected ?? this.workspace
-      if (!workspace) {
-        throw new RemoteError('latex-preview/no-root-file', 'nothing configured', { hint: '先调用 configure' })
-      }
+    // Resolved at *enqueue* time, not inside the task: the lease has to name the paths
+    // this request will write, and a task sitting in the queue must already be visible
+    // to a configure looking at the same directory. `expected` still wins, so a watcher
+    // or a configure binds its own workspace.
+    const workspace = expected ?? this.workspace
+    if (!workspace) {
+      return Promise.reject(
+        new RemoteError('latex-preview/no-root-file', 'nothing configured', { hint: '先调用 configure' }),
+      )
+    }
+    return this.enqueueLeased(this.pathsOf(workspace), 'write', async () => {
       if (this.workspace !== workspace) return this.discarded()
       return this.compileOnce(run, workspace)
     })
