@@ -35,6 +35,7 @@ const DOC = (body: string): string =>
   ['\\documentclass{article}', '\\begin{document}', body, '\\end{document}', ''].join('\n')
 const A = DOC('甲。')
 const B = DOC('乙。')
+const C = DOC('丙。')
 
 const digestOf = (source: string): string => createHash('sha1').update(source).digest('hex').slice(0, 12)
 
@@ -78,15 +79,21 @@ function factory(behaviour: Behaviour): (options: CompileOptions) => CompileServ
   readonly base: string
   /** Bytes served at a path below the route, or the status when it does not serve. */
   fetch(path: string): Promise<{ status: number; body: string }>
+  /** POST an API method and return the envelope, exactly as the panel receives it. */
+  post(method: string): Promise<{ ok: boolean; value?: unknown; error?: { code: string; message: string } }>
   close(): Promise<void>
 }
 
 /**
  * Boot a service whose static route is a real HTTP server.
  * @param workDir - directory holding `main.tex`.
+ * @param onRunReturned - optional pause between the compiler returning and publishing.
  * @returns the harness.
  */
-async function mount(workDir: string): Promise<Harness> {
+async function mount(
+  workDir: string,
+  onRunReturned?: (workspace: { id: string; generation: number }) => Promise<void>,
+): Promise<Harness> {
   const behaviour: Behaviour = { runs: 0 }
   let handler: ((req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>) | null =
     null
@@ -104,6 +111,7 @@ async function mount(workDir: string): Promise<Harness> {
     // Deterministic availability: the real probe spawns `tectonic` with a 10 s
     // budget and can land after any test-side patch, vetoing the fake compiler.
     binaryProbe: async () => fakeBinaries(),
+    onRunReturned,
     compileFactory: factory(behaviour),
   })
   await delay(0)
@@ -127,6 +135,14 @@ async function mount(workDir: string): Promise<Harness> {
     async fetch(path: string) {
       const response = await fetch(`${base}${path}`)
       return { status: response.status, body: await response.text() }
+    },
+    async post(method: string) {
+      const response = await fetch(`${base}/api/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+      return (await response.json()) as { ok: boolean; value?: unknown; error?: { code: string; message: string } }
     },
     close: async () => {
       await (service as unknown as { watcher: { stop(): Promise<void> } }).watcher.stop()
@@ -153,6 +169,16 @@ async function settled(harness: Harness, timeoutMs = 20_000): Promise<PreviewSta
     await delay(20)
   }
   throw new Error('compile never settled')
+}
+
+/** Wait until `predicate` holds, or fail loudly. */
+async function until(predicate: () => boolean, what: string, timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await delay(10)
+  }
+  throw new Error(`timed out waiting for ${what}`)
 }
 
 /** A fresh workspace with `main.tex` holding `source`. */
@@ -240,6 +266,62 @@ test('the PDF route does not serve the rest of the build directory', async () =>
     }
     assert.equal((await harness.fetch('/pdf/main.pdf')).status, 200, 'the PDF itself is still served')
   } finally {
+    await harness.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('an acceptance sent over HTTP waits for the compile that owns the pair', async () => {
+  const dir = workspace(A)
+  let gate: Promise<void> | null = null
+  const hold: { release?: () => void } = {}
+  const harness = await mount(dir, async () => {
+    if (!gate) return
+    const held = gate
+    gate = null
+    await held
+  })
+  try {
+    await settled(harness)
+    // One accepted revision and one pending change, so 接受 has work to do.
+    writeFileSync(join(dir, 'main.tex'), B)
+    const second = await harness.post('compile')
+    assert.equal(second.ok, true, JSON.stringify(second.error))
+    assert.equal((await harness.service.getState(signal())).baseRevisionId, digestOf(A))
+
+    // The run that holds the pair: the compiler returns — so `main.pdf` already holds
+    // C's bytes — and nothing has been published or credentialed yet.
+    gate = new Promise<void>((resolve) => {
+      hold.release = resolve
+    })
+    writeFileSync(join(dir, 'main.tex'), C)
+    const runs = harness.behaviour.runs
+    const running = harness.service.compileNow(signal())
+    await until(() => harness.behaviour.runs > runs, 'the held run to reach the compiler')
+
+    // 接受 reads `main.pdf` off disk and promotes it. Sent now, it would read C's
+    // bytes against B's credential, refuse the pair and delete the baseline; the route
+    // therefore has to join the queue the compile is holding.
+    const accepting = harness.post('accept')
+    const early = await Promise.race([
+      accepting.then(() => 'done' as const),
+      delay(200).then(() => 'pending' as const),
+    ])
+    assert.equal(early, 'pending', 'an acceptance must not read the pair inside the compile’s window')
+
+    hold.release?.()
+    await running
+    const accepted = await accepting
+    assert.equal(accepted.ok, true, JSON.stringify(accepted.error))
+
+    const state = await harness.service.getState(signal())
+    // Queue order: the compile published C, then the acceptance promoted it.
+    assert.equal(state.baseRevisionId, digestOf(C), 'the acceptance promoted the revision it saw')
+    assert.notEqual(state.basePdfUrl, null, 'and the pair is still offered')
+    // End to end: the baseline bytes are the document on screen, served over the route.
+    assert.equal((await harness.fetch('/pdf/main.prev.pdf')).body, `PDF:${digestOf(C)}`)
+  } finally {
+    hold.release?.()
     await harness.close()
     rmSync(dir, { recursive: true, force: true })
   }

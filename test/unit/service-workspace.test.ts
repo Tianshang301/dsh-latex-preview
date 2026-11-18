@@ -61,31 +61,36 @@ interface Harness {
   stop(): Promise<void>
 }
 
+/** How a test wants the service booted. */
+interface BootOptions {
+  /** Pause between the compiler returning and publishing. */
+  onRunReturned?: (workspace: { id: string; generation: number }) => Promise<void>
+  /** Output directory for the first workspace; omitted means the default one. */
+  outDir?: string
+}
+
 /**
  * Boot a service on one workspace, configured and with the watcher stopped so
  * compiles happen only when a test asks for one.
  * @param workDir - directory holding `main.tex`.
- * @param onRunReturned - optional pause between the compiler returning and publishing.
+ * @param options - see {@link BootOptions}.
  * @returns the harness.
  */
-async function boot(
-  workDir: string,
-  onRunReturned?: (workspace: { id: string; generation: number }) => Promise<void>,
-): Promise<Harness> {
+async function boot(workDir: string, options: BootOptions = {}): Promise<Harness> {
   const behaviour: Behaviour = { runs: 0 }
   const service = new LatexPreviewService(new Context(), {
     binaryProbe: async () => fakeBinaries(),
-    onRunReturned,
-    compileFactory: (options: CompileOptions) =>
+    onRunReturned: options.onRunReturned,
+    compileFactory: (compileOptions: CompileOptions) =>
       new CompileService({
-        ...options,
+        ...compileOptions,
         run: async (): Promise<CompileRun> => {
           behaviour.runs += 1
-          const content = readFileSync(options.rootFile, 'utf8')
+          const content = readFileSync(compileOptions.rootFile, 'utf8')
           if (behaviour.failFromRun !== undefined && behaviour.runs >= behaviour.failFromRun) {
             return { code: 1, stdout: '', stderr: 'fake failure', timedOut: false }
           }
-          writeOutputs(options.outDir, options.rootFile, content)
+          writeOutputs(compileOptions.outDir, compileOptions.rootFile, content)
           return { code: 0, stdout: '', stderr: '', timedOut: false }
         },
       }),
@@ -93,7 +98,8 @@ async function boot(
   const stop = async (): Promise<void> => {
     await (service as unknown as { watcher: { stop(): Promise<void> } | null }).watcher?.stop()
   }
-  await service.configure({ rootFile: join(workDir, 'main.tex'), review: 'manual' }, signal())
+  const request = { rootFile: join(workDir, 'main.tex'), review: 'manual' as const }
+  await service.configure(options.outDir ? { ...request, outDir: options.outDir } : request, signal())
   await stop()
   return { service, behaviour, stop }
 }
@@ -131,11 +137,13 @@ test('a switch inside the publish window leaves the new workspace untouched', as
   let gate: Promise<void> | null = null
   const hold: { release?: () => void } = {}
   // Only the run the test arms is held; every other run (including B's first) flows.
-  const h = await boot(a, async () => {
-    if (!gate) return
-    const held = gate
-    gate = null
-    await held
+  const h = await boot(a, {
+    onRunReturned: async () => {
+      if (!gate) return
+      const held = gate
+      gate = null
+      await held
+    },
   })
   try {
     /** configure() kicks a compile; wait for it to be rendered. */
@@ -207,9 +215,8 @@ test('a stale compile cannot take the new workspace’s published pair with it',
   // would legitimately republish the very pair this test is asking about.
   const releases: Array<() => void> = []
   let holdNext = 0
-  const h = await boot(
-    a,
-    () =>
+  const h = await boot(a, {
+    onRunReturned: () =>
       new Promise<void>((resolve) => {
         if (holdNext <= 0) {
           resolve()
@@ -218,7 +225,7 @@ test('a stale compile cannot take the new workspace’s published pair with it',
         holdNext -= 1
         releases.push(resolve)
       }),
-  )
+  })
   try {
     await until(() => h.behaviour.runs >= 1, 'A’s first compile')
     await delay(150)
@@ -322,6 +329,121 @@ test('two configures in flight leave one workspace described in both places', as
       assert.equal(state.pdfUrl.includes('/.latex-preview/pdf/'), true, state.pdfUrl)
     }
   } finally {
+    await h.stop()
+    rmSync(a, { recursive: true, force: true })
+    rmSync(b, { recursive: true, force: true })
+  }
+})
+
+test('a configure that would overwrite a running compile’s output waits for it', async () => {
+  const a = workspaceSource(A1)
+  const b = workspaceSource(B1)
+  // One output directory, two projects, the same file name: every artefact name in it
+  // is shared, and `restoreArtifacts` deletes both pairs by name.
+  const shared = mkdtempSync(join(tmpdir(), 'dsh-latex-shared-'))
+  let gate: Promise<void> | null = null
+  const hold: { release?: () => void } = {}
+  const h = await boot(a, {
+    outDir: shared,
+    onRunReturned: async () => {
+      if (!gate) return
+      const held = gate
+      gate = null
+      await held
+    },
+  })
+  try {
+    await until(() => h.behaviour.runs >= 1, 'A’s first compile')
+    await delay(150)
+    // A second compile, so a previous-compile pair exists in the shared directory —
+    // that pair is what a concurrent restore would delete.
+    writeFileSync(join(a, 'main.tex'), A2)
+    await h.service.compileNow(signal())
+    const paths = compilePaths(join(a, 'main.tex'), shared)
+    assert.equal(existsSync(paths.recentPdf), true, 'A published a pair into the shared directory')
+
+    // Park a compile after its compiler returned: `main.pdf` holds the new bytes and
+    // the pair above still describes the revision before it.
+    gate = new Promise<void>((resolve) => {
+      hold.release = resolve
+    })
+    writeFileSync(join(a, 'main.tex'), A3)
+    const running = h.service.compileNow(signal())
+    await until(() => h.behaviour.runs >= 3, 'the held run to reach the compiler')
+
+    // B writes `main.pdf` too. Its restore must not run now: it would delete the two
+    // pairs of a compile that is about to publish into the same names.
+    const configured = h.service.configure({ rootFile: join(b, 'main.tex'), outDir: shared, review: 'manual' }, signal())
+    const early = await Promise.race([
+      configured.then(() => 'done' as const),
+      delay(200).then(() => 'pending' as const),
+    ])
+    assert.equal(early, 'pending', 'a colliding configure must wait for the compile')
+    assert.equal(existsSync(paths.recentPdf), true, 'and must not have deleted the pair while waiting')
+
+    hold.release?.()
+    await running
+    const state = await configured
+    await until(() => h.behaviour.runs >= 4, 'B’s own compile to start')
+    await delay(200)
+
+    assert.equal(state.rootFile, join(b, 'main.tex'))
+    assert.equal(internals(h.service).currentSource, B1)
+    // The shared directory now holds B's document and only B's: A's run was released
+    // before the switch, so it published its own revision into A's own names first.
+    assert.equal(readFileSync(join(shared, 'main.pdf'), 'utf8'), `PDF:${digestOf(B1)}`)
+  } finally {
+    hold.release?.()
+    await delay(100)
+    await h.stop()
+    rmSync(a, { recursive: true, force: true })
+    rmSync(b, { recursive: true, force: true })
+    rmSync(shared, { recursive: true, force: true })
+  }
+})
+
+test('a configure into another output directory does not wait for a running compile', async () => {
+  const a = workspaceSource(A1)
+  const b = workspaceSource(B1)
+  let gate: Promise<void> | null = null
+  const hold: { release?: () => void } = {}
+  const h = await boot(a, {
+    onRunReturned: async () => {
+      if (!gate) return
+      const held = gate
+      gate = null
+      await held
+    },
+  })
+  try {
+    await until(() => h.behaviour.runs >= 1, 'A’s first compile')
+    await delay(150)
+
+    gate = new Promise<void>((resolve) => {
+      hold.release = resolve
+    })
+    writeFileSync(join(a, 'main.tex'), A2)
+    const running = h.service.compileNow(signal())
+    await until(() => h.behaviour.runs >= 2, 'the held run to reach the compiler')
+
+    // Nothing in B's directory belongs to A's compile, so there is nothing to order:
+    // the switch stays immediate instead of inheriting the compile's duration. This is
+    // the other half of the rule — if this waits too, `configure` has silently become
+    // a queued operation and every project switch pays for a first compile.
+    const configured = h.service.configure({ rootFile: join(b, 'main.tex'), review: 'manual' }, signal())
+    const early = await Promise.race([
+      configured.then(() => 'done' as const),
+      delay(2000).then(() => 'pending' as const),
+    ])
+    assert.equal(early, 'done', 'a configure with its own output directory is not serialised')
+    assert.equal((await configured).rootFile, join(b, 'main.tex'))
+
+    hold.release?.()
+    const result = await running
+    assert.equal(result.pdfUrl, null, 'and the released run still knows it lost its workspace')
+  } finally {
+    hold.release?.()
+    await delay(100)
     await h.stop()
     rmSync(a, { recursive: true, force: true })
     rmSync(b, { recursive: true, force: true })
