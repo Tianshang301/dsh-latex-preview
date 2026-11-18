@@ -600,6 +600,15 @@ export class LatexPreviewService extends TypertRemoteService {
    * @param options - the switches that were only committed because preparation worked.
    * @returns the state after activation.
    */
+  /**
+   * Make a prepared workspace the active one.
+   *
+   * The assignment block has no `await` in it, so no compile can observe half a
+   * switch: either the old workspace is current or the new one is.
+   * @param prepared - the candidate from {@link prepareWorkspace}.
+   * @param options - the switches that were only committed because preparation worked.
+   * @returns the state after activation.
+   */
   private async activateWorkspace(
     prepared: PreparedWorkspace,
     options: { redact: boolean; review: ReviewMode; debounceMs: number },
@@ -1018,24 +1027,56 @@ export class LatexPreviewService extends TypertRemoteService {
   @Remote
   async acceptChanges(signal: AbortSignal): Promise<PreviewState> {
     signal.throwIfAborted()
-    // Queued with compiles: accepting moves the accepted revision, which is exactly
-    // what a compile is about to advance from.
+    return this.acceptQueued()
+  }
+
+  /**
+   * Queue one acceptance.
+   *
+   * Both faces come through here — the Remote method and the same-origin HTTP route.
+   * The route used to call {@link applyAccept} directly, which put a revision change
+   * next to a running compile: accepting reads the PDF *on disk* and promotes it, so
+   * a compile that has already written its new bytes but not yet published them hands
+   * the acceptance a PDF its credential does not describe. The pair is then refused
+   * and the baseline deleted — an accept that silently destroyed the comparison.
+   * @returns the state after acceptance.
+   */
+  private acceptQueued(): Promise<PreviewState> {
     return this.enqueue(() => this.applyAccept())
   }
 
-  /** Shared acceptance body. */
+  /**
+   * Shared acceptance body.
+   *
+   * Runs on the lifecycle queue, so no compile can be between its own two halves
+   * while this reads the pair. The revision is passed explicitly instead of being
+   * read out of `this` by the helper: `acceptedSource` is the answer this call is
+   * *producing*, and a run that lost its workspace must not relabel the new one.
+   * @returns the state after acceptance.
+   */
   private async applyAccept(): Promise<PreviewState> {
+    const ctx = this.currentContext()
+    if (!ctx) throw new RemoteError('latex-preview/nothing-to-review', '尚未配置主文件', {})
     if (!hasPendingChanges(this.revisions())) {
       throw new RemoteError('latex-preview/nothing-to-review', '没有待审核的改动', {})
     }
-    const ctx = this.currentContext()
-    if (!ctx) throw new RemoteError('latex-preview/nothing-to-review', '尚未配置主文件', {})
-    this.acceptedSource = this.currentSource
+    const source = this.currentSource
+    if (source === null) throw new RemoteError('latex-preview/nothing-to-review', '没有待审核的改动', {})
     // The revision being accepted is the one on screen, so its artifacts can be
     // copied straight from disk — no second compile, and the pair now belongs to
     // the baseline the diff will use.
-    await this.snapshotBaseFromCurrent(ctx)
-    this.patch({ message: '已接受这次改动', diffDocUrl: null })
+    const outcome = await this.snapshotBaseFromCurrent(ctx, source)
+    if (outcome === 'stale' || !this.isCurrent(ctx)) return this.state
+    this.acceptedSource = source
+    this.commit(ctx, {
+      // Saying "accepted" while the pair was refused would leave the panel claiming a
+      // comparison the next diff call cannot build.
+      message:
+        outcome === 'withdrawn'
+          ? '已接受这次改动；这一版 PDF 无法校验，已从对比中撤下'
+          : '已接受这次改动',
+      diffDocUrl: null,
+    })
     return this.state
   }
 
@@ -1050,6 +1091,18 @@ export class LatexPreviewService extends TypertRemoteService {
   @Remote
   async revertChanges(signal: AbortSignal): Promise<PreviewState> {
     signal.throwIfAborted()
+    return this.revertQueued()
+  }
+
+  /**
+   * Queue one revert.
+   *
+   * Same reason as {@link acceptQueued}: 撤销 writes the root file and then compiles,
+   * which is the one sequence that must not interleave with an HTTP acceptance or a
+   * compile that is already publishing.
+   * @returns the state after the recompile.
+   */
+  private revertQueued(): Promise<PreviewState> {
     return this.enqueue(() => this.applyRevert())
   }
 
@@ -1059,16 +1112,16 @@ export class LatexPreviewService extends TypertRemoteService {
    * Called from inside a queue task, so it runs the compile directly instead of
    * re-entering {@link runCompile} — the task would then be waiting for a job that is
    * queued behind itself.
+   * @returns the state after the recompile.
    */
   private async applyRevert(): Promise<PreviewState> {
-    const workspace = this.workspace
-    const rootFile = workspace?.rootFile ?? null
+    const ctx = this.currentContext()
     const target = this.acceptedSource
-    if (!rootFile || target === null || !hasPendingChanges(this.revisions())) {
+    if (!ctx || target === null || !hasPendingChanges(this.revisions())) {
       throw new RemoteError('latex-preview/nothing-to-review', '没有可撤回的改动', {})
     }
 
-    await writeFile(rootFile, target, 'utf8')
+    await writeFile(ctx.workspace.rootFile, target, 'utf8')
     // The PDF on screen still belongs to the revision being thrown away, so the
     // compile must be told what it is replacing instead of inferring it from a
     // `currentSource` we just moved. Moving it here would also make the compile
@@ -1077,12 +1130,16 @@ export class LatexPreviewService extends TypertRemoteService {
     const discarded = this.currentSource
     let result: CompileResult
     try {
-      result = await this.compileOnce({ beforeOverride: discarded, suppressReview: true }, workspace ?? undefined)
+      result = await this.compileOnce({ beforeOverride: discarded, suppressReview: true }, ctx.workspace)
     } catch (error) {
       throw new RemoteError('latex-preview/revert-failed', '源码已回滚，但重新编译没有启动', {
         detail: error instanceof Error ? error.message : String(error),
       })
     }
+    // The file was written back before any await, so a switch can only land during
+    // the compile. From here the panel belongs to another project and this revert has
+    // no state to report into: `compileOnce` already refused to publish anything.
+    if (!this.isCurrent(ctx)) throw this.switchedDuringRevert()
     if (!result.ok) {
       // Two different failures wear the same "recompile failed": a rollback that put
       // the old pair back, and one that could not — and in the second case the PDF
@@ -1104,9 +1161,23 @@ export class LatexPreviewService extends TypertRemoteService {
     }
     // The rolled-back content is the baseline, so the pair must describe it
     // rather than the revision that was just thrown away.
-    await this.snapshotBaseFromCurrent()
-    this.patch({ message: '已回滚到上一版', diffDocUrl: null })
+    if ((await this.snapshotBaseFromCurrent(ctx, target)) === 'stale') throw this.switchedDuringRevert()
+    this.commit(ctx, { message: '已回滚到上一版', diffDocUrl: null })
     return this.state
+  }
+
+  /**
+   * The error 撤销 reports when its workspace went away while it recompiled.
+   *
+   * Not a silent success: the file *was* written back, so the panel must be able to
+   * say that the revert landed on disk but nothing was committed for the project now
+   * on screen.
+   * @returns the error to throw.
+   */
+  private switchedDuringRevert(): RemoteError {
+    return new RemoteError('latex-preview/revert-failed', '源码已回滚，但工作区在重新编译期间切换，本次回滚没有提交到面板', {
+      detail: '工作区已切换',
+    })
   }
 
   /**
@@ -1122,6 +1193,7 @@ export class LatexPreviewService extends TypertRemoteService {
     const target = this.currentSource
     const base = this.acceptedSource
     if (this.reviewing || target === null || base === null || target === base) return
+    if (this.workspace !== workspace) return
 
     this.reviewing = true
     this.patch({ message: '自动审核中：正在请独立 AI 审这次改动…' })
@@ -1129,9 +1201,13 @@ export class LatexPreviewService extends TypertRemoteService {
       const verdict = await this.runReview(base, target)
       await this.enqueue(() => this.applyVerdict(workspace, target, verdict))
     } catch (error) {
-      this.patch({
-        message: `自动审核出错（${error instanceof Error ? error.message : String(error)}），已转手动`,
-      })
+      // A reviewer that failed for a project nobody is looking at any more must not
+      // write its complaint into the new project's status line.
+      if (this.workspace === workspace) {
+        this.patch({
+          message: `自动审核出错（${error instanceof Error ? error.message : String(error)}），已转手动`,
+        })
+      }
     } finally {
       this.reviewing = false
     }
@@ -1160,14 +1236,18 @@ export class LatexPreviewService extends TypertRemoteService {
     if (verdict.verdict === 'accept') {
       const ctx = this.currentContext()
       if (!ctx) return
+      // The approved revision is the one on screen. Passed explicitly, and only
+      // committed once the promotion is: a verdict that lands after a switch must not
+      // relabel the workspace the panel is now showing.
+      if ((await this.snapshotBaseFromCurrent(ctx, target)) === 'stale') return
       this.acceptedSource = target
-      // Same reason as 接受: the approved revision is the one on screen.
-      await this.snapshotBaseFromCurrent(ctx)
-      this.patch({ message: `自动审核通过：${verdict.reason}`, diffDocUrl: null })
+      this.commit(ctx, { message: `自动审核通过：${verdict.reason}`, diffDocUrl: null })
       return
     }
     await this.applyRevert()
-    this.patch({ message: `自动审核未通过，已回滚：${verdict.reason}`, diffDocUrl: null })
+    if (this.workspace === workspace) {
+      this.patch({ message: `自动审核未通过，已回滚：${verdict.reason}`, diffDocUrl: null })
+    }
   }
 
   /**
@@ -1537,9 +1617,7 @@ export class LatexPreviewService extends TypertRemoteService {
    * @param ctx - the workspace whose accepted pair is being promoted; defaults to
    * the configured one, which is what 接受 and the reviewer use.
    */
-  private async snapshotBaseFromCurrent(ctx: WorkspaceContext | null = this.currentContext()): Promise<StoreOutcome> {
-    if (!ctx) return 'stale'
-    const source = this.acceptedSource
+  private async snapshotBaseFromCurrent(ctx: WorkspaceContext, source: string | null): Promise<StoreOutcome> {
     if (source === null) return this.dropBaseArtifacts(ctx)
     const stores = this.storesOf(ctx.paths)
     const hashes = await pairHashes(stores.paths.pdf, stores.paths.synctex)
@@ -2182,8 +2260,11 @@ export class LatexPreviewService extends TypertRemoteService {
       diff: () => this.readDiff(),
       diffRegions: (request) => this.readDiffRegions(parseDiffSide(request.side)),
       diffDoc: () => this.applyDiffDoc(),
-      accept: () => this.applyAccept(),
-      revert: () => this.applyRevert(),
+      // Both mutations go through the same queue as compiles: an acceptance reads
+      // the PDF on disk, and a compile that is between "wrote its bytes" and
+      // "published them" would hand it a document no credential describes.
+      accept: () => this.acceptQueued(),
+      revert: () => this.revertQueued(),
       jumpToPdf: (request) => this.view(request),
       jumpToSource: (request) => this.edit(request),
       sendError: (request) => this.handOff(request),
