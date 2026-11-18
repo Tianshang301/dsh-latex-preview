@@ -29,6 +29,7 @@ import test from 'node:test'
 import { CompileService, compilePaths, type CompileOptions, type CompileRun } from '../../src/services/compile.ts'
 import { LatexPreviewService } from '../../src/services/latex-preview-service.ts'
 import type { PreviewState } from '../../src/types.ts'
+import { fakeBinaries } from './support.ts'
 
 const DOC = (body: string): string =>
   ['\\documentclass{article}', '\\begin{document}', body, '\\end{document}', ''].join('\n')
@@ -70,28 +71,6 @@ function factory(behaviour: Behaviour): (options: CompileOptions) => CompileServ
     })
 }
 
-/**
- * Make the service believe both binaries exist, and keep believing it.
- *
- * `compileOnce` refuses to start without `tectonic`, and the availability flag is
- * written by a probe the constructor fires without awaiting — so a single patch can
- * be undone a few milliseconds later. The loop ends only once two consecutive reads
- * agree, which is enough for a probe that has already landed.
- * @param service - the service under test.
- */
-async function trustFakeBinaries(service: LatexPreviewService): Promise<void> {
-  const patched = service as unknown as { patch(next: Partial<PreviewState>): void }
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    patched.patch({ binaries: { tectonic: true, synctex: true } })
-    await delay(25)
-    if ((await service.getState(signal())).binaries.tectonic) {
-      await delay(50)
-      if ((await service.getState(signal())).binaries.tectonic) return
-    }
-  }
-  throw new Error('could not keep the binary probe from vetoing the fake compiler')
-}
-
 /** The handler the service registers, captured so tests can serve it. */interface Harness {
   readonly service: LatexPreviewService
   readonly behaviour: Behaviour
@@ -121,13 +100,12 @@ async function mount(workDir: string): Promise<Harness> {
       return () => undefined
     },
   })
-  const service = new LatexPreviewService(ctx, { compileFactory: factory(behaviour) })
-  // The constructor probes for `tectonic` in the background over a real `spawn`. A
-  // patch applied before that probe lands is overwritten by it (available: false),
-  // and every compile is then vetoed before the fake process ever runs — the failure
-  // is timing-dependent, which is exactly how it passed here and failed on CI. So:
-  // let the probe settle, patch, then keep patching until the value sticks.
-  await trustFakeBinaries(service)
+  const service = new LatexPreviewService(ctx, {
+    // Deterministic availability: the real probe spawns `tectonic` with a 10 s
+    // budget and can land after any test-side patch, vetoing the fake compiler.
+    binaryProbe: async () => fakeBinaries(),
+    compileFactory: factory(behaviour),
+  })
   await delay(0)
   assert.ok(handler, 'the service registered a route; without one these tests prove nothing')
 

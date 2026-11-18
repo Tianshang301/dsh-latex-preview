@@ -27,6 +27,7 @@ import { CompileService, compilePaths, type CompileOptions, type CompileRun } fr
 import { LatexPreviewService } from '../../src/services/latex-preview-service.ts'
 import { workspaceIdOf } from '../../src/services/provenance.ts'
 import type { PreviewState } from '../../src/types.ts'
+import { fakeBinaries } from './support.ts'
 
 const DOC = (body: string): string =>
   ['\\documentclass{article}', '\\begin{document}', body, '\\end{document}', ''].join('\n')
@@ -92,12 +93,11 @@ async function boot(
   review: 'manual' | 'auto' = 'manual',
 ): Promise<{ service: LatexPreviewService; behaviour: Behaviour; stop: () => Promise<void> }> {
   const behaviour: Behaviour = { runs: 0 }
-  const service = new LatexPreviewService(new Context(), { compileFactory: factory(behaviour) })
-  // The binary probe is not what these tests are about, and a missing `tectonic`
-  // would veto every compile before the fake process ever ran.
-  await delay(0)
-  ;(service as unknown as { patch(next: Partial<PreviewState>): void }).patch({
-    binaries: { tectonic: true, synctex: true },
+  const service = new LatexPreviewService(new Context(), {
+    // The probe is injected rather than patched: the real one spawns `tectonic` with
+    // a 10 s budget and can land after any patch, vetoing the fake compiler.
+    binaryProbe: async () => fakeBinaries(),
+    compileFactory: factory(behaviour),
   })
   await service.configure({ rootFile: join(workDir, 'main.tex'), review }, signal())
   await (service as unknown as { watcher: { stop(): Promise<void> } }).watcher.stop()
