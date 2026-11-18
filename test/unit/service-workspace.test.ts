@@ -37,6 +37,7 @@ const A1 = DOC('甲一。')
 const A2 = DOC('甲二。')
 const A3 = DOC('甲三。')
 const B1 = DOC('乙一。')
+const C1 = DOC('丙一。')
 
 const digestOf = (source: string): string => createHash('sha1').update(source).digest('hex').slice(0, 12)
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
@@ -47,6 +48,8 @@ interface Behaviour {
   runs: number
   /** From this run number on, exit non-zero without writing anything. */
   failFromRun?: number
+  /** On exactly this run number, throw instead of returning a result. */
+  throwOnRun?: number
 }
 
 function writeOutputs(outDir: string, rootFile: string, content: string): void {
@@ -65,6 +68,8 @@ interface Harness {
 interface BootOptions {
   /** Pause between the compiler returning and publishing. */
   onRunReturned?: (workspace: { id: string; generation: number }) => Promise<void>
+  /** Pause inside the compiler, *before* it writes any bytes. */
+  beforeWrite?: () => Promise<void>
   /** Output directory for the first workspace; omitted means the default one. */
   outDir?: string
 }
@@ -86,6 +91,13 @@ async function boot(workDir: string, options: BootOptions = {}): Promise<Harness
         ...compileOptions,
         run: async (): Promise<CompileRun> => {
           behaviour.runs += 1
+          if (behaviour.throwOnRun === behaviour.runs) {
+            throw new Error('fake compiler crash')
+          }
+          // The seam that matters for path leases: the task owns the directory and has
+          // not written anything yet. `onRunReturned` is too late — the bytes are
+          // already there by then.
+          await options.beforeWrite?.()
           const content = readFileSync(compileOptions.rootFile, 'utf8')
           if (behaviour.failFromRun !== undefined && behaviour.runs >= behaviour.failFromRun) {
             return { code: 1, stdout: '', stderr: 'fake failure', timedOut: false }
@@ -447,5 +459,120 @@ test('a configure into another output directory does not wait for a running comp
     await h.stop()
     rmSync(a, { recursive: true, force: true })
     rmSync(b, { recursive: true, force: true })
+  }
+})
+
+test('a stale writer cannot change paths a later workspace has taken over', async () => {
+  const a = workspaceSource(A1)
+  const b = workspaceSource(B1)
+  const c = workspaceSource(C1)
+  // A and C write the same file names into the same directory; B does not.
+  const shared = mkdtempSync(join(tmpdir(), 'dsh-latex-lease-'))
+  let gate: Promise<void> | null = null
+  const hold: { release?: () => void } = {}
+  const h = await boot(a, {
+    outDir: shared,
+    beforeWrite: async () => {
+      if (!gate) return
+      const held = gate
+      gate = null
+      await held
+    },
+  })
+  const pathsA = compilePaths(join(a, 'main.tex'), shared)
+  try {
+    await until(() => h.behaviour.runs >= 1, 'A’s first compile')
+    await delay(150)
+    // A second compile, so the shared directory holds a published pair the restore
+    // would delete.
+    writeFileSync(join(a, 'main.tex'), A2)
+    await h.service.compileNow(signal())
+    assert.equal(existsSync(pathsA.recentPdf), true, 'A published a pair into the shared directory')
+
+    // A's third run owns the directory but has written nothing yet: the compiler is
+    // holding the gate. This is the window `onRunReturned` cannot produce.
+    gate = new Promise<void>((resolve) => {
+      hold.release = resolve
+    })
+    writeFileSync(join(a, 'main.tex'), A3)
+    const running = h.service.compileNow(signal())
+    await until(() => h.behaviour.runs >= 3, 'A’s held run to reach the compiler')
+
+    // B has its own directory: nothing to order against, so the switch is immediate.
+    const started = Date.now()
+    const configuredB = await h.service.configure(
+      { rootFile: join(b, 'main.tex'), outDir: join(b, '.latex-preview'), review: 'manual' },
+      signal(),
+    )
+    assert.equal(configuredB.rootFile, join(b, 'main.tex'))
+    assert.ok(Date.now() - started < 5000, 'a non-colliding switch still does not wait')
+
+    // C claims A's directory. A is stale already — its result will be discarded — but it
+    // is still writing, so the paths are not C's to restore yet.
+    const configuredC = h.service.configure({ rootFile: join(c, 'main.tex'), outDir: shared, review: 'manual' }, signal())
+    const early = await Promise.race([
+      configuredC.then(() => 'done' as const),
+      delay(300).then(() => 'pending' as const),
+    ])
+    assert.equal(early, 'pending', 'C must wait for the writer that still owns the paths')
+    // The promise being pending is not the point: the *restore* must not have run, so
+    // the pair A published is still on disk and A's bytes are still the last written.
+    assert.equal(existsSync(pathsA.recentPdf), true, 'no restore ran under the running writer')
+    assert.equal(readFileSync(join(shared, 'main.pdf'), 'utf8'), `PDF:${digestOf(A2)}`, 'and nothing wrote over it')
+
+    // Release the writer. Only after its underlying I/O finishes does the lease go, and
+    // only then does C's activation run.
+    hold.release?.()
+    const result = await running
+    const state = await configuredC
+    await until(() => h.behaviour.runs >= 5, 'C’s own compile to start')
+    await delay(200)
+
+    assert.equal(result.pdfUrl, null, 'the stale run published nothing')
+    assert.equal(state.rootFile, join(c, 'main.tex'))
+    // The stricter criterion: the stale writer must not determine the final bytes.
+    const final = readFileSync(join(shared, 'main.pdf'), 'utf8')
+    assert.equal(final, `PDF:${digestOf(C1)}`, 'the final document is C’s')
+    assert.ok(!final.includes(digestOf(A3)), 'and A’s late bytes are nowhere in it')
+    assert.equal(internals(h.service).currentSource, C1)
+    assert.equal(internals(h.service).acceptedSource, C1)
+    assert.equal(h.behaviour.runs >= 5, true)
+  } finally {
+    hold.release?.()
+    await delay(100)
+    await h.stop()
+    for (const dir of [a, b, c, shared]) rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a lease is released by a crash and never conflicts with a queued peer', async () => {
+  const a = workspaceSource(A1)
+  const b = workspaceSource(B1)
+  const shared = mkdtempSync(join(tmpdir(), 'dsh-latex-lease-miss-'))
+  const h = await boot(a, { outDir: shared })
+  try {
+    await until(() => h.behaviour.runs >= 1, 'A’s first compile')
+    await delay(150)
+
+    // A compiler that throws rejects the queued task; the lease lives in a `finally`,
+    // so it must be gone before the next operation looks at these paths. If it leaked,
+    // the configure below would be refused as `artifact-busy`.
+    h.behaviour.throwOnRun = 2
+    await assert.rejects(h.service.compileNow(signal()), /fake compiler crash/)
+
+    // Two compiles queued at once on one path set: each holds its own reservation, and
+    // neither may read the other's as a conflict.
+    const both = await Promise.all([h.service.compileNow(signal()), h.service.compileNow(signal())])
+    assert.equal(both.length, 2)
+    assert.equal(both[0]?.ok, true)
+    assert.equal(both[1]?.ok, true)
+
+    const state = await h.service.configure({ rootFile: join(b, 'main.tex'), outDir: shared, review: 'manual' }, signal())
+    assert.equal(state.rootFile, join(b, 'main.tex'), 'a leaked lease would have refused this restore')
+  } finally {
+    await h.stop()
+    rmSync(a, { recursive: true, force: true })
+    rmSync(b, { recursive: true, force: true })
+    rmSync(shared, { recursive: true, force: true })
   }
 })
