@@ -37,11 +37,13 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 
 **Reliability boundaries**
 
-- **The PDF route follows the configured workspace.** `StaticMount.dir` also accepts a getter, resolved per request before the path is normalised and checked. A workspace outside the process directory used to 404 on every PDF (the mount captured `<cwd>/.latex-preview` at registration), and two workspaces sharing a file name would serve each other's document at a URL that looked valid.
-- **`CompileResult.artifactState`** (`current` / `restored` / `unavailable`) separates "did it compile" from "may this be shown": a failed compile that restored the pair keeps the previous PDF on screen, while one whose rollback or backup fell through withdraws both URLs and both revision pairs. `pdfPath` is null whenever nothing can be vouched for.
+- **The PDF route follows the configured workspace.** `StaticMount.dir` also accepts a getter, resolved per request before the path is normalised and checked. A workspace outside the process directory used to 404 on every PDF (the mount captured `<cwd>/.latex-preview` at registration), and two workspaces sharing a file name would serve each other's document at a URL that looked valid. `StaticMount.accept` additionally narrows the mount to `.pdf` names, so the compile log, the manifests and the `.prev` copies next door are not downloadable through the document route.
+- **`CompileResult.artifactState`** (`current` / `restored` / `unavailable`) separates "did it compile" from "may this be shown": a failed compile that restored the pair keeps the previous PDF on screen, while one whose rollback or backup fell through withdraws both URLs and both revision pairs. `pdfPath` is null whenever nothing can be vouched for — and so is the `pdfUrl` the result carries, since a caller rendering it would show the same document the panel was just told to forget.
+- **An artefact nobody can vouch for is deleted, not merely hidden.** After a failed backup (or an incomplete rollback, or a first compile that failed), the run's PDF and `.synctex.gz` are removed from the output directory. Withdrawing the URL alone left the bytes where the static route serves them by name and where the next backup would adopt them as "the previous revision".
+- **The status line matches what is on screen.** "已保留上一次的 PDF" is only said for a clean rollback; a withdrawn preview says so, including on the 撤销 path, where the old wording promised a PDF that no longer existed.
 - **The reviewer starts last**, after the credential for the bytes on screen exists. An immediately-approving reviewer used to reach `snapshotBaseFromCurrent()` while `trusted` still described the revision being replaced, so the promotion was refused and the accepted pair was dropped.
 - **A compile is bound to one workspace.** `Workspace` (generation, identity, root file, out dir, compiler) is replaced in a single assignment and captured once per run; if it is no longer current when the process returns, nothing is patched, published or credentialed.
-- 62 unit tests, including a real HTTP server for the route and a service test that parks one workspace's compile while another is configured.
+- 65 unit tests, including a real HTTP server for the route — twice: once against a bare handler, once against the handler the *service* registered, so a workspace switch and a withdrawn artefact are both checked end to end — a service test that parks one workspace's compile while another is configured, and a backup-failure test that asserts the partial PDF is gone and its URL 404s.
 
 **Artefact provenance**
 
@@ -50,7 +52,7 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 - **Compiles are serialised at the service level.** `CompileService.run` already single-flights the process, but the revision snapshots and the artefact publishes are this service's own bookkeeping, and two interleaved bookkeepings are not one.
 - **A redundant compile republishes nothing.** "上次编译" answers *what did the last save change*; a compile of unchanged content has no answer, and letting it overwrite the pair loses the comparison.
 - **A restart re-adopts an accepted pair** when its manifest still names the source on disk, and the restore result is committed in the same state patch as the rest of the configuration instead of being patched separately first.
-- `npm test` now runs 54 cases, including service-level ones that drive a real `LatexPreviewService` in a real Cordis context with a real `CompileService` whose process is faked (`ServiceOptions.compileFactory`). `.github/workflows/ci.yml` runs typecheck, test typecheck and tests on Node 22 via pnpm.
+- `npm test` now runs 65 cases, including service-level ones that drive a real `LatexPreviewService` in a real Cordis context with a real `CompileService` whose process is faked (`ServiceOptions.compileFactory`). `.github/workflows/ci.yml` runs typecheck, test typecheck and tests on Node 22 via pnpm.
 
 **Previous-revision view**
 

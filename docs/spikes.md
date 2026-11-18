@@ -32,6 +32,7 @@
 | **B25** | 四个边界 | 路由目录按请求解析；`artifactState` 决定能否展示；审核在凭据之后启动；一次编译只认一个 `Workspace` | 已实现并真机验证（外部工作区 PDF 200、跨工作区编译不污染） |
 | **B24** | 来源证明 | 清单只证明完整性；凭据（workspace + 源码摘要 + 两份哈希）只在「本进程编译且输入未变」时签发，三个发布入口都要它 | 已实现并真机验证（残留 PDF 不发布、撤销后 recent=C、重启恢复已接受对） |
 | **B22** | 在旧版 PDF 上标删除 | 旧行号 + 旧 SyncTeX 才能拿到被删文字的真实盒子（`kind: 'removed'` 红带 + 中线删除线）；该视图必须只读 | 已实现并真机验证（`main.prev.pdf` 加载、红带压在第二段、选区不起浮条） |
+| **B26** | 撤下 ≠ 不可达 | 只清 URL 不够：`unavailable` 的 PDF/同步表必须从 `outDir` 删掉（否则静态路由按名服务、下次备份还会采纳）；`CompileResult.pdfUrl` 也要随 `showable` 走；路由用 `accept` 收窄到 `.pdf` | 已实现，单测覆盖（真 HTTP：撤下后 404、切工作区后取到新字节） |
 
 ---
 
@@ -877,7 +878,7 @@ interface TrustedArtifacts { workspaceId; sourceDigest; pdfSha256; synctexSha256
 | 改坏 `main.recent.pdf` | 拒绝出图 | "未能成对校验"、`regions: 0`、URL 置空 ✔ |
 | 重启后（清单仍描述当前源码） | 恢复已接受对 | ✔ |
 
-测试：`test/unit/service-provenance.test.ts` 8 例，用真实 `LatexPreviewService` + 真实 Cordis 上下文 + 真实 `CompileService`（只把进程换成假实现，`ServiceOptions.compileFactory`）。覆盖：残留 PDF 不发布、第二次编译后才可发布、重启恢复、备份失败不发布、撤销的版本推进、`side` 元数据、编译期间改源码、并发编译。全套 54 例；`.github/workflows/ci.yml` 跑 `typecheck` / `typecheck:test` / `test`。
+测试：`test/unit/service-provenance.test.ts` 13 例，用真实 `LatexPreviewService` + 真实 Cordis 上下文 + 真实 `CompileService`（只把进程换成假实现，`ServiceOptions.compileFactory`）。覆盖：残留 PDF 不发布、第二次编译后才可发布、重启恢复、备份失败不发布且撤下、撤销的版本推进、`side` 元数据、编译期间改源码、并发编译、审核时序、工作区隔离。全套 65 例（含 `service-route.test.ts` 的 3 例真 HTTP）；`.github/workflows/ci.yml` 跑 `typecheck` / `typecheck:test` / `test`。
 
 ---
 
@@ -892,6 +893,41 @@ interface TrustedArtifacts { workspaceId; sourceDigest; pdfSha256; synctexSha256
 **4. 一次编译只认一个工作区。** `compileOnce` 逐处读 `state.rootFile` / `outDir` / `compiler`，`configure` 落在中间就会"用旧源码编译、把产物发布到新工作区"，甚至能观察到半应用状态（新编译器 + 旧根文件）。现在 `Workspace`（generation / id / rootFile / outDir / compiler）一次性替换、整轮捕获；进程返回时若已不是当前工作区，则不 patch、不发布、不签发。测试：A 的编译被卡在编译器里 → 配置 B → 放行 A，B 的文件不被污染、两个工作区都没有被误发布的清单、凭据指向 B。
 
 ---
+
+## B26 · 撤下 ≠ 不可达：产物要删，路由要收窄
+
+§B25 第 2 条把「能否展示」拆成了 `current / restored / unavailable`，但**只做到了"不给 URL"**。外部评审指出这一层不够，实测复查后确认两个缺口：
+
+**1. `unavailable` 的字节还留在目录里。** `backup.status === 'failed'` 时 `compile.ts` 只置 `rollbackIncomplete`，既不恢复也不删除——于是「备份失败 + 编译器写了一半 PDF + 非零退出」之后，`outDir/main.pdf` 是本次失败运行的残缺输出，`main.synctex.gz` 是它的对应表。后果有三条，都真实存在：
+
+- `/.latex-preview/pdf/main.pdf` 由静态路由按名字服务，**任何人拿着上一个 `?v=` 的 URL 都能打开这份残缺 PDF**（画面上是残缺文档，不是错误）；
+- 下一次编译的 `backupPair()` 会把它当成"上一次的 PDF"复制到 `.prev`；
+- 面板状态已经清空，于是"状态"与"磁盘"描述的是两件事。
+
+现在统一成一条规则：**`artifactState === 'unavailable'` ⇒ 删掉 `pdf` 与 `synctex` 两半**（日志保留，它是诊断证据、不是预览目标）。这条规则自动覆盖三种来源——备份失败、半回滚（PDF 回来了但同步表没有，成不了对）、首次编译失败（原先的 `else` 分支）。"隔离"没有采用：另建目录会让 `compilePaths` 的 basename 配对规则、`-o` 的 SyncTeX 查找、路由的目录来源三处同时变复杂，而这三处正是 §B20/§B23 反复踩坑的地方；删除是唯一不需要再解释一遍的答案。
+
+**2. `CompileResult` 仍在发 URL。** `compileOnce` 末尾 `return { ...result, pdfUrl }`，而 `pdfUrl` 是按 `result.pdfPath` 算出来的、与 `showable` 无关。状态里撤了，返回值里没撤——渲染 `result.pdfUrl` 的调用方看到的是同一份没人能担保的文档。同时 `describe()` 与撤销失败的文案都在**无条件**声称"已保留上一次的 PDF"/"PDF 仍是回滚前那一版"，在 `unavailable` 时这是假的。现在：返回值随 `showable` 走，四句文案按 `artifactState` 分岔。
+
+**3. 路由从"一个目录"收窄成"一类文件"。** `outDir` 里不只有 PDF：`main.log`、两份 manifest、`main.pdf.prev`、`main.diff.tex`。原挂载把这些一起服务出去，等于给构建目录开了个文件浏览器，而其中 `.prev` 恰好是面板刚刚撤下的那一版。`StaticMount.accept?(fileName)` 由调用方决定哪些名字属于自己；服务侧只放行 `extname === '.pdf'`（`main.diff.pdf` 这类 latexdiff 产物仍然是 PDF，不受影响）。判定发生在 `stat` 之前，被拒的名字是纯 404，连"存不存在"都不泄露。
+
+**测试**（新增 3 例，全 65 例）：
+
+| 断言 | 位置 |
+|---|---|
+| 备份失败 + 残缺 PDF + 非零退出 ⇒ `artifactState: unavailable`、`pdfPath: null`、磁盘上两半都不在、`prev` 无残留、日志仍在 | `compile-rollback.test.ts` |
+| 同上（服务级）⇒ `result.pdfUrl === null`、状态 URL 清空、文案不含"保留/回滚到" | `service-provenance.test.ts` |
+| **真 HTTP**：配置 A → 取到 A 的字节 → 配置 B（同名 `main.tex`）→ 同一路径取到 B 的字节，且 A 的文件未被覆盖 | `service-route.test.ts` |
+| **真 HTTP**：撤下之后，原先能 200 的 URL 变成 404，响应体不含残缺内容 | 同上 |
+| **真 HTTP**：`main.log` / `main.prev.manifest.json` / `main.pdf.prev` 一律 404，`main.pdf` 仍 200 | 同上 |
+| 审核器被调用时 `trusted` 已存在且指向被审的那一版；通过后基线字节 = 被审版本的 PDF | `service-provenance.test.ts` |
+| 切换工作区后凭据的 `workspaceId` 是新工作区 | 同上 |
+
+这 3 例都用 `ctx.provide('webServer', …)` 把假 webServer **在构造之前**注入，再拿服务真正注册的那个 handler 起真 HTTP 服务——路由测试此前只验证过 `createStaticHandler` 的闭包，验证不到"服务是否真的传了 getter"。
+
+**未做**：本轮没有真机（DSH boot + 真实 tectonic）复跑。这两个改动的可观察面（删除、404、文案）都由上面的真 HTTP 断言覆盖；需要真机的部分是"真实 tectonic 半途失败时留下什么"，而 fake run 正是为了复现一个真实 tectonic 不会按需制造的时序。
+
+---
+
 
 ## B22 · 旧版视图：被删除的文字回到它原来的位置
 
