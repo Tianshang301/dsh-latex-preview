@@ -66,7 +66,10 @@ function factory(behaviour: Behaviour): (options: CompileOptions) => CompileServ
       run: async (): Promise<CompileRun> => {
         behaviour.runs += 1
         if (behaviour.gate && behaviour.gateFromRun !== undefined && behaviour.runs >= behaviour.gateFromRun) {
-          await behaviour.gate()
+          const gate = behaviour.gate
+          // One-shot: the compiles that follow must not queue behind it.
+          behaviour.gate = undefined
+          await gate()
         }
         const content = readFileSync(options.rootFile, 'utf8')
         if (behaviour.mutate) {
@@ -436,5 +439,53 @@ test('a rejecting reviewer rolls back without asking for a second review', async
     assert.equal(state.recentRevisionId, digestOf(B), 'what was rejected is now the previous compile')
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a compile that outlives its workspace publishes nothing and patches nothing', async () => {
+  const a = workspace(A)
+  const b = workspace(B)
+  try {
+    const { service, behaviour, stop } = await boot(a)
+    await settled(service, behaviour)
+
+    // Park a compile of A mid-run, switch to B while it is inside the compiler, then
+    // let it finish. Nothing it produces belongs to B.
+    const gateRef: { release?: () => void } = {}
+    behaviour.gateFromRun = 2
+    behaviour.gate = () =>
+      new Promise<void>((resolve) => {
+        gateRef.release = resolve
+      })
+    writeFileSync(join(a, 'main.tex'), DOC('A2'))
+    const running = service.compileNow(signal())
+    await delay(80)
+
+    await service.configure({ rootFile: join(b, 'main.tex'), review: 'manual' }, signal())
+    await (service as unknown as { watcher: { stop(): Promise<void> } }).watcher.stop()
+    gateRef.release?.()
+    await running
+    await delay(400)
+    const state = await service.getState(signal())
+    await stop()
+
+    assert.equal(state.rootFile, join(b, 'main.tex'), 'the panel still describes B')
+    assert.ok(state.pdfUrl?.includes('/pdf/main.pdf'), state.pdfUrl ?? '')
+    assert.equal(readFileSync(join(b, '.latex-preview', 'main.pdf'), 'utf8'), `PDF:${digestOf(B)}`)
+    assert.equal(readFileSync(join(a, '.latex-preview', 'main.pdf'), 'utf8'), `PDF:${digestOf(DOC('A2'))}`, "A's own document")
+
+    // Neither workspace may show a published revision: A's run was discarded before
+    // it could publish, and B has only compiled once (no credential yet).
+    for (const dir of [a, b]) {
+      const out = join(dir, '.latex-preview')
+      assert.equal(existsSync(join(out, 'main.recent.manifest.json')), false, `${dir} recent`)
+      assert.equal(existsSync(join(out, 'main.prev.manifest.json')), false, `${dir} base`)
+    }
+    assert.equal((service as unknown as { trusted: { sourceDigest: string } | null }).trusted?.sourceDigest, digestOf(B))
+    assert.equal(state.baseRevisionId, null)
+    assert.equal(state.recentRevisionId, null)
+  } finally {
+    rmSync(a, { recursive: true, force: true })
+    rmSync(b, { recursive: true, force: true })
   }
 })

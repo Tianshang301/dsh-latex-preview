@@ -122,6 +122,26 @@ export interface ServiceOptions {
   readonly compileFactory?: (options: CompileOptions) => CompileService
 }
 
+/**
+ * One configured workspace, captured as a value.
+ *
+ * The compiler, the directory and the identity always belong together: a half-applied
+ * `configure` used to be observable (new compiler, old root file), and a compile that
+ * started in one workspace could publish its artefacts into another's store, because
+ * every step re-read `this.outDir` / `this.state.rootFile` at the moment it needed
+ * them. Replacing the whole object at once gives a compile one thing to hold on to
+ * and one identity to compare against when it finishes.
+ */
+interface Workspace {
+  /** Bumped on every switch; a compile whose generation is stale publishes nothing. */
+  readonly generation: number
+  /** `workspaceIdOf(rootFile, outDir)`, the identity a credential is bound to. */
+  readonly id: string
+  readonly rootFile: string
+  readonly outDir: string
+  readonly compiler: CompileService
+}
+
 /** Per-run overrides for one compile. */
 interface RunOptions {
   /**
@@ -139,7 +159,6 @@ interface RunOptions {
 
 export class LatexPreviewService extends TypertRemoteService {
   private state: PreviewState
-  private compiler: CompileService
   private diffDoc: DiffDocService | null = null
   private watcher: FileWatcher | null = null
   private readonly bridge: AgentBridge
@@ -210,9 +229,12 @@ export class LatexPreviewService extends TypertRemoteService {
   private readonly compileFactory: (options: CompileOptions) => CompileService
   /** Tail of the compile queue; see {@link runCompile}. */
   private compileQueue: Promise<void> = Promise.resolve()
-  private outDir: string
+  /** The configured workspace; null until `configure` has run. */
+  private workspace: Workspace | null = null
+  /** Generation counter for {@link workspace}. */
+  private workspaceGeneration = 0
   /**
-   * Whether {@link outDir} came from the caller.
+   * Whether the output directory came from the caller.
    *
    * The constructor seeds it with `<cwd>/.latex-preview`, which is right for the
    * common case (DSH started inside the paper folder) but wrong as a *default*: a
@@ -227,13 +249,6 @@ export class LatexPreviewService extends TypertRemoteService {
     super(ctx, SERVICE_KEY, { namespace: SERVICE_KEY })
 
     this.compileFactory = options.compileFactory ?? ((compileOptions) => new CompileService(compileOptions))
-    this.outDir = join(process.cwd(), '.latex-preview')
-    this.compiler = this.compileFactory({
-      rootFile: join(process.cwd(), 'main.tex'),
-      outDir: this.outDir,
-      timeoutMs: DEFAULT_TIMEOUT_MS,
-      firstRunTimeoutMs: DEFAULT_FIRST_RUN_TIMEOUT_MS,
-    })
 
     // Lazy lookups: neither service is guaranteed to exist in every profile.
     this.bridge = new AgentBridge(() => this.agents)
@@ -254,6 +269,11 @@ export class LatexPreviewService extends TypertRemoteService {
 
     this.state = this.emptyState()
     void this.refreshBinaries()
+  }
+
+  /** Directory the current workspace compiles into (the process default before configure). */
+  private get workDir(): string {
+    return this.workspace?.outDir ?? join(process.cwd(), '.latex-preview')
   }
 
   /** Idle state for a fresh service; kept in one place so shapes cannot drift. */
@@ -387,10 +407,9 @@ export class LatexPreviewService extends TypertRemoteService {
     }
 
     const outDir =
-      request.outDir ?? (this.outDirExplicit ? this.outDir : join(dirname(rootFile), '.latex-preview'))
+      request.outDir ?? (this.outDirExplicit ? this.workDir : join(dirname(rootFile), '.latex-preview'))
     if (request.outDir) this.outDirExplicit = true
-    this.outDir = outDir
-    this.compiler = this.compileFactory({
+    const compiler = this.compileFactory({
       rootFile,
       outDir,
       timeoutMs: DEFAULT_TIMEOUT_MS,
@@ -403,11 +422,21 @@ export class LatexPreviewService extends TypertRemoteService {
       firstRunTimeoutMs: DEFAULT_FIRST_RUN_TIMEOUT_MS,
     })
     const initial = await this.readSource(rootFile)
-    const workspace = workspaceIdOf(rootFile, outDir)
+    const id = workspaceIdOf(rootFile, outDir)
     // A credential names the workspace it was issued in: the same source digest in
     // another project says nothing about these bytes.
-    if (this.workspaceId !== workspace) this.trusted = null
-    this.workspaceId = workspace
+    if (this.workspace?.id !== id) this.trusted = null
+    // One assignment, so a compile starting now sees either the old workspace or the
+    // new one — never a new compiler next to an old root file.
+    this.workspaceGeneration += 1
+    const workspace: Workspace = {
+      generation: this.workspaceGeneration,
+      id,
+      rootFile,
+      outDir,
+      compiler,
+    }
+    this.workspace = workspace
     // A fresh configure starts from "what is on disk is the accepted revision and
     // the current one"; the previous-compile revision is unknown until we compile.
     this.acceptedSource = initial
@@ -607,7 +636,7 @@ export class LatexPreviewService extends TypertRemoteService {
           continue
         }
         for (const line of lines) {
-          hits.push(...(await synctexView(rootFile, line, pdf, { cwd: this.outDir })))
+          hits.push(...(await synctexView(rootFile, line, pdf, { cwd: this.workDir })))
         }
       }
 
@@ -723,7 +752,7 @@ export class LatexPreviewService extends TypertRemoteService {
       }
       const hits: SyncViewHit[] = []
       for (const line of lines) {
-        hits.push(...(await synctexView(rootFile, line, basePdf, { cwd: this.outDir })))
+        hits.push(...(await synctexView(rootFile, line, basePdf, { cwd: this.workDir })))
       }
       const kind: DiffRegionKind = hunk.kind === 'delete' ? 'removed' : 'modify'
       const where = first === last ? `第 ${first} 行` : `第 ${first}-${last} 行`
@@ -1000,7 +1029,7 @@ export class LatexPreviewService extends TypertRemoteService {
    */
   private artifactPathsNow(
     rootFile: string | null = this.state.rootFile,
-    outDir: string = this.outDir,
+    outDir: string = this.workDir,
   ): { paths: CompilePaths; accepted: ArtifactStore; recent: ArtifactStore } | null {
     if (!rootFile) return null
     const paths = compilePaths(rootFile, outDir)
@@ -1022,9 +1051,10 @@ export class LatexPreviewService extends TypertRemoteService {
    * @returns true only for an exact match.
    */
   private claimCovers(source: string | null, hashes: { pdfSha256: string; synctexSha256: string }): boolean {
-    if (source === null || this.workspaceId === null) return false
+    const id = this.workspace?.id ?? null
+    if (source === null || id === null) return false
     return trustCovers(this.trusted, {
-      workspaceId: this.workspaceId,
+      workspaceId: id,
       sourceDigest: this.digestOf(source),
       pdfSha256: hashes.pdfSha256,
       synctexSha256: hashes.synctexSha256,
@@ -1043,11 +1073,12 @@ export class LatexPreviewService extends TypertRemoteService {
    */
   private async issueTrustFor(rootFile: string, source: string | null): Promise<TrustedArtifacts | null> {
     const stores = this.artifactPathsNow(rootFile)
-    if (!stores || source === null || this.workspaceId === null) return null
+    const id = this.workspace?.id ?? null
+    if (!stores || source === null || id === null) return null
     const hashes = await pairHashes(stores.paths.pdf, stores.paths.synctex)
     if (hashes === null) return null
     return issueTrust({
-      workspaceId: this.workspaceId,
+      workspaceId: id,
       sourceDigest: this.digestOf(source),
       pdfSha256: hashes.pdfSha256,
       synctexSha256: hashes.synctexSha256,
@@ -1299,7 +1330,7 @@ export class LatexPreviewService extends TypertRemoteService {
     const pdf = this.requirePdf()
     const file = request.file ?? this.state.rootFile
     if (!file) throw new RemoteError('latex-preview/no-root-file', 'no file to jump from', { hint: '先 configure' })
-    return synctexView(file, request.line, pdf, { cwd: this.outDir })
+    return synctexView(file, request.line, pdf, { cwd: this.workDir })
   }
 
   /**
@@ -1317,7 +1348,7 @@ export class LatexPreviewService extends TypertRemoteService {
   /** Reverse-jump body shared by the Remote method and the HTTP API. */
   private async edit(request: { page: number; x: number; y: number }): Promise<readonly SyncEditHit[]> {
     const pdf = this.requirePdf()
-    return synctexEdit(request.page, request.x, request.y, pdf, { cwd: this.outDir })
+    return synctexEdit(request.page, request.x, request.y, pdf, { cwd: this.workDir })
   }
 
   /**
@@ -1346,9 +1377,9 @@ export class LatexPreviewService extends TypertRemoteService {
       throw new RemoteError('latex-preview/empty-instruction', '请先说明想怎么改这里', {})
     }
 
-    const hits = await synctexEdit(request.page, request.x, request.y, pdf, { cwd: this.outDir })
+    const hits = await synctexEdit(request.page, request.x, request.y, pdf, { cwd: this.workDir })
     if (typeof request.x2 === 'number' && typeof request.y2 === 'number') {
-      hits.push(...(await synctexEdit(request.page, request.x2, request.y2, pdf, { cwd: this.outDir })))
+      hits.push(...(await synctexEdit(request.page, request.x2, request.y2, pdf, { cwd: this.workDir })))
     }
 
     const located = hits.filter((hit) => hit.line > 0)
@@ -1421,7 +1452,7 @@ export class LatexPreviewService extends TypertRemoteService {
       candidates.push(candidate)
     }
     for (const candidate of candidates) {
-      const hits = await synctexView(rootFile, candidate, pdf, { cwd: this.outDir })
+      const hits = await synctexView(rootFile, candidate, pdf, { cwd: this.workDir })
       const useful = hits.filter((hit) => hit.page > 0 && hit.width > 0 && hit.height > 0)
       if (useful.length > 0) return useful
     }
@@ -1559,10 +1590,14 @@ export class LatexPreviewService extends TypertRemoteService {
    * @returns the compile result, with its URL filled in.
    */
   private async compileOnce(run: RunOptions = {}): Promise<CompileResult> {
-    const rootFile = this.state.rootFile
-    if (!rootFile) {
+    // One snapshot for the whole run. Reading `state.rootFile` / `outDir` / `compiler`
+    // as the run progresses is how a compile started in one workspace ended up
+    // writing into another's store after a mid-run `configure`.
+    const workspace = this.workspace
+    if (!workspace) {
       throw new RemoteError('latex-preview/no-root-file', 'nothing configured', { hint: '先调用 configure' })
     }
+    const rootFile = workspace.rootFile
     if (!this.state.binaries.tectonic) {
       throw new RemoteError('latex-preview/binary-missing', 'tectonic is not available', { missing: ['tectonic'] })
     }
@@ -1578,8 +1613,9 @@ export class LatexPreviewService extends TypertRemoteService {
     this.patch({ status: 'compiling', message: '正在编译…' })
     let result: CompileResult
     try {
-      result = await this.compiler.run()
+      result = await workspace.compiler.run()
     } catch (error) {
+      if (this.workspace !== workspace) throw error
       // Without this the state stays 'compiling' forever and the panel looks hung.
       this.patch({
         status: 'failed',
@@ -1587,6 +1623,13 @@ export class LatexPreviewService extends TypertRemoteService {
       })
       throw error
     }
+    if (this.workspace !== workspace) {
+      // Another workspace took over while this run was inside the compiler. Its PDF
+      // is real and sits in the old outDir, but nothing about it may reach the new
+      // workspace: no state patch, no published pair, no credential.
+      return { ...result, pdfUrl: null }
+    }
+
     const version = this.state.version + 1
     const pdfRoute = result.pdfPath ? `${ROUTE_PREFIX}/pdf/${encodeURIComponent(basename(result.pdfPath))}` : null
     const pdfUrl = pdfRoute ? `${pdfRoute}?v=${version}` : null
@@ -1684,7 +1727,7 @@ export class LatexPreviewService extends TypertRemoteService {
   private requirePdf(): string {
     const rootFile = this.state.rootFile
     if (!rootFile) throw new RemoteError('latex-preview/no-pdf', 'no root file', { hint: '先 configure' })
-    return compilePaths(rootFile, this.outDir).pdf
+    return compilePaths(rootFile, this.workDir).pdf
   }
 
   /** Read the root source, tolerating a missing file. */
@@ -1727,7 +1770,7 @@ export class LatexPreviewService extends TypertRemoteService {
     if (!this.webServer || this.disposeRoute) return
     const mounts: StaticMount[] = [
       // A getter, not a snapshot: `outDir` follows the configured workspace.
-      { prefix: '/pdf', dir: () => this.outDir, cacheable: false },
+      { prefix: '/pdf', dir: () => this.workDir, cacheable: false },
       // Packaged assets, not `process.cwd()/assets`: the viewer must be found
       // wherever DSH happens to be started from (see utils/assets.ts).
       { prefix: '/assets', dir: assetsRoot(), cacheable: true },
