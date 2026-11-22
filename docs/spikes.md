@@ -899,6 +899,61 @@ interface TrustedArtifacts { workspaceId; sourceDigest; pdfSha256; synctexSha256
 
 ---
 
+## B32 · 「输入未变」是一张图，不是一行字
+
+`stable = result.ok && compiled === input`，而 `input` 是**根文件**的文本。于是 `\input` 的章节、
+`.bib`、本地 `.sty`、`\includegraphics` 的图在编译期间被改写，`stable` 仍为真：凭据照样签发、
+三版本照样推进、`hasPendingChanges` 照样为假 —— 屏幕上那份 PDF 属于"半旧半新"的文档，
+而所有哈希校验都通过。CHANGELOG 里"输入未变"这句话，此前只能读成"根文件未变"。
+
+**修法**：`services/build-input.ts` 从根出发 BFS，按原始字节哈希整张图，`sameBuildInput` 比较 digest。
+`stable` 现在要求两半：根文本未变 **且** `sameBuildInput(pre, post)`。扫描放在 `readSource` **之前** ——
+否则夹在两者之间的编辑会被哈希成"改后"的样子，看起来毫无变化。
+
+三个与正确性同等重要的机制：
+
+- **TeX 自产文件不是输入**。`\input{main.toc}`、`\input{\jobname.bbl}` 编译前不存在、编译后被创建，
+  且内容逐次抖动。数进来的后果不是"偶尔不稳定"，而是**永不停止**：每次编译都发现变化 → 收敛重编译 →
+  再发现变化。`.aux .toc .lof .lot .out .bbl .blg .idx .ind .ilg .nav .snm .vrb .fls .fdb_latexmk .log
+  .pdf .synctex.gz .xdv .dvi` 在解析阶段就被拒。`\includegraphics` 不过滤 `.pdf`（图本来就该是 PDF）。
+- **不可读是内容，不是失败**。`\input{chapters}`（目标是目录）在编译前后都一样 → 同一张图 → 稳定。
+  若改成"不可读即不稳定"，这类项目会永远拿不到凭据；若把 `unreadable` 剔出 digest，编译期间
+  "多出一个读不了的文件"就不可见了。所以它进 digest，且对称比较。
+- **扫描失败 fail-open**。抛错时 `stable` 回落到只看根文本。fail-closed 等于"每次编译都不稳定"，
+  那不是保护，是重编译循环。注入点是 `ServiceOptions.buildInputScanner`（与 `binaryProbe` 同一风格）。
+
+**收敛预算**：原来的 `void this.runCompile({})` 没有预算。以前"输入变了"只可能是根文件变（人手动保存，
+不会连发）；有了图，格式化器或同步工具每次保存都改写 chapter 就会把它变成死循环。`MAX_CONVERGE = 2`
+（最多 3 次进程），用尽后不再排，文案改为"输入在编译期间反复变化，已停止自动重编译"——**不承诺一件不会发生的事**。
+
+**状态行要说清楚是哪个文件变了**："源码又变了"会把读者送到根文件，而那里什么都没变。`diffBuildInput`
+返回变更路径（最多 4 条 + 等 N 个），根文件变了则仍说"根文件"。
+
+**凭据有意不带输入图摘要**：`sourceDigest` 回答"哪个 revision"（根文本的身份），manifest 回答
+"签发那一刻磁盘上的图没动"。写进凭据会让"编译 → 改一个 chapter → 想接受上一版"被判不可信 →
+`dropBaseArtifacts()` 删掉合法配对（与"重启删掉合法已接受对"同一类过度拒绝），且重启后 manifest 无从重建。
+代价写在已知限制里：同一 `revisionId` 可以对应两份不同的 PDF。
+
+**同轮的 `outDir` 生命周期**：`outDirExplicit` 是进程级粘性，且用的是**当前** workspace 的目录。
+`configure(A, outDir=shared)` → `configure(B)` 会把 B 的产物写进 shared（A 的目录），而 B 的恢复按名字
+删两对产物 —— 删掉的是 A 的。改为"显式目录属于它的根文件"：同 root 沿用（面板只发 `{review}`/`{redact}`，
+不沿用就不再是 refresh，恢复会删掉刚发布的配对），换 root 回落默认。顺带补上"没有任何文件提示的
+configure 指的是屏幕上的工作区"——此前它会去扫 `process.cwd()`，在 `rootFile` 指到别处的项目里直接变成
+"当前工作目录没有含 \documentclass 的 .tex"。
+
+**测试**
+
+- `build-input.test.ts`（16 例，真实临时目录）：`.tex` 回落与两种拼写去重、新建此前 missing 的章节可见、
+  目录名进入 `unreadable` 且对称、产物扩展名不进 entries、注释/`\%`/管道/宏参数的跳过、跨行参数与 BOM/CRLF、
+  逗号拆分、`\endinput` 截断、`\import` vs `\subimport` 的不同基准、`\graphicspath`、环、超限截断。
+- `service-inputs.test.ts`（7 例）：编译期间改 chapter → 无凭据、上一编译对不动（去掉 `!inputsMoved.moved` 即红）；
+  无人改则只跑一次（强制 `stable=false` 即红）；`\input{main.toc}` 每次被改写也只跑一次；`\input{目录}` 稳定；
+  扫描抛错不影响编译；连续变化在第 3 次停下（去掉预算即红）；根文件变时文案说"根文件"。
+- `service-workspace.test.ts` 新增 4 例：settings 刷新保住两对产物、同 root 保住显式目录、
+  换 root 不再继承（改前红：B 落进共享目录）、`paper/./main.tex` 与 `paper/main.tex` 同一工作区（改前红）。
+
+---
+
 ## B31 · 等待，而不是拒绝：读写锁、审核认主、diff 认基准
 
 §B30 的租约只回答了"是否被占用"，两个方向都没有**等待**：
