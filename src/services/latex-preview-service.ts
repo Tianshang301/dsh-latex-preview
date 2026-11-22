@@ -2,7 +2,7 @@
  * The one Host service the client half talks to.
  *
  * Shape follows the Typert Remote contract (verified 2026-11-16 against
- * `@deepseek-ai/dsh-typert-protocol@0.2.2-rc.1`):
+ * `@deepseek-ai/dsh-typert-protocol@0.2.2-rc.5`):
  * - `TypertRemoteService` + `super(ctx, key, { namespace })` publishes the
  *   service to the Gateway; the client sees generated descriptors, never the
  *   instance.

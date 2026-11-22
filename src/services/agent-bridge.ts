@@ -185,8 +185,8 @@ export class AgentBridge {
       agent.steer(
         createUserMessage({
           content: [{ type: 'text', text }],
-          // `MessageSourceMap` in dsh-llm 0.2.2-rc.1 has no `plugin` kind (it
-          // existed in 0.1.0-rc.6 and was removed), so a plugin-produced turn is
+          // `MessageSourceMap` in dsh-llm 0.2.2 (rc.1 through rc.5 alike) has no
+          // `plugin` kind — it existed in 0.1.0-rc.6 and was removed — so a plugin-produced turn is
           // an ordinary user message. See docs/spikes.md §B8.
           source: { kind: 'user' },
         }),

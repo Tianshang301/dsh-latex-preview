@@ -21,6 +21,7 @@
     "cordis.patch.yml"
   ],
   "dsh": {
+    "manifestVersion": 1,
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
@@ -30,6 +31,10 @@
         "slots"
       ]
     }
+  },
+  "engines": {
+    "node": ">=22",
+    "dsh": "^0.2.2-rc.5"
   },
   "scripts": {
     "assets": "node scripts/build-assets.mjs",
@@ -42,19 +47,19 @@
     "verify": "tsx test/contract/probe.ts"
   },
   "dependencies": {
-    "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.5",
     "chokidar": "3.6.0",
     "diff-match-patch": "1.0.5",
     "pdfjs-dist": "4.10.38"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.1.0",
-    "@deepseek-ai/dsh-llm": "0.2.2-rc.1"
+    "@deepseek-ai/dsh-llm": "^0.2.2-rc.5"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.1.0",
-    "@deepseek-ai/dsh-client-ui-slots": "0.0.1-rc.1",
-    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.5",
     "@types/diff-match-patch": "1.0.36",
     "@types/node": "22.10.2",
     "@types/react": "18.3.12",

@@ -88,7 +88,7 @@ await probe('ctx.inject(deps, cb) resolves deferred services', async () => {
 // 4 · createUserMessage: what actually comes back, and what `source` must be.
 await probe('createUserMessage({ content, source })', () => {
   // The spec wrote `source: 'latex-preview'` (a bare string). The real contract is
-  // a discriminated object, and `dsh-llm@0.2.2-rc.1` dropped the `plugin` kind, so
+  // a discriminated object, and `dsh-llm@0.2.2` dropped the `plugin` kind, so
   // a plugin-produced turn is an ordinary `{ kind: 'user' }` message.
   const message = createUserMessage({
     content: [{ type: 'text', text: 'LaTeX 编译失败，请修复' }],
