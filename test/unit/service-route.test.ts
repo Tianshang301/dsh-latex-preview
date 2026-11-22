@@ -390,6 +390,12 @@ test('a revert whose workspace went away reports the switch instead of acting on
   try {
     await settled(harness)
     writeFileSync(join(dirA, 'main.tex'), C)
+    // Park the compile after its compiler returned: the revert click lands while
+    // the queue is held by that run, so the workspace switch below beats the
+    // queued task instead of racing it mid-compile.
+    gate = new Promise<void>((resolve) => {
+      hold.release = resolve
+    })
     const runs = harness.behaviour.runs
     const running = harness.service.compileNow(signal())
     await until(() => harness.behaviour.runs > runs, 'the held run to reach the compiler')
