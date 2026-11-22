@@ -46,6 +46,13 @@ import {
 } from './revisions.ts'
 import { DiffDocService } from './diffdoc.ts'
 import { PathLeaseRegistry } from './path-lease.ts'
+import {
+  diffBuildInput,
+  sameBuildInput,
+  scanBuildInput,
+  type BuildInputManifest,
+  type InputDiff,
+} from './build-input.ts'
 import { FileWatcher } from './watcher.ts'
 import { lineDiff, normalizeLatexLine } from './diff.ts'
 import { bandsFromHits, diffHunks, insertionAnchor, type DiffHunk } from './diff-regions.ts'
@@ -111,6 +118,17 @@ const DEFAULT_DEBOUNCE_MS = 500
 const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_FIRST_RUN_TIMEOUT_MS = 300_000
 
+/**
+ * How many convergence recompiles one request may trigger.
+ *
+ * A compile whose input moved under it is re-run to show the edit that landed
+ * mid-flight — and a save that lands during *every* run (a formatter, a sync tool,
+ * the user holding Ctrl+S) would otherwise recompile for ever with no credential
+ * ever issued. Two extra runs is enough to converge on a settled file and small
+ * enough that the panel is never stuck on "正在编译" because of a loop.
+ */
+const MAX_CONVERGE = 2
+
 /** Constructor options; every field is optional so `ctx.plugin(Service)` still works. */
 export interface ServiceOptions {
   /**
@@ -155,6 +173,15 @@ export interface ServiceOptions {
     timeoutMs: number
     firstRunTimeoutMs: number
   }) => DiffDocService
+  /**
+   * Scans the files one compile is about to read.
+   *
+   * Same rationale as {@link binaryProbe}: an injected *answer* rather than a mocked
+   * module. Two behaviours of the wiring cannot be produced from a real directory —
+   * a scan that throws (the fail-open path must still publish) and a scan that is
+   * slow enough for a `configure` to land in the middle of it.
+   */
+  readonly buildInputScanner?: (rootFile: string, outDir: string) => Promise<BuildInputManifest>
 }
 
 /**
@@ -208,6 +235,16 @@ interface BuildContext extends WorkspaceContext {
   readonly before: string | null
   /** Source the compiler read, as re-read just before it started. */
   readonly input: string | null
+  /**
+   * Every file the document pulls in, as hashed just before the run.
+   *
+   * A snapshot like the rest: re-scanning afterwards is the *second* half of the
+   * comparison, never a replacement for this one — two scans of two different graphs
+   * would agree with each other and disagree with the compiler. `null` means the scan
+   * failed, and `stable` degrades to the root-only comparison (see
+   * {@link compileOnce}).
+   */
+  readonly inputManifest: BuildInputManifest | null
   /** The three revisions as they stood when the run started. */
   readonly revisions: Revisions
   /** The review gate in force when the run started. */
@@ -311,7 +348,8 @@ interface ConfigureRequest {
   readonly debounceMs?: number
 }
 
-/** Per-run overrides for one compile. */interface RunOptions {
+/** Per-run overrides for one compile. */
+interface RunOptions {
   /**
    * Source that produced the artefacts currently on disk, when it is not
    * `currentSource`.
@@ -323,6 +361,8 @@ interface ConfigureRequest {
   readonly beforeOverride?: string | null
   /** Skip the reviewer: a revert is not a proposal, it is the undo of one. */
   readonly suppressReview?: boolean
+  /** How many convergence recompiles this request has already spent. */
+  readonly converge?: number
 }
 
 export class LatexPreviewService extends TypertRemoteService {
@@ -408,6 +448,8 @@ export class LatexPreviewService extends TypertRemoteService {
   private readonly binaryProbe: () => Promise<BinaryReport>
   /** Optional pause between the compiler returning and the first publish. */
   private readonly onRunReturned?: (workspace: { id: string; generation: number }) => Promise<void>
+  /** Hashes what a compile is about to read; injectable so the fail-open path is testable. */
+  private readonly buildInputScanner: (rootFile: string, outDir: string) => Promise<BuildInputManifest>
   /** Builds the diff-document service; injectable so tests can hold a build mid-read. */
   private readonly diffDocFactory: (options: {
     rootFile: string
@@ -461,6 +503,8 @@ export class LatexPreviewService extends TypertRemoteService {
     this.compileFactory = options.compileFactory ?? ((compileOptions) => new CompileService(compileOptions))
     this.binaryProbe = options.binaryProbe ?? checkBinaries
     this.onRunReturned = options.onRunReturned
+    this.buildInputScanner =
+      options.buildInputScanner ?? ((rootFile, outDir) => scanBuildInput(rootFile, { outDir }))
     this.diffDocFactory =
       options.diffDocFactory ??
       ((diffOptions) => new DiffDocService(diffOptions))
@@ -2411,6 +2455,10 @@ export class LatexPreviewService extends TypertRemoteService {
     // Not always what `currentSource` says: 撤销 writes the file back first, and the
     // PDF on screen still belongs to the revision it is throwing away.
     const before = run.beforeOverride !== undefined ? run.beforeOverride : this.currentSource
+    // The graph the compiler is about to read. Scanned *before* `readSource` so the
+    // snapshot is never later than the text: a member edited between the two would
+    // otherwise be hashed after the edit and look unchanged.
+    const inputManifest = await this.scanInputs(rootFile, workspace.outDir)
     // The input the compiler is about to read. Comparing it with the file after the
     // run is the only way to notice an edit that landed mid-compile: the PDF then
     // belongs to neither snapshot, and must not be given a credential.
@@ -2420,6 +2468,7 @@ export class LatexPreviewService extends TypertRemoteService {
       paths,
       before,
       input,
+      inputManifest,
       revisions: this.revisions(),
       review: this.review,
       trusted: this.trusted,
@@ -2462,10 +2511,22 @@ export class LatexPreviewService extends TypertRemoteService {
 
     const compiled = result.ok ? await this.readSource(rootFile) : null
     if (!this.isCurrent(ctx)) return this.discarded(result)
-    // A compile is only as trustworthy as its input: if the file changed while the
-    // compiler had it open, the PDF corresponds to neither the before- nor the
-    // after-snapshot.
-    const stable = result.ok && compiled !== null && compiled === input
+    // The same graph, read again. Skipped for a failed run: no credential is issued
+    // for it anyway, and the scan can be hundreds of files.
+    let inputsMoved: InputDiff = { moved: false }
+    if (result.ok && compiled !== null && ctx.inputManifest !== null) {
+      const after = await this.scanInputs(rootFile, workspace.outDir)
+      // A scan is a long `await`: a `configure` can land inside it, and the answer
+      // would then belong to a workspace this run no longer speaks for.
+      if (!this.isCurrent(ctx)) return this.discarded(result)
+      if (after !== null) inputsMoved = diffBuildInput(ctx.inputManifest, after)
+    }
+    // A compile is only as trustworthy as its input: if the root file changed while
+    // the compiler had it open, the PDF corresponds to neither the before- nor the
+    // after-snapshot. The same is true of any file the root pulls in — a chapter
+    // rewritten mid-run leaves the PDF describing half of each document.
+    const rootMoved = !(compiled !== null && compiled === input)
+    const stable = result.ok && compiled !== null && !rootMoved && !inputsMoved.moved
     let contentChanged = false
 
     if (result.ok) {
@@ -2514,10 +2575,14 @@ export class LatexPreviewService extends TypertRemoteService {
       await this.dropRecentArtifacts(ctx)
     }
 
-    if (result.ok && !stable && this.isCurrent(ctx)) {
-      // Converge: the edit that landed mid-compile is now on disk, and the PDF on
-      // screen predates it.
-      void this.runCompile({}, workspace).catch(() => undefined)
+    // Converge: the edit that landed mid-compile is now on disk, and the PDF on
+    // screen predates it. Bounded, because a save that lands during *every* run would
+    // otherwise recompile for ever; `void` because a queued task awaiting a compile
+    // would be waiting on itself.
+    const converge = run.converge ?? 0
+    const recompiling = result.ok && !stable && converge < MAX_CONVERGE && this.isCurrent(ctx)
+    if (recompiling) {
+      void this.runCompile({ converge: converge + 1 }, workspace).catch(() => undefined)
     }
 
     // `restored` keeps showing the previous revision (the compile failed but put it
@@ -2537,7 +2602,7 @@ export class LatexPreviewService extends TypertRemoteService {
       compiledAt: result.ok ? new Date().toISOString() : this.state.compiledAt,
       diagnostics: result.diagnostics,
       durationMs: result.durationMs,
-      message: this.describe(result, stable),
+      message: this.describe(result, { stable, rootMoved, inputs: inputsMoved, recompiling }),
     })) {
       return this.discarded(result)
     }
@@ -2547,12 +2612,33 @@ export class LatexPreviewService extends TypertRemoteService {
     return { ...result, pdfUrl: showable ? pdfUrl : null }
   }
 
-  /** One-line status for the panel. */
-  private describe(result: CompileResult, stable = true): string {
+  /**
+   * One-line status for the panel.
+   *
+   * A successful-but-unstable run has three different stories and the line must tell
+   * the right one: the root moved (the old wording), a member of the graph moved (the
+   * reader needs the file name, or they will look at the root and see nothing), or the
+   * budget ran out (nothing is going to change by waiting).
+   * @param result - the compile.
+   * @param stability - what the two input scans and the convergence budget decided.
+   * @returns the line to show.
+   */
+  private describe(
+    result: CompileResult,
+    stability: { readonly stable: boolean; readonly rootMoved: boolean; readonly inputs: InputDiff; readonly recompiling: boolean } = {
+      stable: true,
+      rootMoved: false,
+      inputs: { moved: false },
+      recompiling: false,
+    },
+  ): string {
     if (result.ok) {
-      return stable
-        ? `编译成功（${(result.durationMs / 1000).toFixed(1)}s）`
-        : `编译成功（${(result.durationMs / 1000).toFixed(1)}s），但编译期间源码又变了，正在重新编译`
+      const took = `编译成功（${(result.durationMs / 1000).toFixed(1)}s）`
+      if (stability.stable) return took
+      const subject = stability.rootMoved ? '根文件' : namedInputs(stability.inputs)
+      return stability.recompiling
+        ? `${took}，但编译期间${subject}又变了，正在重新编译`
+        : `${took}，但编译期间${subject}反复变化，已停止自动重编译；本次 PDF 不作为可接受的版本`
     }
     const errors = result.diagnostics.filter((d) => d.severity === 'error').length
     // Every sentence below has to match what is actually on screen. "保留上一次的
@@ -2575,6 +2661,25 @@ export class LatexPreviewService extends TypertRemoteService {
   private async readSource(file: string): Promise<string | null> {
     try {
       return await readFile(file, 'utf8')
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Hash the input graph, degrading to `null` instead of failing the compile.
+   *
+   * A scan that throws means "we could not look", not "the document is broken": the
+   * compile is real either way, and the consequence is only that `stable` falls back
+   * to the root-only comparison. Failing the run instead would turn a permission
+   * error in `../shared/refs.bib` into "this project never compiles again".
+   * @param rootFile - the workspace's root `.tex`.
+   * @param outDir - its output directory, tried as a second base for includes.
+   * @returns the manifest, or null when scanning is impossible.
+   */
+  private async scanInputs(rootFile: string, outDir: string): Promise<BuildInputManifest | null> {
+    try {
+      return await this.buildInputScanner(rootFile, outDir)
     } catch {
       return null
     }
@@ -2722,4 +2827,18 @@ function sampleLines(first: number, last: number, budget: number): number[] {
   if (budget <= 0) return []
   const step = count / budget
   return Array.from({ length: budget }, (_, i) => first + Math.floor(i * step))
+}
+
+/**
+ * Name the input members that moved, for the status line.
+ *
+ * The reader who is told "the input changed" looks at the root file and sees nothing,
+ * so the paths have to be named — capped, because a status line is one line.
+ * @param inputs - the diff from `diffBuildInput`.
+ * @returns the joined paths, or a generic word when only the root is identifiable.
+ */
+function namedInputs(inputs: InputDiff): string {
+  if (!inputs.moved || inputs.paths.length === 0) return '输入'
+  const named = inputs.paths.join('、')
+  return inputs.more > 0 ? `${named} 等 ${inputs.paths.length + inputs.more} 个文件` : named
 }
