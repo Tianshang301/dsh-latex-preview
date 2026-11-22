@@ -703,3 +703,92 @@ test('a diff build that outlives its baseline is dropped, not published', async 
     rmSync(a, { recursive: true, force: true })
   }
 })
+
+test('a settings change is a refresh, not a new workspace', async () => {
+  const a = workspaceSource(A1)
+  const h = await boot(a)
+  try {
+    await until(() => h.behaviour.runs >= 1, 'the first compile')
+    await delay(150)
+    // A change, so a previous-compile pair exists: a full reconfigure would restore
+    // over it and delete it, which is what "same workspace" has to prevent.
+    writeFileSync(join(a, 'main.tex'), A2)
+    await h.service.compileNow(signal())
+    const before = await h.service.getState(signal())
+    assert.ok(before.recentRevisionId, 'a previous-compile pair exists to lose')
+
+    // The panel switches a setting without naming a root file — exactly what
+    // `panel.tsx` sends. That is the same workspace, and the pair must survive.
+    const configured = await h.service.configure({ review: 'manual' }, signal())
+    assert.equal(configured.rootFile, join(a, 'main.tex'))
+    assert.equal(configured.recentRevisionId, before.recentRevisionId)
+    assert.equal(configured.baseRevisionId, before.baseRevisionId)
+    assert.match(configured.message ?? '', /配置已更新/)
+  } finally {
+    await h.stop()
+    rmSync(a, { recursive: true, force: true })
+  }
+})
+
+test('a settings change keeps the directory its root file was configured with', async () => {
+  const a = workspaceSource(A1)
+  const shared = mkdtempSync(join(tmpdir(), 'dsh-latex-keep-'))
+  const h = await boot(a, { outDir: shared })
+  try {
+    await until(() => h.behaviour.runs >= 1, 'the first compile')
+    await delay(150)
+    await h.service.configure({ redact: true }, signal())
+    // The directory the caller named belongs to this root file: dropping it on the
+    // next configure would silently move the workspace and republish elsewhere.
+    assert.equal(internals(h.service).workspace?.outDir, shared)
+  } finally {
+    await h.stop()
+    rmSync(a, { recursive: true, force: true })
+    rmSync(shared, { recursive: true, force: true })
+  }
+})
+
+test('an explicit output directory expires with its own root file', async () => {
+  const a = workspaceSource(A1)
+  const b = workspaceSource(B1)
+  const shared = mkdtempSync(join(tmpdir(), 'dsh-latex-expire-'))
+  const h = await boot(a, { outDir: shared })
+  try {
+    await until(() => h.behaviour.runs >= 1, 'A’s first compile')
+    await delay(150)
+    const aPaths = compilePaths(join(a, 'main.tex'), shared)
+    assert.equal(existsSync(aPaths.pdf), true, 'A published into the directory it was given')
+
+    // B neither names nor inherits a directory. Inheriting A's would write two
+    // projects' artefacts into one directory, and the restore that follows
+    // (`restoreArtifacts` deletes both pairs by name) would take A's pair with it.
+    await h.service.configure({ rootFile: join(b, 'main.tex'), review: 'manual' }, signal())
+    await delay(300)
+    const state = await h.service.getState(signal())
+    assert.equal(state.rootFile, join(b, 'main.tex'))
+    assert.equal(internals(h.service).workspace?.outDir, join(b, '.latex-preview'))
+    assert.equal(existsSync(aPaths.pdf), true, 'A’s pair was not deleted by B’s switch')
+  } finally {
+    await h.stop()
+    rmSync(a, { recursive: true, force: true })
+    rmSync(b, { recursive: true, force: true })
+    rmSync(shared, { recursive: true, force: true })
+  }
+})
+
+test('the same root file spelled differently is the same workspace', async () => {
+  const a = workspaceSource(A1)
+  const h = await boot(a)
+  try {
+    await until(() => h.behaviour.runs >= 1, 'the first compile')
+    await delay(150)
+    // `a/./main.tex` names the file already configured. Comparing spellings instead
+    // of resolved paths makes it a second workspace with a second `.latex-preview`.
+    const configured = await h.service.configure({ rootFile: `${a}/./main.tex`, review: 'manual' }, signal())
+    assert.equal(configured.rootFile, join(a, 'main.tex'))
+    assert.match(configured.message ?? '', /配置已更新/)
+  } finally {
+    await h.stop()
+    rmSync(a, { recursive: true, force: true })
+  }
+})

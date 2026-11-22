@@ -322,7 +322,6 @@ interface PreparedWorkspace {
   /** Same workspace, same source: keep the PDF, the pairs and the revisions. */
   readonly refresh: boolean
   /** Whether the caller named the output directory. */
-  readonly explicitOutDir: boolean
 }
 
 /** The two revision pairs that live in one path set. */
@@ -494,7 +493,6 @@ export class LatexPreviewService extends TypertRemoteService {
    * directory DSH happens to be running from. Without this flag the seeded value
    * wins and the per-workspace fallback below never runs.
    */
-  private outDirExplicit = false
   private debounceMs = DEFAULT_DEBOUNCE_MS
 
   constructor(ctx: Context, options: ServiceOptions = {}) {
@@ -650,6 +648,13 @@ export class LatexPreviewService extends TypertRemoteService {
   private async prepareWorkspace(request: ConfigureRequest): Promise<PreparedWorkspace | null> {
     let rootFile = request.rootFile ?? null
     let resolution: RootResolution | null = null
+    if (!rootFile && !request.file && this.workspace !== null) {
+      // A request with no file at all is a *settings* change (`{ review }`,
+      // `{ redact }`), and the document it applies to is the one on screen. Falling
+      // through to the process directory instead would abandon a workspace the caller
+      // never asked to leave — and with it the published pairs.
+      rootFile = this.workspace.rootFile
+    }
     if (!rootFile && !request.file) {
       // No hint at all: adopt the DSH process directory when it holds exactly one
       // compilable document. This is what makes "open DSH in a paper folder" work
@@ -695,27 +700,38 @@ export class LatexPreviewService extends TypertRemoteService {
       })
     }
 
-    const explicitOutDir = Boolean(request.outDir)
-    const outDir =
-      request.outDir ?? (this.outDirExplicit ? this.workDir : join(dirname(rootFile), '.latex-preview'))
+    // One spelling per document. A caller may pass `paper/./main.tex` or a relative
+    // path; resolving here makes the identity (`workspaceIdOf`) and the comparison
+    // below agree about what "the same file" means.
+    const root = resolve(rootFile)
+    const current = this.workspace
+    // An explicit `outDir` belongs to the **root file** it was given for, not to the
+    // process. Making it sticky meant `configure(A, outDir=X)` followed by
+    // `configure(B)` wrote B's artefacts into X — a directory that already holds A's —
+    // and B's restore then deleted A's pairs by name. Reusing the current directory
+    // only while the root file is unchanged keeps a settings refresh a refresh
+    // (`panel.tsx` never sends `outDir`), without leaking across projects.
+    const outDir = resolve(
+      request.outDir ?? (current !== null && resolve(current.rootFile) === root ? current.outDir : join(dirname(root), '.latex-preview')),
+    )
     const compiler = this.compileFactory({
-      rootFile,
+      rootFile: root,
       outDir,
       timeoutMs: DEFAULT_TIMEOUT_MS,
       firstRunTimeoutMs: DEFAULT_FIRST_RUN_TIMEOUT_MS,
     })
     const diffDoc = this.diffDocFactory({
-      rootFile,
+      rootFile: root,
       outDir,
       timeoutMs: DEFAULT_TIMEOUT_MS,
       firstRunTimeoutMs: DEFAULT_FIRST_RUN_TIMEOUT_MS,
     })
-    const initial = await this.readSource(rootFile)
-    const id = workspaceIdOf(rootFile, outDir)
+    const initial = await this.readSource(root)
+    const id = workspaceIdOf(root, outDir)
     const workspace: Workspace = {
       generation: this.workspaceGeneration + 1,
       id,
-      rootFile,
+      rootFile: root,
       outDir,
       compiler,
     }
@@ -726,7 +742,7 @@ export class LatexPreviewService extends TypertRemoteService {
     // pair, whose wording nobody could recover (the text behind it is not stored).
     const refresh = this.workspace?.id === id && initial !== null && initial === this.currentSource
     if (refresh) {
-      return { workspace, initial, resolution, restored: {}, diffDoc, refresh, explicitOutDir }
+      return { workspace, initial, resolution, restored: {}, diffDoc, refresh }
     }
     // Restore against the candidate's own paths — but only while nothing else is
     // writing to them. A different `outDir`, or a different root file in the same
@@ -735,15 +751,15 @@ export class LatexPreviewService extends TypertRemoteService {
     // compile that is still writing, or by a task still queued for those names — a
     // restore now would delete pairs under that writer, so it moves behind the queue.
     if (this.artifactPathsBusy(workspace)) {
-      return { workspace, initial, resolution, restored: null, diffDoc, refresh: false, explicitOutDir }
+      return { workspace, initial, resolution, restored: null, diffDoc, refresh: false }
     }
     // Hold the candidate's paths for the duration: a compile queued while this restore
     // runs must see the claim rather than start writing into files being deleted.
-    const held = this.holdLease(compilePaths(rootFile, outDir), 'write')
+    const held = this.holdLease(compilePaths(root, outDir), 'write')
     held.begin()
     try {
-      const restored = await this.restoreArtifacts(rootFile, outDir, initial, held.lease)
-      return { workspace, initial, resolution, restored, diffDoc, refresh: false, explicitOutDir }
+      const restored = await this.restoreArtifacts(root, outDir, initial, held.lease)
+      return { workspace, initial, resolution, restored, diffDoc, refresh: false }
     } finally {
       held.release()
     }
@@ -793,7 +809,6 @@ export class LatexPreviewService extends TypertRemoteService {
     this.redact = options.redact
     this.review = options.review
     this.debounceMs = options.debounceMs
-    if (prepared.explicitOutDir) this.outDirExplicit = true
 
     // Before the assignment block, because stopping is asynchronous and the old
     // watcher must not be able to fire once the new workspace is live.
