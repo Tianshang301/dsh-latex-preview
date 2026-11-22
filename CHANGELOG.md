@@ -61,7 +61,7 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 - **Compiles are serialised at the service level.** `CompileService.run` already single-flights the process, but the revision snapshots and the artefact publishes are this service's own bookkeeping, and two interleaved bookkeepings are not one.
 - **A redundant compile republishes nothing.** "上次编译" answers *what did the last save change*; a compile of unchanged content has no answer, and letting it overwrite the pair loses the comparison.
 - **A restart re-adopts an accepted pair** when its manifest still names the source on disk, and the restore result is committed in the same state patch as the rest of the configuration instead of being patched separately first.
-- `npm test` now runs 111 cases, including service-level ones that drive a real `LatexPreviewService` in a real Cordis context with a real `CompileService` whose process is faked (`ServiceOptions.compileFactory`). `.github/workflows/ci.yml` runs typecheck, test typecheck and tests on Node 22 via pnpm.
+- `npm test` now runs 114 cases, including service-level ones that drive a real `LatexPreviewService` in a real Cordis context with a real `CompileService` whose process is faked (`ServiceOptions.compileFactory`). `.github/workflows/ci.yml` runs typecheck, test typecheck and tests on Node 22 via pnpm.
 
 **Previous-revision view**
 
@@ -114,6 +114,7 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 
 ### Changed
 
+- **Targets DSH `0.2.2-rc.5`, and now says so.** `package.json` never declared a compatible harness version, so the launcher had nothing to check (and its refusal, when one *is* declared, reads as an opaque version error). `engines.dsh` is `^0.2.2-rc.5`, `dsh.manifestVersion` is `1`, and the peer range for `dsh-llm` follows the same 0.2.2 line. The three packages this project compiles against were diffed rc.1 → rc.5 declaration by declaration: Typert is byte-identical, `dsh-llm`'s message contract is unchanged (only `HarnessError` moved to `dsh-error` and failure codes were enumerated), the slot registry's `register` options are unchanged, and the sidebar-right declarations — `sidebarRightTabs`, `openTab`, both `sidebar.right.pane.tab` seats — are byte-identical. The frontend bundles differ, so this is a *declaration-level* compatibility claim; a real rc.5 boot is still outstanding.
 - `getDiffRegions` takes `{ side: 'new' | 'base' | 'compile' }` and every region says which document it describes; the panel fetches only the side on screen (each one costs a `synctex view` sweep).
 - Diff bands are now positioned by the document's own line numbering on both sides: the source diff carries `oldStart`/`oldLines` alongside the new ones, which is what makes an old-revision lookup possible at all.
 - Deletion rendering went from a 2 px dashed seam to a 7 px red hatched band to a chip plus struck-through hover flyout, because a seam cannot say *what* was removed and a filled band reads as "this line changed".

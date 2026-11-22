@@ -40,8 +40,8 @@
 
 | 依赖 | 说明 |
 |---|---|
-| DSH | `0.2.2-rc.1`（插件按此版本的 Typert / slots 契约实现） |
-| Node.js | ≥ 20（开发用 22.x） |
+| DSH | `^0.2.2-rc.5`（声明在 `engines.dsh`；Typert / slots / manifest 契约与 rc.1 相同） |
+| Node.js | ≥ 22（声明在 `engines.node`） |
 | `tectonic` | **需自行安装并在 PATH 中**，启动时校验 |
 | `synctex` | 随 TeX 发行版提供，**需在 PATH 中**，启动时校验 |
 | `latexdiff` | **可选**，仅 `对比` 需要；Windows 上 MiKTeX 发行的 `latexdiff.exe` 还要求 Perl |

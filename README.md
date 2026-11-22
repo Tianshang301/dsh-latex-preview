@@ -40,8 +40,8 @@ Compiling, rendering, SyncTeX, and diffing all run **on your machine**. Only wha
 
 | Dependency | Notes |
 |---|---|
-| DSH | `0.2.2-rc.1` (the plugin targets this version's Typert / slots contracts) |
-| Node.js | ≥ 20 (developed on 22.x) |
+| DSH | `^0.2.2-rc.5` (declared as `engines.dsh`; the Typert / slots / manifest contracts are unchanged from rc.1) |
+| Node.js | ≥ 22 (declared as `engines.node`) |
 | `tectonic` | **You install it** and put it on `PATH`; verified at startup |
 | `synctex` | Shipped with your TeX distribution, **must be on `PATH`**; verified at startup |
 | `latexdiff` | **Optional**, only for `对比`; MiKTeX's `latexdiff.exe` additionally needs Perl |

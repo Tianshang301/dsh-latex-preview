@@ -2,7 +2,8 @@
 
 > 起点：2026-11-15 交接（`HANDOFF.md` §6 的 B1–B6 全部为"未验证假设"）。
 > 本轮验证方式：**直接读已发布 npm 包的类型与源码 + 在本机实跑命令**，而非逆向猜测。
-> 目标 DSH 版本：`@deepseek-ai/dsh@0.2.2-rc.1`（`cordis ~4.1.0`）。所有包**精确锁定**，不用 `^`。
+> 目标 DSH 版本：`@deepseek-ai/dsh@0.2.2-rc.5`（`cordis ~4.1.0`）。本项目直接编译依赖的包**精确锁定**，不用 `^`；
+> 版本兼容性由 `package.json` 的 `engines.dsh` 声明（§B33），宿主提供的 peer（`dsh-llm`）用 `^0.2.2-rc.5` 表示同一条 0.2.2 线。
 
 ## 0. 结论速查
 
@@ -896,6 +897,33 @@ interface TrustedArtifacts { workspaceId; sourceDigest; pdfSha256; synctexSha256
 **3. 审核不能抢在凭据之前。** `queueReview()` 原先在成功分支里、`issueTrustFor()` 之前启动。审核通过会调 `snapshotBaseFromCurrent()` 把当前 PDF 提升为基线，而此刻 `trusted` 还描述着被替换的那一版，于是提升被拒、已接受对被丢弃。顺序固定为：发布 → 推进 → 采纳 → 签发 → 审核（发布必须在签发之前，因为它用的是**编译前**的凭据）。两个测试：立即 accept（base 落到新版本）、立即 reject（源码回滚、被拒版本成为「上次编译」、不触发第二次审核）。
 
 **4. 一次编译只认一个工作区。** `compileOnce` 逐处读 `state.rootFile` / `outDir` / `compiler`，`configure` 落在中间就会"用旧源码编译、把产物发布到新工作区"，甚至能观察到半应用状态（新编译器 + 旧根文件）。现在 `Workspace`（generation / id / rootFile / outDir / compiler）一次性替换、整轮捕获；进程返回时若已不是当前工作区，则不 patch、不发布、不签发。测试：A 的编译被卡在编译器里 → 配置 B → 放行 A，B 的文件不被污染、两个工作区都没有被误发布的清单、凭据指向 B。
+
+---
+
+## B33 · 升到 DSH 0.2.2-rc.5：先比声明，再谈兼容
+
+目标版本从 `0.2.2-rc.1` 换成 `0.2.2-rc.5`。做法不是"升上去跑一下没报错"，而是把两版**已发布包**都
+`npm pack` 下来，逐文件 diff 声明（`lib/types/**/*.d.ts`）与实现（`lib/**/*.js`，忽略 `.map`）。
+我们依赖的是契约，不是 changelog 的措辞。
+
+| 包 | rc.1 → rc.5 的差异 | 对本插件的影响 |
+|---|---|---|
+| `dsh-typert-protocol` | 类型声明与 JS **完全一致**，只差 `version`、`files`、依赖版本（`zod 4.6.6`、`dsh-brand`） | 无。`Remote` / `TypertRemoteService` / `RemoteError` / 错误详情表增强全部原样 |
+| `dsh-llm` | `message.d.ts` **完全一致**（`createUserMessage`、`MessageSourceMap` 未变）；`error.d.ts` 改为 re-export `@deepseek-ai/dsh-error` 的 `HarnessError` 并新增 `LLM_FAILURE_CODES`；tool-history / 延迟工具的运行时逻辑有改动 | 无。我们只调 `createUserMessage`，不用 `HarnessError`，也不做工具声明 |
+| `dsh-client-ui-slots` | 新增 `hoc` 槽类型、Component Factory、resource 协议表；`store` 类型外移到 `dsh-client-store` | 无。`register(options, component)` 的 options 形状（`name` / `key` / 可选 `store`/`children`）未变 |
+| `dsh-client-ui-sidebar-right` | **类型声明逐字节相同**：`sidebarRightTabs: SidebarRightTabRegistry`、`openTab(kind, options)`、`sidebar.right.pane.tab` 与 `.title` 全在。只有构建产物 `lib/client.js` 与 `package.json` 变了 | 无。B2/B13 那套两级注册仍然成立 |
+| `dsh-package-manifest` | 类型声明一致 | 无 |
+
+**顺带发现一件本来会咬人的事**：`package.json` 从来没有 `engines`，也就没声明过 DSH 兼容版本。
+§B13 里那条真机报错 `incompatible with dsh 0.2.2-rc.1: requirements {"@deepseek-ai/dsh-client-ui-sidebar-right":"0.1.5-alpha.1"}`
+就是宿主在读这类声明 —— 作者侧对应的字段是 `engines.dsh`（SemVer range，含预发布）与 `dsh.manifestVersion: 1`。
+现在写成 `^0.2.2-rc.5`（= `>=0.2.2-rc.5 <0.3.0`，接受 0.2.2 之后同 tuple 的 rc 与正式版，拒绝换 minor），
+peer 的 `dsh-llm` 用同一条线。`test/unit/manifest.test.ts` 把三件事钉住：清单里该有的字段都在、
+`engines.dsh` 的 tuple 与**实际安装**的版本一致、`src/` 里 import 的每个 `@deepseek-ai/*` 都在
+`dependencies` 或 `peerDependencies` 里（否则宿主加载时就崩，而单元测试看不见）。
+
+**已知未覆盖**：`lib/client.js` 的差异（构建产物）没有被验证；前端装配只能靠真机 boot。所以这一轮的结论是
+"**声明层面兼容 rc.5**"，不是"真机已验证 rc.5"，§B11 / §B12 那些真机结论仍然只对 rc.1 成立。
 
 ---
 
