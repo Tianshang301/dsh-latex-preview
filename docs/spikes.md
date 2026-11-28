@@ -900,6 +900,42 @@ interface TrustedArtifacts { workspaceId; sourceDigest; pdfSha256; synctexSha256
 
 ---
 
+## B34 · 真机跑通 rc.5：声明相同之外的那一半
+
+§B33 只证明了声明层面兼容。这一轮把 `@deepseek-ai/dsh@0.2.2-rc.5` 装成 CLI，用真实 web profile 起机器，
+再拿 CDP 驱动无头 Edge 把面板真正挂起来 —— 前端 bundle 是构建产物，声明相同不代表装配相同。
+
+**做法**：`npm i -g @deepseek-ai/dsh@0.2.2-rc.5` → `dsh web --no-open --port 3080`（profile 里
+`dsh-latex-preview` 是 `link:E:/dsh-latex-preview`）→ `msedge --headless=new --remote-debugging-port=9222`
+打开带 `?token=` 的地址 → 用 Node 22 自带的 `WebSocket` 说 CDP，`Runtime.evaluate` 读 DOM/state、
+`Page.captureScreenshot` 留证。
+
+| 检查 | 结果 |
+|---|---|
+| 清单与版本门禁 | ✅ 无 `disabling profile plugin row`、无 `incompatible with dsh`（`engines.dsh` 就位后才有这条可比） |
+| Host 插件加载 | ✅ `GET /.latex-preview/api/state` → 200，`binaries {tectonic:true, synctex:true}` |
+| configure | ✅ 传 Windows 路径，回包已 `resolve()`，`watching:true` |
+| 真实 tectonic | ✅ 10.1 s（首次下载 amsmath）；修正测试文档后 `artifactState:current`、`pdfUrl ?v=12` |
+| 编译失败路径 | ✅ 缺 `\usepackage{amsmath}` 时 `artifactState:unavailable`、`pdfUrl:null`（不给 URL 的那条规则真机成立） |
+| 静态 PDF 路由 | ✅ 200 / `application/pdf` / `%PDF-1.5`，Range 206，`main.log` 404（`accept?` 收窄生效） |
+| 客户端 bundle | ✅ `/plugins/??dsh-latex-preview/client.js&rev=7daf8cc91021` → 200，34 KB，`__ModuleLoader__.load` |
+| 客户端装配 | ✅ `apply()` 执行；两个 keyed 槽注册；`LaTeX` 标签页出现并可见（**B11 遗留的"首次可见性未验证"至此关闭**） |
+| 面板 → iframe | ✅ `/.latex-preview/assets/viewer/index.html?file=…&v=17`，iframe 内 `canvas×2`、`.page×1`，pdf.js 真的出图 |
+| 多文件文档 | ✅ 带 `\input{chapters/ch1}` + `\tableofcontents` 的文档：改章节 → 编译 1.1 s → `编译成功（1.1s）` |
+| 收敛不自激 | ✅ 带目录的文档连编 3 次，`version` 停在 v38 不再上涨（`.aux/.toc` 若被计入输入图会变成永不停止的重编译） |
+| 两个版本视图 | ✅ 第二次编译后 `已接受版` / `上次编译版` 按钮同时可用，`差异 1` 在 `Contents` 上画出琥珀色带 |
+
+**一个不属于本插件的控制台报错**（记下来免得下次误判）：页面 boot 与每次换版都会出现
+`scrollPageIntoView: "1" is not a valid pageNumber parameter.`，栈是
+`pdf_viewer.mjs:7689 ← client.js&rev=bd81e7aaaaff:232/271/434` —— 那个 rev 是**内置插件**的批量
+bundle，不是我们的 `7daf8cc91021`，所以是宿主侧另一个 PDF 预览把字符串页码传给了 pdf.js。
+我们自己的 `scrollToPage()` 在调用前 `Math.trunc(Number(page))`，栈里没有我们的帧。
+
+**仍未验证**：`latexdiff`（本机没装，`对比` 只到按钮可用）；DiffDoc 的两分钟读租约在真机下的行为；
+真机下"编译期间输入变了"（需要制造精确的写窗口，单测已覆盖）。
+
+---
+
 ## B33 · 升到 DSH 0.2.2-rc.5：先比声明，再谈兼容
 
 目标版本从 `0.2.2-rc.1` 换成 `0.2.2-rc.5`。做法不是"升上去跑一下没报错"，而是把两版**已发布包**都

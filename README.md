@@ -40,7 +40,7 @@ Compiling, rendering, SyncTeX, and diffing all run **on your machine**. Only wha
 
 | Dependency | Notes |
 |---|---|
-| DSH | `^0.2.2-rc.5` (declared as `engines.dsh`; the Typert / slots / manifest contracts are unchanged from rc.1) |
+| DSH | `^0.2.2-rc.5` (declared as `engines.dsh`; the Typert / slots / manifest contracts are unchanged from rc.1, and rc.5 is verified by a real boot) |
 | Node.js | ≥ 22 (declared as `engines.node`) |
 | `tectonic` | **You install it** and put it on `PATH`; verified at startup |
 | `synctex` | Shipped with your TeX distribution, **must be on `PATH`**; verified at startup |
