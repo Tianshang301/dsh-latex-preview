@@ -175,6 +175,8 @@ Notable changes to `dsh-latex-preview`. Format follows [Keep a Changelog](https:
 - Scanned PDFs have no text layer, so boxing may fail to resolve.
 - Cross-page selections reverse-jump only the part on the current page.
 - Deletions are shown as a chip plus hover text, not re-typeset, unless `对比` is used — and MiKTeX's `latexdiff.exe` needs a system Perl, absent on some Windows machines; the probe degrades to an install hint rather than throwing.
+- In `上次编译版` / `已接受版` a deleted line is a red band with a midline strikethrough, but the band is **line-accurate, not character-accurate**: a visual line that holds both a deleted phrase and a surviving one is tinted whole. `synctex view` answers in boxes and boxes are merged per line, so the band means "something on this line moved" rather than "these words went".
+- **CJK text is dropped silently by tectonic's default fonts.** A Chinese document compiles "successfully" with the Chinese missing, and `synctex view` then collapses those source lines onto a nearby line that does have content — so bands land in the wrong place. Real-boot verification needs Latin text or an explicitly configured CJK font.
 - Auto review spends model calls and can be wrong.
 - **A revision is still the root file's text.** Editing a chapter, a `.bib` or a figure does not create a pending change and does not move the revision — only edits to the root file do. The input graph decides whether a compile may be *trusted*, not what counts as a revision.
 - Because of that, one `revisionId` can describe two different PDFs (compiled before and after a chapter changed). The credential names the revision and the bytes, not the graph it was issued against.
